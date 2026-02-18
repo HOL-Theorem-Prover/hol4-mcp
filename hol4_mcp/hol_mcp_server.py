@@ -329,9 +329,12 @@ async def hol_send(command: str, timeout: int = 5, max_output: int = DEFAULT_MAX
     elif timeout > 600:
         timeout = 600
 
+    t0 = time.monotonic()
     result = await s.send(command, timeout=timeout)
+    elapsed = time.monotonic() - t0
     _schedule_gc(session)
-    return _truncate_output(result, max_output)
+    timing = f"\n[{elapsed:.3f}s]"
+    return _truncate_output(result, max_output, footer=timing)
 
 
 @mcp.tool()
