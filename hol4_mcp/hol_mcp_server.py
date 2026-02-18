@@ -586,6 +586,8 @@ async def holmake(workdir: str, target: str = None, env: dict = None, log_limit:
                     break
                 continue  # Keep polling
 
+        wall = time.time() - start_time
+
         if timed_out:
             return f"ERROR: Build timed out after {timeout}s."
 
@@ -600,7 +602,7 @@ async def holmake(workdir: str, target: str = None, env: dict = None, log_limit:
                         entry.holmake_env = env
                 # Include env in output for caller to capture if needed
                 result += f"\nHOLMAKE_ENV: {json.dumps(env)}"
-            return result
+            return f"{result}\n[{wall:.1f}s]"
 
         # Build failed - append relevant logs (all logs are from this run)
         result = f"Build failed (exit code {proc.returncode}).\n\n{output}"
@@ -618,7 +620,7 @@ async def holmake(workdir: str, target: str = None, env: dict = None, log_limit:
                         content = f"...(truncated, showing last {log_limit} bytes)...\n" + content[-log_limit:]
                     result += f"\n--- {log_file.name} ---\n{content}\n"
 
-        return result
+        return f"{result}\n[{wall:.1f}s]"
 
     except Exception as e:
         return f"ERROR: {e}"
