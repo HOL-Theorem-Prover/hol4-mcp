@@ -828,19 +828,10 @@ class FileProofCursor:
         # Save deps-only checkpoint for clean verification
         await self._save_deps_checkpoint()
 
-        # Load file content (definitions, theorems) into session
-        load_error = await self._load_remaining_content()
-        if load_error:
-            return {
-                "theorems": [],
-                "cheats": [],
-                "error": load_error,
-            }
+        # File content loading is LAZY — handled by enter_theorem →
+        # _load_context_to_line when a specific theorem is requested.
+        # This avoids loading all theorems upfront (expensive for large files).
 
-        # Save base checkpoint for fast theorem navigation
-        await self.session.send('(drop_all(); PolyML.fullGC());', timeout=10)
-        await self._save_base_checkpoint()
-        
         return {
             "theorems": thm_list,
             "cheats": cheats,
@@ -911,11 +902,20 @@ class FileProofCursor:
 
         attrs = f"[{','.join(thm.attributes)}]" if thm.attributes else ""
         cheat_block = f'Theorem {thm.name}{attrs}:\n{thm.goal}\nProof\n  cheat\nQED'
+        # Drain extra residual output from the failed proof before cheating
+        await asyncio.sleep(0.1)
+        await self.session._drain_pipe()
         result = await self.session.send(cheat_block, timeout=30)
+        # Check for success: val <name> = ... : thm in output
+        # (residual output from the original failed proof can pollute the result,
+        # so checking for errors is unreliable — check for success instead)
+        if f"val {thm.name}" in result:
+            self._failed_proofs.add(thm.name)
+            return None
         if _is_hol_error(result):
             return (
                 f"Proof of '{thm.name}' failed (line {thm.start_line}) "
-                f"and could not be cheated: {result[:200]}"
+                f"and could not be cheated: {result[-500:]}"
             )
         self._failed_proofs.add(thm.name)
         return None
@@ -959,12 +959,21 @@ class FileProofCursor:
             thm_content = '\n'.join(content_lines[thm.start_line - 1:thm.proof_end_line - 1])
             if thm_content.strip():
                 result = await self.session.send(thm_content, timeout=60)
-                if _is_fatal_hol_error(result):
+                # Timeout during theorem proof: interrupt and auto-cheat
+                # (the HOL process is still computing, must interrupt first)
+                if result.startswith("TIMEOUT") and thm.kind not in ("Definition",):
+                    self.session.interrupt()
+                    # Small delay for HOL to process the interrupt
+                    await asyncio.sleep(0.5)
+                    cheat_err = await self._cheat_failed_theorem(thm)
+                    if cheat_err:
+                        return f"Failed to load context: {_format_context_error(result)}"
+                elif _is_fatal_hol_error(result):
                     return f"Failed to load context: {_format_context_error(result)}"
                 # On proof failure, cheat the theorem so its name is bound.
                 # Without this, later theorems that reference it get a fatal
                 # Poly/ML compile error ("Value or constructor not declared").
-                if _is_hol_error(result):
+                elif _is_hol_error(result):
                     if thm.kind == "Definition":
                         # Definition failures are fatal — they create constants
                         # and can't be cheated. Report clearly.
@@ -1118,6 +1127,11 @@ class FileProofCursor:
         error = await self._load_context_to_line(thm.start_line)
         if error:
             return {"error": error}
+
+        # Lazily save base checkpoint after first context load
+        if not self._base_checkpoint_saved:
+            await self.session.send('(drop_all(); PolyML.fullGC());', timeout=10)
+            await self._save_base_checkpoint()
 
         # Parse step plan from proof body using TacticParse
         if thm.proof_body:

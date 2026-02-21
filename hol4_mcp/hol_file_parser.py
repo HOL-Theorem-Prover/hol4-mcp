@@ -341,6 +341,13 @@ def parse_theorems(content: str) -> list[TheoremInfo]:
         if not term_match:
             continue  # No Termination block — plain definition, skip
 
+        # Check that no End appears before Termination (otherwise it's a
+        # plain Definition...End block, and the Termination belongs to a
+        # later Definition)
+        first_end = re.search(r'^\s*End\s*$', rest_stripped, re.MULTILINE)
+        if first_end and first_end.start() < term_match.start():
+            continue  # Plain definition — End comes before any Termination
+
         end_match = re.search(r'^\s*End\s*$', rest_stripped[term_match.end():], re.MULTILINE)
         if not end_match:
             continue
