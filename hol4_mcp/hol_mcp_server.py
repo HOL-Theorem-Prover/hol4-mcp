@@ -104,7 +104,7 @@ def _sigint_handler(signum, frame):
 signal.signal(signal.SIGINT, _sigint_handler)
 
 
-_SESSION_IDLE_TIMEOUT = 7200  # 2 hours
+_SESSION_IDLE_TIMEOUT = 1800  # 30 minutes
 _PRUNE_INTERVAL = 300  # Check every 5 minutes at most
 _last_prune_time = 0.0
 
