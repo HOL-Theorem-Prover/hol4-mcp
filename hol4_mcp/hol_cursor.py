@@ -193,7 +193,7 @@ def _format_context_error(output: str) -> str:
 
     # Timeout
     if output.startswith("TIMEOUT"):
-        return "Timeout loading context\n  Hint: check for infinite loops or increase timeout"
+        return "Timeout executing file content (a definition or proof may be looping)\n  Hint: check for infinite loops or increase timeout"
 
     # Generic: truncate raw output
     return output[:300]
@@ -940,7 +940,7 @@ class FileProofCursor:
                 if to_load.strip():
                     result = await self.session.send(to_load, timeout=60)
                     if _is_fatal_hol_error(result):
-                        return f"Failed to load context: {_format_context_error(result)}"
+                        return f"Error executing file content: {_format_context_error(result)}"
                 self._loaded_to_line = thm.start_line
 
             # For Definition blocks with Termination: extract TC goal BEFORE
@@ -967,9 +967,9 @@ class FileProofCursor:
                     await asyncio.sleep(0.5)
                     cheat_err = await self._cheat_failed_theorem(thm)
                     if cheat_err:
-                        return f"Failed to load context: {_format_context_error(result)}"
+                        return f"Error executing file content: {_format_context_error(result)}"
                 elif _is_fatal_hol_error(result):
-                    return f"Failed to load context: {_format_context_error(result)}"
+                    return f"Error executing file content: {_format_context_error(result)}"
                 # On proof failure, cheat the theorem so its name is bound.
                 # Without this, later theorems that reference it get a fatal
                 # Poly/ML compile error ("Value or constructor not declared").
@@ -997,7 +997,7 @@ class FileProofCursor:
                 if trailing.strip():
                     result = await self.session.send(trailing, timeout=60)
                     if _is_fatal_hol_error(result):
-                        return f"Failed to load context: {_format_context_error(result)}"
+                        return f"Error executing file content: {_format_context_error(result)}"
                 self._loaded_to_line = total_lines + 1
 
         # Track content hash so _check_stale_state works correctly
@@ -1036,7 +1036,7 @@ class FileProofCursor:
             if to_load.strip():
                 result = await self.session.send(to_load, timeout=timeout)
                 if _is_fatal_hol_error(result):
-                    return f"Failed to load context: {_format_context_error(result)}"
+                    return f"Error executing file content: {_format_context_error(result)}"
         else:
             # Theorems in range - load piece by piece to isolate failures
             current_line = self._loaded_to_line
@@ -1049,7 +1049,7 @@ class FileProofCursor:
                     if pre_content.strip():
                         result = await self.session.send(pre_content, timeout=timeout)
                         if _is_fatal_hol_error(result):
-                            return f"Failed to load context: {_format_context_error(result)}"
+                            return f"Error executing file content: {_format_context_error(result)}"
                 
                 # For Definition blocks: extract TC goal before processing
                 if thm.kind == "Definition" and thm.proof_body and thm.name not in self._tc_goals:
@@ -1064,7 +1064,7 @@ class FileProofCursor:
                 if thm_content.strip():
                     result = await self.session.send(thm_content, timeout=timeout)
                     if _is_fatal_hol_error(result):
-                        return f"Failed to load context: {_format_context_error(result)}"
+                        return f"Error executing file content: {_format_context_error(result)}"
                     # On proof failure, cheat so later theorems can reference it
                     if _is_hol_error(result):
                         if thm.kind == "Definition":
@@ -1086,7 +1086,7 @@ class FileProofCursor:
                 if remaining.strip():
                     result = await self.session.send(remaining, timeout=timeout)
                     if _is_fatal_hol_error(result):
-                        return f"Failed to load context: {_format_context_error(result)}"
+                        return f"Error executing file content: {_format_context_error(result)}"
         
         # Update tracking
         loaded_content = '\n'.join(content_lines[:target_line - 1])
