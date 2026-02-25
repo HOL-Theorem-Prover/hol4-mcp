@@ -468,3 +468,79 @@ QED
     # Body starts with 'rpt strip_tac'
     assert thm.proof_body.startswith("rpt strip_tac")
     assert content[thm.proof_body_offset:thm.proof_body_offset + 13] == "rpt strip_tac"
+
+
+# =============================================================================
+# Keyword regex: [^\S\n]* prevents matching across lines (commit 8e70dba)
+# =============================================================================
+
+
+def test_keyword_no_cross_line_match_proof_qed():
+    r"""Proof/QED with \s* would match blank lines left by comment stripping.
+
+    [^\S\n]* ensures the keyword regex only matches horizontal whitespace,
+    so blank lines between a comment and Proof/QED don't shift match positions.
+    """
+    # Simulate content where comment stripping left blank lines before keywords
+    content = '''\
+Theorem foo:
+  T
+
+Proof
+  simp[]
+
+QED
+'''
+    thms = parse_theorems(content)
+    assert len(thms) == 1
+    thm = thms[0]
+    assert thm.name == "foo"
+    # proof_end_line should point to the line AFTER QED, not a blank line
+    lines = content.split('\n')
+    qed_line_idx = next(i for i, l in enumerate(lines) if l.strip() == 'QED')
+    assert thm.proof_end_line == qed_line_idx + 2  # 1-indexed, line after QED
+
+
+def test_keyword_no_cross_line_match_termination_end():
+    """Termination/End keywords must not match across blank lines."""
+    content = '''\
+Definition fact_def:
+  fact (n:num) = if n = 0 then 1 else n * fact (n - 1)
+
+Termination
+
+  WF_REL_TAC `measure I`
+
+End
+'''
+    thms = parse_theorems(content)
+    assert len(thms) == 1
+    thm = thms[0]
+    assert thm.name == "fact_def"
+    assert thm.kind == "Definition"
+    lines = content.split('\n')
+    end_line_idx = next(i for i, l in enumerate(lines) if l.strip() == 'End')
+    assert thm.proof_end_line == end_line_idx + 2
+
+
+def test_end_before_termination_skipped():
+    """Definition...End without Termination should not match as Definition with proof.
+
+    Regression from remote commit 6a49ce6: if End appears before Termination,
+    it's a plain Definition, not one with a termination proof.
+    """
+    content = '''\
+Definition simple_def:
+  my_const = 42
+End
+
+Definition rec_def:
+  rec_fn (n:num) = if n = 0 then 1 else n * rec_fn (n - 1)
+Termination
+  WF_REL_TAC `measure I`
+End
+'''
+    thms = parse_theorems(content)
+    # Only rec_def should be parsed (has Termination proof)
+    assert len(thms) == 1
+    assert thms[0].name == "rec_def"

@@ -22,6 +22,7 @@ from hol4_mcp.hol_mcp_server import (
     hol_check_proof as _hol_check_proof,
     _kill_process_group,
     _sessions,
+    _SESSION_IDLE_TIMEOUT,
 )
 
 # Unwrap FunctionTool to get actual functions
@@ -1332,3 +1333,8 @@ val _ = export_theory();
         assert "-> 0" in r  # final step resolves all goals
     finally:
         await hol_stop(session=session)
+
+
+def test_session_idle_timeout_is_30_minutes():
+    """Session idle timeout should be 30 minutes (1800s), not 2 hours."""
+    assert _SESSION_IDLE_TIMEOUT == 1800
