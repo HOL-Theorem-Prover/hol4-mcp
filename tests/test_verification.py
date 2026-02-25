@@ -282,8 +282,11 @@ QED
 
 
 @pytest.mark.asyncio
-async def test_init_fails_on_fatal_pre_theorem_load_error(hol_session_tmpdir: HOLSession, tmp_path: Path):
-    """Regression: fatal pre-theorem load errors must fail init (not silently advance loaded_to_line)."""
+async def test_fatal_pre_theorem_load_error(hol_session_tmpdir: HOLSession, tmp_path: Path):
+    """Regression: fatal pre-theorem load errors must be reported (not silently advance loaded_to_line).
+
+    With lazy loading, init() succeeds but the error surfaces when entering a theorem.
+    """
     script = tmp_path / "testScript.sml"
     script.write_text("""\
 open definitelyMissingTheory;
@@ -302,17 +305,20 @@ QED
     cursor = FileProofCursor(script, hol_session_tmpdir)
     result = await cursor.init()
 
-    assert "error" in result
-    assert result["error"].startswith("Failed to load context:")
-    assert "Missing dependency:" in result["error"]
+    # init() succeeds with lazy loading — error surfaces on enter_theorem
+    assert "error" not in result
 
-    # Fatal pre-content failure must not mark file as loaded.
-    assert cursor.status["loaded_to_line"] == 0
+    result = await cursor.enter_theorem("uses_pre_def")
+    assert "error" in result
+    assert "Missing dependency:" in result["error"]
 
 
 @pytest.mark.asyncio
-async def test_init_fails_on_missing_file_load_statement(hol_session_tmpdir: HOLSession, tmp_path: Path):
-    """Regression: `load "..."` missing-file errors must be treated as fatal context failures."""
+async def test_missing_file_load_statement(hol_session_tmpdir: HOLSession, tmp_path: Path):
+    """Regression: `load "..."` missing-file errors must be treated as fatal context failures.
+
+    With lazy loading, init() succeeds but the error surfaces on enter_theorem.
+    """
     script = tmp_path / "testScript.sml"
     script.write_text("""\
 load "definitely_missing";
@@ -327,13 +333,20 @@ QED
     cursor = FileProofCursor(script, hol_session_tmpdir)
     result = await cursor.init()
 
+    # init() succeeds with lazy loading
+    assert "error" not in result
+
+    result = await cursor.enter_theorem("t")
     assert "error" in result
-    assert result["error"].startswith("Failed to load context:")
     assert "Missing dependency file:" in result["error"]
     assert "definitely_missing.ui" in result["error"]
 
-    # Fatal pre-content failure must not mark file as loaded.
-    assert cursor.status["loaded_to_line"] == 0
+
+def test_format_context_error_timeout_message():
+    """Timeout message should mention file content, not just 'loading context'."""
+    msg = _format_context_error("TIMEOUT after 60s")
+    assert "file content" in msg.lower() or "definition or proof" in msg.lower()
+    assert "Hint:" in msg
 
 
 def test_format_context_error_includes_env_var_recovery_steps():
@@ -392,12 +405,13 @@ End
     cursor = FileProofCursor(script, hol_session_tmpdir)
     await cursor.init()
 
-    # TC goal should have been extracted during init
+    # state_at before tactic: should show TC goal
+    # (TC goal is extracted lazily when entering the theorem)
+    result = await cursor.state_at(4, col=1)  # Termination line
+
+    # TC goal should have been extracted during lazy load
     assert "fact_def" in cursor._tc_goals
     assert "WF" in cursor._tc_goals["fact_def"]
-
-    # state_at before tactic: should show TC goal
-    result = await cursor.state_at(4, col=1)  # Termination line
     assert not result.error or "no goals" in (result.error or "")
     assert result.tactics_total >= 1
 
@@ -560,7 +574,11 @@ val _ = export_theory();
 
 @pytest.mark.asyncio
 async def test_cascade_prevented_init(hol_session_tmpdir: HOLSession, tmp_path: Path):
-    """T1: Init succeeds despite broken proof; cascade prevented by auto-cheat."""
+    """T1: Init succeeds despite broken proof; cascade prevented by auto-cheat.
+
+    With lazy loading, failed proofs are detected when loading context for
+    a later theorem (not during init).
+    """
     script = tmp_path / "testCascadeScript.sml"
     script.write_text(CASCADE_SCRIPT)
     cursor = FileProofCursor(script, hol_session_tmpdir)
@@ -569,6 +587,10 @@ async def test_cascade_prevented_init(hol_session_tmpdir: HOLSession, tmp_path: 
     # Init should succeed (no error), all 3 theorems found
     assert "error" not in result
     assert len(result["theorems"]) == 3
+
+    # Trigger lazy load by entering thm_c (loads thm_a and thm_b as context)
+    enter_result = await cursor.enter_theorem("thm_c")
+    assert "error" not in enter_result
 
     # thm_b should be in _failed_proofs and marked proof_failed in status
     assert "thm_b" in cursor._failed_proofs
@@ -624,7 +646,10 @@ async def test_failed_proofs_cleared_on_header_change(hol_session_tmpdir: HOLSes
     cursor = FileProofCursor(script, hol_session_tmpdir)
     await cursor.init()
 
-    # Verify thm_b is in failed_proofs after init
+    # Trigger lazy load to populate _failed_proofs
+    await cursor.enter_theorem("thm_c")
+
+    # Verify thm_b is in failed_proofs after lazy load
     assert "thm_b" in cursor._failed_proofs
 
     # Change pre-theorem content (triggers full session reinit path)
@@ -678,6 +703,11 @@ val _ = export_theory();
 
     assert "error" not in result
     assert len(result["theorems"]) == 4
+
+    # Trigger lazy load by entering ok2 (loads fail1, fail2 as context)
+    enter_result = await cursor.enter_theorem("ok2")
+    assert "error" not in enter_result
+
     assert cursor._failed_proofs == {"fail1", "fail2"}
 
     # ok2 references fail1 (cheated to TRUTH) — should still load
@@ -715,7 +745,10 @@ val _ = export_theory();
     cursor = FileProofCursor(script, hol_session_tmpdir)
     result = await cursor.init()
 
-    # Init should report the Definition failure clearly
+    # init() succeeds with lazy loading — error surfaces on enter_theorem
+    assert "error" not in result
+
+    result = await cursor.enter_theorem("uses_bad")
     assert "error" in result
     assert "bad_def" in result["error"]
     # Definition should NOT be in _failed_proofs (not cheated)

@@ -1128,6 +1128,13 @@ class FileProofCursor:
         if error:
             return {"error": error}
 
+        # Lazily extract TC goal / Resume goal for this theorem
+        # (must happen BEFORE the theorem block is processed)
+        if thm.kind == "Definition" and thm.proof_body and thm.name not in self._tc_goals:
+            await self._extract_tc_goal(thm)
+        if thm.kind == "Resume" and thm.name not in self._resume_goals:
+            await self._extract_resume_goal(thm)
+
         # Lazily save base checkpoint after first context load
         if not self._base_checkpoint_saved:
             await self.session.send('(drop_all(); PolyML.fullGC());', timeout=10)
