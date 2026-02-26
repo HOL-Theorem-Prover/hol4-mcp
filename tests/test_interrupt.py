@@ -22,12 +22,12 @@ from hol4_mcp.hol_mcp_server import (
     hol_interrupt as _hol_interrupt,
 )
 
-# Unwrap FunctionTool to get actual functions
-hol_start = _hol_start.fn
-hol_send = _hol_send.fn
-hol_sessions = _hol_sessions.fn
-hol_stop = _hol_stop.fn
-hol_interrupt = _hol_interrupt.fn
+# In FastMCP 3.x, @mcp.tool() returns the original function unchanged
+hol_start = _hol_start
+hol_send = _hol_send
+hol_sessions = _hol_sessions
+hol_stop = _hol_stop
+hol_interrupt = _hol_interrupt
 
 
 async def test_sigint_handler_installed():

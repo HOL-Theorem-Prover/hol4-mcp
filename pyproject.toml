@@ -4,7 +4,7 @@ version = "0.1.0"
 description = "MCP server and tools for HOL4 theorem prover"
 requires-python = ">=3.11"
 dependencies = [
-    "fastmcp>=2.0.0",
+    "fastmcp>=3.0.0",
 ]
 
 [project.scripts]

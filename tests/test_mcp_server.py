@@ -25,18 +25,19 @@ from hol4_mcp.hol_mcp_server import (
     _SESSION_IDLE_TIMEOUT,
 )
 
-# Unwrap FunctionTool to get actual functions
-hol_start = _hol_start.fn
-hol_send = _hol_send.fn
-hol_sessions = _hol_sessions.fn
-hol_stop = _hol_stop.fn
-hol_log = _hol_log.fn
-hol_logs = _hol_logs.fn
-holmake = _holmake.fn
-hol_file_init = _init_file_cursor  # Direct function, not .fn
-hol_state_at = _hol_state_at.fn
-hol_check_proof = _hol_check_proof.fn
-hol_file_status = _hol_file_status.fn
+# In FastMCP 3.x, @mcp.tool() returns the original function unchanged
+# (no .fn unwrapping needed). Alias for clarity.
+hol_start = _hol_start
+hol_send = _hol_send
+hol_sessions = _hol_sessions
+hol_stop = _hol_stop
+hol_log = _hol_log
+hol_logs = _hol_logs
+holmake = _holmake
+hol_file_init = _init_file_cursor
+hol_state_at = _hol_state_at
+hol_check_proof = _hol_check_proof
+hol_file_status = _hol_file_status
 
 FIXTURES_DIR = Path(__file__).parent / "fixtures"
 
