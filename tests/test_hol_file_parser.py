@@ -523,6 +523,56 @@ End
     assert thm.proof_end_line == end_line_idx + 2
 
 
+def test_proof_with_annotations():
+    """Proof[...] annotations (e.g. exclude_simps) should be parsed correctly."""
+    content = '''\
+Theorem assign_WordFromInt:
+  op = WordOp WordFromInt ==> assign_thm_goal
+Proof[exclude_simps = INT_OF_NUM NUM_EQ0]
+  rpt strip_tac
+QED
+'''
+    thms = parse_theorems(content)
+    assert len(thms) == 1
+    thm = thms[0]
+    assert thm.name == "assign_WordFromInt"
+    assert thm.proof_body == "rpt strip_tac"
+    assert thm.goal == "op = WordOp WordFromInt ==> assign_thm_goal"
+
+
+def test_proof_with_empty_annotations():
+    """Proof[] should also be handled."""
+    content = '''\
+Theorem foo:
+  T
+Proof[]
+  simp[]
+QED
+'''
+    thms = parse_theorems(content)
+    assert len(thms) == 1
+    assert thms[0].proof_body == "simp[]"
+
+
+def test_proof_annotation_line_numbers():
+    """Line numbers should be correct with Proof[...] annotations."""
+    content = '''\
+Theorem bar:
+  T /\\ T
+Proof[exclude_simps = foo bar]
+  conj_tac >> simp[]
+QED
+'''
+    thms = parse_theorems(content)
+    assert len(thms) == 1
+    thm = thms[0]
+    assert thm.start_line == 1
+    # proof_start_line is the line after Proof[...] (first line of proof body)
+    lines = content.split('\n')
+    proof_line_idx = next(i for i, l in enumerate(lines) if 'Proof[' in l)
+    assert thm.proof_start_line == proof_line_idx + 2  # 1-indexed, line after Proof
+
+
 def test_end_before_termination_skipped():
     """Definition...End without Termination should not match as Definition with proof.
 

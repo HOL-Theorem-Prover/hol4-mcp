@@ -277,7 +277,7 @@ def parse_theorems(content: str) -> list[TheoremInfo]:
         rest_stripped = stripped[match.end():]
         rest = content[match.end():]
 
-        proof_match = re.search(r'^[^\S\n]*Proof[^\S\n]*$', rest_stripped, re.MULTILINE)
+        proof_match = re.search(r'^[^\S\n]*Proof(?:\[.*?\])?[^\S\n]*$', rest_stripped, re.MULTILINE)
         if not proof_match:
             continue
 
