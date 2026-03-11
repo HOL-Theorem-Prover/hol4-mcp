@@ -9,6 +9,7 @@ import asyncio
 import hashlib
 import json
 import os
+import re
 import signal
 import sys
 import time
@@ -292,6 +293,40 @@ async def hol_sessions() -> str:
     return "\n".join(lines)
 
 
+_PROOF_STATE_PATTERNS = [
+    (re.compile(r"^\s*e\s*\("), "e(...)"),
+    (re.compile(r"^\s*b\s*\(\s*\)"), "b()"),
+    (re.compile(r"^\s*drop\s*\(\s*\)"), "drop()"),
+    (re.compile(r"^\s*top_goal\s*\(\s*\)"), "top_goal()"),
+    (re.compile(r"^\s*g\s*[`(]"), "g()/g`...`"),
+    (re.compile(r"^\s*p\s*\(\s*\)"), "p()"),
+    (re.compile(r"^\s*r\s*\(\s*\)"), "r()"),
+    (re.compile(r"proofManagerLib\."), "proofManagerLib.*"),
+]
+
+
+def _check_proof_state_command(command: str) -> str | None:
+    """Block hol_send commands that interact with proof state.
+
+    Returns an error message if blocked, None if allowed.
+    """
+    cmd = command.strip()
+    for pattern, name in _PROOF_STATE_PATTERNS:
+        if pattern.search(cmd):
+            return (
+                f"ERROR: hol_send BLOCKED — '{name}' interacts with proof state.\n"
+                f"\n"
+                f"hol_send must ONLY be used for read-only queries:\n"
+                f"  DB.match, DB.find, type_of, EVAL, printing theorems\n"
+                f"\n"
+                f"For proof development, use:\n"
+                f"  hol_state_at(line, col) — navigate to position, see goals\n"
+                f"  Edit tool — modify tactics in the file\n"
+                f"  hol_check_proof — validate complete proofs\n"
+            )
+    return None
+
+
 @mcp.tool()
 async def hol_send(command: str, timeout: int = 5, max_output: int = DEFAULT_MAX_OUTPUT, session: str = "default") -> str:
     """Send raw SML command to HOL session.
@@ -315,6 +350,10 @@ async def hol_send(command: str, timeout: int = 5, max_output: int = DEFAULT_MAX
 
     Returns: HOL output (may include errors), truncated if exceeds max_output
     """
+    blocked = _check_proof_state_command(command)
+    if blocked:
+        return blocked
+
     s = await _get_session(session)
     if not s:
         return f"ERROR: Session '{session}' not found. Use hol_sessions() to list available sessions."
