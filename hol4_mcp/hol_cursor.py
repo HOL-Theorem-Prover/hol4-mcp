@@ -246,8 +246,9 @@ class TraceEntry:
     real_ms: int                # Real time in milliseconds
     usr_ms: int                 # User CPU time in milliseconds
     sys_ms: int                 # System CPU time in milliseconds
-    goals_before: int           # Number of goals before execution
-    goals_after: int            # Number of goals after execution
+    # SML always emits both fields; None should be unreachable (defensive against malformed JSON)
+    goals_before: int | None     # Number of goals before execution
+    goals_after: int | None      # Number of goals after execution
     error: str | None = None    # Error message if tactic failed
     start_offset: int | None = None  # Start offset in theorem proof_body
     end_offset: int | None = None    # End offset in theorem proof_body
@@ -1740,12 +1741,14 @@ class FileProofCursor:
                 cmd = tactics[i] if i < len(tactics) else ""
                 start_offset = steps[i - 1].end if i > 0 and i - 1 < len(steps) else 0
                 end_offset = steps[i].end if i < len(steps) else None
+                goals_before = entry.get('goals_before')
+                goals_after = entry.get('goals_after')
                 trace.append(TraceEntry(
                     cmd=cmd,
                     real_ms=entry.get('real_ms', 0),
                     usr_ms=0, sys_ms=0,
-                    goals_before=entry.get('goals_before', 0),
-                    goals_after=entry.get('goals_after', 0),
+                    goals_before=goals_before,
+                    goals_after=goals_after,
                     error=entry.get('err'),
                     start_offset=start_offset,
                     end_offset=end_offset,
@@ -1753,7 +1756,7 @@ class FileProofCursor:
         elif 'err' in parsed:
             trace.append(TraceEntry(
                 cmd="", real_ms=0, usr_ms=0, sys_ms=0,
-                goals_before=0, goals_after=0, error=parsed['err']
+                goals_before=None, goals_after=None, error=parsed['err']
             ))
 
         # Track oracle tags (detects cheat cascades via HOL4's tag propagation)
@@ -1846,7 +1849,7 @@ class FileProofCursor:
                             # Definition failures can't be cheated; record error
                             results[thm.name] = [TraceEntry(
                                 cmd="", real_ms=0, usr_ms=0, sys_ms=0,
-                                goals_before=0, goals_after=0,
+                                goals_before=None, goals_after=None,
                                 error=f"Definition failed: {result[:200]}"
                             )]
                             current_line = thm.proof_end_line - 1
@@ -1895,7 +1898,7 @@ class FileProofCursor:
                         if _is_hol_error(def_result):
                             results[thm.name] = [TraceEntry(
                                 cmd="", real_ms=0, usr_ms=0, sys_ms=0,
-                                goals_before=0, goals_after=0,
+                                goals_before=None, goals_after=None,
                                 error=f"Definition failed: {def_result[:200]}"
                             )]
                         else:
@@ -1941,12 +1944,14 @@ class FileProofCursor:
                     cmd = tactics[i] if i < len(tactics) else ""
                     start_offset = steps[i - 1].end if i > 0 and i - 1 < len(steps) else 0
                     end_offset = steps[i].end if i < len(steps) else None
+                    goals_before = entry.get('goals_before')
+                    goals_after = entry.get('goals_after')
                     trace.append(TraceEntry(
                         cmd=cmd,
                         real_ms=entry.get('real_ms', 0),
                         usr_ms=0, sys_ms=0,
-                        goals_before=entry.get('goals_before', 0),
-                        goals_after=entry.get('goals_after', 0),
+                        goals_before=goals_before,
+                        goals_after=goals_after,
                         error=entry.get('err'),
                         start_offset=start_offset,
                         end_offset=end_offset,
@@ -1955,7 +1960,7 @@ class FileProofCursor:
                 # Goal setup failed - record single error entry
                 trace.append(TraceEntry(
                     cmd="", real_ms=0, usr_ms=0, sys_ms=0,
-                    goals_before=0, goals_after=0, error=parsed['err']
+                    goals_before=None, goals_after=None, error=parsed['err']
                 ))
 
             # Did verify_theorem_json store the theorem?
@@ -1991,7 +1996,7 @@ class FileProofCursor:
                         # Definition block failed — record error in trace
                         trace.append(TraceEntry(
                             cmd="", real_ms=0, usr_ms=0, sys_ms=0,
-                            goals_before=0, goals_after=0,
+                            goals_before=None, goals_after=None,
                             error=f"Definition failed: {def_result[:200]}"
                         ))
             elif stored and thm.attributes:

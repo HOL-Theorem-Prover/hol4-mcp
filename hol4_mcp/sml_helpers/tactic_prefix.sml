@@ -509,14 +509,21 @@ fun verify_core name tactics store timeout_sec =
                  ",\"goals_after\":" ^ Int.toString goals_after ^ "}"), false)
       end
       handle smlTimeout.FunctionTimeout =>
-        let val timeout_ms = Real.round (timeout_sec * 1000.0) in
+        let
+          val timeout_ms = Real.round (timeout_sec * 1000.0)
+          val goals_now = length (top_goals()) handle _ => 0
+        in
         (SOME ("{\"err\":\"TIMEOUT after " ^ Real.fmt (StringCvt.FIX (SOME 1)) timeout_sec ^ "s\"" ^
                ",\"real_ms\":" ^ Int.toString timeout_ms ^
-               ",\"goals_before\":" ^ Int.toString (length (top_goals()) handle _ => 0) ^ "}"), false)
+               ",\"goals_before\":" ^ Int.toString goals_now ^
+               ",\"goals_after\":" ^ Int.toString goals_now ^ "}"), false)
         end
       | e =>
+        let val goals_now = length (top_goals()) handle _ => 0 in
         (SOME ("{\"err\":" ^ json_string (exnMessage e) ^
-               ",\"goals_before\":" ^ Int.toString (length (top_goals()) handle _ => 0) ^ "}"), false)
+               ",\"goals_before\":" ^ Int.toString goals_now ^
+               ",\"goals_after\":" ^ Int.toString goals_now ^ "}"), false)
+        end
 
     fun run_all [] acc = rev acc
       | run_all (cmd::rest) acc =

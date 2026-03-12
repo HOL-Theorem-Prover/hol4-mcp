@@ -1160,7 +1160,9 @@ async def hol_check_proof(
                         f"{substep_info['count']} (line {sl} col {sc}): {sub_text}"
                     )
             else:
-                lines.append(f"  {entry.real_ms}ms | Goals: {entry.goals_before} -> {entry.goals_after}")
+                gb = entry.goals_before if entry.goals_before is not None else "?"
+                ga = entry.goals_after if entry.goals_after is not None else "?"
+                lines.append(f"  {entry.real_ms}ms | Goals: {gb} -> {ga}")
         lines.append("")
 
     # Show failing tactic with location (when not in trace mode, which already shows all steps)
@@ -1185,7 +1187,8 @@ async def hol_check_proof(
     # Brief goal summary for failure/incomplete
     if failed_idx is not None:
         lines.append("")
-        lines.append(f"Remaining: {final.goals_after} goal(s)")
+        ga = final.goals_after if final.goals_after is not None else "unknown"
+        lines.append(f"Remaining: {ga} goal(s)")
         if substep_info:
             fail_line, fail_col = offset_to_pos(substep_info['start_offset'])
         else:
@@ -1257,13 +1260,14 @@ async def hol_file_status(file: str = None, workdir: str = None, timing: bool = 
                 total_ms += thm_ms
                 error = next((e.error for e in trace if e.error), None)
                 # Check proof actually completed (no remaining goals)
-                final_goals = trace[-1].goals_after if trace else -1
+                final_goals = trace[-1].goals_after if trace else None
                 if error:
                     failed.append((thm['name'], error))
                     timing_lines.append(f"  {thm['name']}: {thm_ms}ms (ERROR: {error})")
-                elif final_goals != 0:
-                    failed.append((thm['name'], f"incomplete ({final_goals} goals remain)"))
-                    timing_lines.append(f"  {thm['name']}: {thm_ms}ms (INCOMPLETE: {final_goals} goals)")
+                elif final_goals is None or final_goals != 0:
+                    fg = final_goals if final_goals is not None else "unknown"
+                    failed.append((thm['name'], f"incomplete ({fg} goals remain)"))
+                    timing_lines.append(f"  {thm['name']}: {thm_ms}ms (INCOMPLETE: {fg} goals)")
                 else:
                     # Check oracle tags from HOL4 — detects cheat cascades
                     oracles = cursor._theorem_oracles.get(thm['name'], [])
