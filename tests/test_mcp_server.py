@@ -23,6 +23,7 @@ from hol4_mcp.hol_mcp_server import (
     _kill_process_group,
     _sessions,
     _SESSION_IDLE_TIMEOUT,
+    _file_offset_to_line_col,
 )
 
 # In FastMCP 3.x, @mcp.tool() returns the original function unchanged
@@ -1339,3 +1340,174 @@ val _ = export_theory();
 def test_session_idle_timeout_is_30_minutes():
     """Session idle timeout should be 30 minutes (1800s), not 2 hours."""
     assert _SESSION_IDLE_TIMEOUT == 1800
+
+
+# --- Tests for absolute line/col reporting ---
+
+def test_file_offset_to_line_col_basic():
+    """_file_offset_to_line_col converts byte offset to 1-indexed (line, col)."""
+    content = "abc\ndef\nghi"
+    # offset 0 = 'a' -> line 1, col 1
+    assert _file_offset_to_line_col(0, content) == (1, 1)
+    # offset 3 = '\n' -> line 1, col 4
+    assert _file_offset_to_line_col(3, content) == (1, 4)
+    # offset 4 = 'd' -> line 2, col 1
+    assert _file_offset_to_line_col(4, content) == (2, 1)
+    # offset 7 = '\n' -> line 2, col 4
+    assert _file_offset_to_line_col(7, content) == (2, 4)
+    # offset 8 = 'g' -> line 3, col 1
+    assert _file_offset_to_line_col(8, content) == (3, 1)
+
+
+def test_file_offset_to_line_col_first_char():
+    """Edge case: offset 0 with no preceding newline."""
+    assert _file_offset_to_line_col(0, "x") == (1, 1)
+
+
+# Script with blank line between Proof and first tactic
+BLANK_LINE_AFTER_PROOF_SCRIPT = '''\
+open HolKernel Parse boolLib bossLib;
+
+val _ = new_theory "blankline";
+
+Theorem first_thm:
+  T
+Proof
+  simp[]
+QED
+
+Theorem second_thm:
+  !a b. a /\\ b ==> b /\\ a
+Proof
+
+  rpt strip_tac >>
+  simp[bad_theorem] >>
+  decide_tac
+QED
+
+val _ = export_theory();
+'''
+
+# Script without blank line after Proof (normal case)
+NORMAL_PROOF_SCRIPT = '''\
+open HolKernel Parse boolLib bossLib;
+
+val _ = new_theory "normalproof";
+
+Theorem first_thm:
+  T
+Proof
+  simp[]
+QED
+
+Theorem second_thm:
+  !a b. a /\\ b ==> b /\\ a
+Proof
+  rpt strip_tac >>
+  simp[bad_theorem] >>
+  decide_tac
+QED
+
+val _ = export_theory();
+'''
+
+
+@pytest.mark.asyncio
+async def test_check_proof_absolute_lines_with_blank_line(tmp_path):
+    """hol_check_proof reports absolute file line numbers even when
+    there's a blank line between Proof and the first tactic.
+
+    File layout (BLANK_LINE_AFTER_PROOF_SCRIPT):
+      Line 13: Proof
+      Line 14: (blank)
+      Line 15: "  rpt strip_tac >>"   <- first tactic
+      Line 16: "  simp[bad_theorem] >>"
+    """
+    test_file = tmp_path / "blanklineScript.sml"
+    test_file.write_text(BLANK_LINE_AFTER_PROOF_SCRIPT)
+    session = "abs_line_blank_test"
+
+    try:
+        r = await hol_check_proof(
+            theorem="second_thm", file=str(test_file), session=session, trace=True
+        )
+        assert "FAILED" in r
+        # First tactic is at line 15 (after blank line 14), NOT line 14
+        assert "line/col 15:" in r, f"Expected line 15 (first tactic), got: {r}"
+        # The suggested hol_state_at line must also be absolute
+        assert "hol_state_at(line=15" in r, f"Suggested line should be 15: {r}"
+    finally:
+        await hol_stop(session=session)
+
+
+@pytest.mark.asyncio
+async def test_check_proof_absolute_lines_normal(tmp_path):
+    """hol_check_proof reports absolute file line numbers (no blank line case).
+
+    File layout (NORMAL_PROOF_SCRIPT):
+      Line 13: Proof
+      Line 14: "  rpt strip_tac >>"   <- first tactic
+      Line 15: "  simp[bad_theorem] >>"
+    """
+    test_file = tmp_path / "normalproofScript.sml"
+    test_file.write_text(NORMAL_PROOF_SCRIPT)
+    session = "abs_line_normal_test"
+
+    try:
+        r = await hol_check_proof(
+            theorem="second_thm", file=str(test_file), session=session, trace=True
+        )
+        assert "FAILED" in r
+        # First tactic at line 14 (right after Proof on line 13)
+        assert "line/col 14:" in r, f"Expected line 14, got: {r}"
+        assert "hol_state_at(line=14" in r, f"Suggested line should be 14: {r}"
+    finally:
+        await hol_stop(session=session)
+
+
+@pytest.mark.asyncio
+async def test_check_proof_absolute_columns(tmp_path):
+    """hol_check_proof columns are absolute in the file, not relative to proof body.
+
+    "  rpt strip_tac" is indented 2 spaces -> col 3 (1-indexed).
+    """
+    test_file = tmp_path / "normalproofScript.sml"
+    test_file.write_text(NORMAL_PROOF_SCRIPT)
+    session = "abs_col_test"
+
+    try:
+        r = await hol_check_proof(
+            theorem="second_thm", file=str(test_file), session=session, trace=True
+        )
+        # "  rpt strip_tac" starts at col 3 (2 spaces + 'r')
+        # Must NOT be col 1 (which would mean relative to stripped proof_body)
+        assert "14:3" in r, f"Expected col 3 for indented tactic, got: {r}"
+    finally:
+        await hol_stop(session=session)
+
+
+@pytest.mark.asyncio
+async def test_state_at_absolute_lines_with_blank_line(tmp_path):
+    """hol_state_at reports absolute line numbers with blank line after Proof.
+
+    File layout (BLANK_LINE_AFTER_PROOF_SCRIPT):
+      Line 13: Proof
+      Line 14: (blank)
+      Line 15: "  rpt strip_tac >>"
+      Line 18: QED
+    """
+    test_file = tmp_path / "blanklineScript.sml"
+    test_file.write_text(BLANK_LINE_AFTER_PROOF_SCRIPT)
+    session = "abs_line_state_at_test"
+
+    try:
+        await hol_file_init(file=str(test_file), session=session)
+
+        # Request state at QED line (line 18). Proof is broken, so PROOF BROKEN.
+        r = await hol_state_at(session=session, line=18, col=1)
+        assert "PROOF BROKEN" in r
+        # The failure location must be line 15 (rpt strip_tac), not line 14 (blank)
+        assert "line 15" in r, f"Expected failure at line 15, got: {r}"
+        assert "hol_state_at(line=15" in r, f"Suggested line should be 15: {r}"
+    finally:
+        await hol_stop(session=session)

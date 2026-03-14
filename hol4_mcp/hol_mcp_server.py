@@ -28,6 +28,15 @@ from .hol_file_parser import HOLParseError
 DEFAULT_MAX_OUTPUT = 4096
 
 
+def _file_offset_to_line_col(file_offset: int, content: str) -> tuple[int, int]:
+    """Convert a byte offset in file content to absolute (line, col), both 1-indexed."""
+    before = content[:file_offset]
+    line = before.count('\n') + 1
+    last_nl = before.rfind('\n')
+    col = file_offset - last_nl if last_nl >= 0 else file_offset + 1
+    return line, col
+
+
 def _truncate_output(output: str, max_output: int, footer: str = "") -> str:
     """Truncate output to max_output bytes, showing tail.
 
@@ -872,23 +881,20 @@ async def hol_state_at(
     active_theorem = cursor._active_theorem
     thm = cursor._get_theorem(active_theorem) if active_theorem else None
 
-    # Helper to convert tactic index to line:col
+    # Helper to convert tactic index to absolute line:col
     def tactic_to_loc(idx):
         if not thm:
             return None
         if not thm.proof_body or idx <= 0:
-            return (thm.proof_start_line, 1)
+            # Start of proof body content (accounts for stripped whitespace)
+            return _file_offset_to_line_col(thm.proof_body_offset, cursor._content)
         if idx > len(cursor._step_plan):
             idx = len(cursor._step_plan)
         if idx > 0:
             step = cursor._step_plan[idx - 1]
-            # Find line and column
-            before = thm.proof_body[:step.end]
-            line_num = thm.proof_start_line + before.count('\n')
-            last_nl = before.rfind('\n')
-            col_num = step.end - last_nl if last_nl >= 0 else step.end + 1
-            return (line_num, col_num)
-        return (thm.proof_start_line, 1)
+            file_pos = thm.proof_body_offset + step.end
+            return _file_offset_to_line_col(file_pos, cursor._content)
+        return _file_offset_to_line_col(thm.proof_body_offset, cursor._content)
 
     lines = []
     error_footer = ""  # Errors go in footer so truncation never hides them
@@ -1095,15 +1101,11 @@ async def hol_check_proof(
             failed_idx = i
             break
 
-    # Compute line:col from offset within proof_body
+    # Compute absolute line:col from proof_body offset using file content
     def offset_to_pos(offset):
         if not thm.proof_body or offset < 0:
-            return thm.proof_start_line, 1
-        before = thm.proof_body[:offset]
-        line = thm.proof_start_line + before.count('\n')
-        last_nl = before.rfind('\n')
-        col = offset - last_nl if last_nl >= 0 else offset + 1
-        return line, col
+            return _file_offset_to_line_col(thm.proof_body_offset, cursor._content)
+        return _file_offset_to_line_col(thm.proof_body_offset + offset, cursor._content)
 
     # Get tactic start/end range
     def tactic_range(idx):
