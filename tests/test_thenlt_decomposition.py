@@ -61,14 +61,14 @@ PROOF_CASES = [
         # conj_tac >- arm1 >> continuation — classic split pattern
         "(A:bool) /\\ B ==> B /\\ A",
         "strip_tac >> conj_tac >- (first_assum ACCEPT_TAC) >- (first_assum ACCEPT_TAC)",
-        3,  # strip_tac, conj_tac, >- suffix
+        4,  # strip_tac, conj_tac, arm1, arm2
     ),
     (
         "bare_thenlt",
         # No >> base, just tactic >- arms
         "(A:bool) /\\ B ==> A /\\ B",
         "strip_tac >> conj_tac >- fs[] >- fs[]",
-        3,
+        4,  # strip_tac, conj_tac, arm1, arm2
     ),
 
     # -----------------------------------------------------------------
@@ -79,14 +79,14 @@ PROOF_CASES = [
         "eq_tac_thenlt",
         "(A:bool) /\\ B <=> B /\\ A",
         "eq_tac >- (strip_tac >> conj_tac >> fs[]) >- (strip_tac >> conj_tac >> fs[])",
-        2,  # eq_tac, >- suffix
+        3,  # eq_tac, arm1, arm2
     ),
     (
         "eq_tac_with_chain",
         # >> before eq_tac >-
         "T ==> ((A:bool) /\\ B <=> B /\\ A)",
         "strip_tac >> eq_tac >- (strip_tac >> simp[]) >- (strip_tac >> simp[])",
-        3,  # strip_tac, eq_tac, >- suffix
+        4,  # strip_tac, eq_tac, arm1, arm2
     ),
 
     # -----------------------------------------------------------------
@@ -97,13 +97,13 @@ PROOF_CASES = [
         "cases_bool",
         "(b:bool) ==> b \\/ ~b",
         "Cases_on `b` >- simp[] >- simp[]",
-        2,  # Cases_on, >- suffix
+        3,  # Cases_on, arm1, arm2
     ),
     (
         "cases_with_chain",
         "(A:bool) ==> (b:bool) ==> A",
         "strip_tac >> Cases_on `b` >- simp[] >- simp[]",
-        3,  # strip_tac, Cases_on, >- suffix
+        4,  # strip_tac, Cases_on, arm1, arm2
     ),
 
     # -----------------------------------------------------------------
@@ -114,7 +114,7 @@ PROOF_CASES = [
         "induct_thenlt",
         "!n:num. n + 0 = n",
         "Induct >- simp[] >- simp[]",
-        2,  # Induct, >- suffix
+        3,  # Induct, arm1, arm2
     ),
     (
         "induct_with_chain",
@@ -156,7 +156,7 @@ PROOF_CASES = [
         "nested_thenlt",
         "(A:bool) /\\ B ==> B /\\ (A /\\ T)",
         "strip_tac >> conj_tac >- (first_assum ACCEPT_TAC) >- (conj_tac >- (first_assum ACCEPT_TAC) >- simp[])",
-        3,  # strip_tac, conj_tac, >- suffix (nested >- is inside arm, stays atomic)
+        4,  # strip_tac, conj_tac, arm1, arm2 (nested >- is inside arm, opaque)
     ),
 
     # -----------------------------------------------------------------
@@ -167,7 +167,7 @@ PROOF_CASES = [
         "chains_in_arms",
         "(A:bool) /\\ B ==> (A ==> B) /\\ (B ==> A)",
         "strip_tac >> conj_tac >- (strip_tac >> first_assum ACCEPT_TAC) >- (strip_tac >> first_assum ACCEPT_TAC)",
-        3,  # strip_tac, conj_tac, >- suffix
+        4,  # strip_tac, conj_tac, arm1, arm2
     ),
 
     # -----------------------------------------------------------------
@@ -234,7 +234,7 @@ PROOF_CASES = [
         "long_base_thenlt",
         "(A:bool) /\\ B /\\ C ==> A /\\ (B /\\ C)",
         "strip_tac >> conj_tac >- fs[] >- (conj_tac >- fs[] >- fs[])",
-        3,  # strip_tac, conj_tac, >- suffix
+        4,  # strip_tac, conj_tac, arm1, arm2
     ),
 
     # -----------------------------------------------------------------
@@ -255,7 +255,7 @@ PROOF_CASES = [
         "grouped_base",
         "(A:bool) /\\ B ==> B /\\ A",
         "(strip_tac >> conj_tac) >- (first_assum ACCEPT_TAC) >- (first_assum ACCEPT_TAC)",
-        3,  # strip_tac, conj_tac, >- suffix
+        4,  # strip_tac, conj_tac, arm1, arm2
     ),
 ]
 
@@ -326,17 +326,18 @@ class TestStepPlanDecomposition:
         assert len(result) == expected_steps, \
             f"{name}: expected {expected_steps} steps, got {len(result)}: {[s.cmd.strip() for s in result]}"
 
-    async def test_first_step_e_rest_eall(self, hol_session_with_prefix):
-        """First step uses e(), all subsequent use eall()."""
+    async def test_first_step_e_rest_eall_or_arm_e(self, hol_session_with_prefix):
+        """First base step uses e(), subsequent base steps use eall(), arm steps use e()."""
         result = await call_step_plan(
             hol_session_with_prefix,
             "strip_tac >> conj_tac >- (first_assum ACCEPT_TAC) >- (first_assum ACCEPT_TAC)"
         )
-        assert result[0].cmd.strip().startswith("e(")
-        for step in result[1:]:
-            cmd = step.cmd.strip()
-            assert cmd.startswith("eall(") or cmd.startswith("elt("), \
-                f"Non-eall/elt step: {step.cmd}"
+        assert len(result) == 4
+        assert result[0].cmd.strip().startswith("e(")       # base 1
+        assert result[1].cmd.strip().startswith("eall(")     # base 2
+        # Arms use e() because each solves one goal (THEN1 semantics)
+        assert result[2].cmd.strip().startswith("e(")
+        assert result[3].cmd.strip().startswith("e(")
 
     async def test_ends_monotonic(self, hol_session_with_prefix):
         """End positions should be strictly increasing."""
@@ -348,42 +349,46 @@ class TestStepPlanDecomposition:
         for i in range(1, len(ends)):
             assert ends[i] > ends[i-1], f"Non-monotonic ends: {ends}"
 
-    async def test_by_outermost_rewrites_to_thenl(self, hol_session_with_prefix):
-        """`by` at outermost ThenLT decomposes with >- (not by) in suffix.
+    async def test_by_outermost_decomposes(self, hol_session_with_prefix):
+        """`by` at outermost level decomposes into e(sg) + e(arm).
 
-        `by` = `sg >- tac`. After decomposing sg as base, suffix needs >-
-        because ALL_LT by tac is a type error (by expects quotation, not list_tactic).
+        `by` = `sg >- tac`. Single LThen1 arm → decomposed to e(tac).
         """
         result = await call_step_plan(
             hol_session_with_prefix, "`P` by simp[]"
         )
         assert len(result) == 2
         assert "sg" in result[0].cmd
-        suffix = result[1].cmd.strip()
-        assert suffix.startswith("elt(")
-        assert ">-" in suffix, f"by should be rewritten to >-: {suffix}"
-        assert " by " not in suffix, f"by should not appear in suffix: {suffix}"
+        arm = result[1].cmd.strip()
+        assert arm.startswith("e("), f"by arm should be e(): {arm}"
+        assert "ALL_LT" not in arm, f"Should not have ALL_LT: {arm}"
+        assert "simp" in arm
 
-    async def test_grouped_base_no_paren_leak(self, hol_session_with_prefix):
-        """Grouped base (a >> b) >- c must not leak closing paren into suffix."""
+    async def test_grouped_base_arms_correct(self, hol_session_with_prefix):
+        """Grouped base (a >> b) >- c decomposes base and arms separately."""
         result = await call_step_plan(
             hol_session_with_prefix,
             "(strip_tac >> conj_tac) >- (first_assum ACCEPT_TAC) >- (first_assum ACCEPT_TAC)"
         )
-        assert len(result) == 3
-        suffix = result[-1].cmd
-        assert "ALL_LT )" not in suffix, f"Closing paren leaked into suffix: {suffix}"
-        assert "ALL_LT >-" in suffix, f"Expected 'ALL_LT >-' in suffix: {suffix}"
+        assert len(result) == 4
+        # Base steps
+        assert "strip_tac" in result[0].cmd
+        assert "conj_tac" in result[1].cmd
+        # Arm steps use e() with correct text
+        for i in [2, 3]:
+            cmd = result[i].cmd.strip()
+            assert cmd.startswith("e("), f"Arm should use e(): {cmd}"
+            assert "ACCEPT_TAC" in cmd
 
-    async def test_suffix_contains_thenlt_operator(self, hol_session_with_prefix):
-        """The >- suffix step should contain the routing operator."""
+    async def test_arm_steps_have_correct_text(self, hol_session_with_prefix):
+        """Decomposed arm steps should contain the tactic text."""
         result = await call_step_plan(
             hol_session_with_prefix,
             "strip_tac >> conj_tac >- simp[] >- fs[]"
         )
-        suffix = result[-1].cmd
-        assert ">-" in suffix or ">>>" in suffix or "THEN_LT" in suffix or \
-               "HEADGOAL" in suffix, f"Suffix doesn't contain >- operator: {suffix}"
+        assert len(result) == 4
+        assert "simp" in result[2].cmd
+        assert "fs" in result[3].cmd
 
 
 # =============================================================================

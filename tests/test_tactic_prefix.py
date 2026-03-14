@@ -482,14 +482,14 @@ class TestStepPlan:
         assert "gvs" in result[2].cmd
 
     async def test_thenlt_chain(self, hol_session):
-        """>- at top level decomposes >> base, keeps >- suffix atomic.
+        """>- at top level decomposes base and arms into individual steps.
         
-        e(a); elt(ALL_LT >- b) ≡ e(a >- b) for the suffix step.
+        e(Induct); e(simp[]) ≡ e(Induct >- simp[]) for single >- arm.
         """
         result = await call_step_plan(hol_session, "Induct >- simp[]")
         assert len(result) == 2
         assert "Induct" in result[0].cmd
-        assert ">-" in result[1].cmd
+        assert result[1].cmd.strip().startswith("e(")
         assert "simp" in result[1].cmd
 
     async def test_mixed_then_and_thenlt(self, hol_session):

@@ -190,6 +190,9 @@ def count_goals(hol_output: str) -> int | None:
         return int(m.group(1))
     if "Initial goal proved" in hol_output:
         return 0
+    # Goal proved with remaining subgoals but no explicit count → 1 remaining
+    if "Goal proved" in hol_output and "Remaining subgoals" in hol_output:
+        return 1
     return None
 
 

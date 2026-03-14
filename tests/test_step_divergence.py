@@ -62,14 +62,14 @@ class TestStepPlan:
         assert plan[2].cmd.strip().startswith("eall(")
 
     async def test_step_plan_thenl_multiple_steps(self, hol_session):
-        """THENL (>-) with arms: base decomposed, suffix uses elt(ALL_LT ...)."""
+        """THENL (>-) with arms: base decomposed, arms decomposed into e() each."""
         tactic = "conj_tac >- simp[] >- fs[]"
         escaped = escape_sml_string(tactic)
         result = await hol_session.send(f'step_plan_json "{escaped}";', timeout=10)
         plan = parse_step_plan_output(result)
         
-        # Base (conj_tac) + suffix (>- simp[] >- fs[])
-        assert len(plan) == 2
+        # Base (conj_tac) + 2 arms (simp[], fs[])
+        assert len(plan) == 3
         # All steps start with e(, eall(, or elt(
         for step in plan:
             cmd = step.cmd.strip()

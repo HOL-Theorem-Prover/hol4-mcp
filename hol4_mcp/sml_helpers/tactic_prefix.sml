@@ -371,6 +371,26 @@ fun hasThenLTAtTop (TacticParse.ThenLT _) = true
   | hasThenLTAtTop (TacticParse.Group (_, _, e)) = hasThenLTAtTop e
   | hasThenLTAtTop _ = false
 
+(* Check if a list_tac_expr is LThen1 (>- arm, decomposable) *)
+fun isLThen1Arm (TacticParse.LThen1 _) = true
+  | isLThen1Arm _ = false
+
+(* Check if all arms in nested ThenLT chain are LThen1.
+   If ANY arm is not LThen1 (e.g., >| produces LNullOk), the entire
+   suffix must stay atomic because >| arms can produce subgoals. *)
+fun allArmsDecomposable (TacticParse.ThenLT (e, arms)) =
+      List.all isLThen1Arm arms andalso allArmsDecomposable e
+  | allArmsDecomposable (TacticParse.Group (_, _, e)) = allArmsDecomposable e
+  | allArmsDecomposable _ = true
+
+(* Collect inner tac_exprs from LThen1 arms in nested ThenLT chain.
+   Returns innermost arms first (matches evaluation order). *)
+fun collectLThen1Inners (TacticParse.ThenLT (e, arms)) =
+      collectLThen1Inners e @
+      List.mapPartial (fn (TacticParse.LThen1 inner) => SOME inner | _ => NONE) arms
+  | collectLThen1Inners (TacticParse.Group (_, _, e)) = collectLThen1Inners e
+  | collectLThen1Inners _ = []
+
 fun step_plan proofBody =
   let
     val tree = TacticParse.parseTacticBlock proofBody
@@ -415,14 +435,15 @@ fun step_plan proofBody =
 
   in
     if hasThenLTAtTop tree then
-      (* Top-level ThenLT (>-): decompose the >> base chain, keep >- suffix atomic.
+      (* Top-level ThenLT: decompose >> base chain, then handle arms.
          
-         Semantics: e(a); eall(b) ≡ e(a >> b) when starting from 1 goal.
-         Proofs always start with 1 goal, so decomposing the base is safe.
-         The >- suffix uses elt(ALL_LT ...) — a list_tactic applied to the
-         entire goal stack at once via expand_list:
-         - >- (THEN1) peels off first subgoal: ALL_LT >- arm solves goal 1
-         - >| (THENL) routes all subgoals: ALL_LT >| [arm1, arm2]
+         If all arms are LThen1 (>-), decompose each into e(arm_text).
+         Each >- arm solves exactly one goal (THEN1 semantics), so
+         sequential e(arm_k) is equivalent to the parallel >- chain.
+         
+         If any arm is NOT LThen1 (e.g., >| produces LNullOk), keep
+         entire suffix atomic as elt(ALL_LT ...) because >| arms can
+         produce subgoals that corrupt sequential execution.
          
          Refs: goalStack.sml expandf/expand_listf, Tactical.sml THEN1/ALL_LT *)
       let
@@ -431,48 +452,63 @@ fun step_plan proofBody =
         val baseEndPositions = collectEnds baseFrags []
         val baseSteps = makeSteps base baseEndPositions 0 true []
         
-        (* Find the >- / >| / by / >>> operator position in the text.
-           Scan forward from base span end, skipping whitespace and ')' (from
-           grouped bases like "(a >> b) >-"). First non-skip char is the operator. *)
-        val baseSpanOpt = computeSpan base
-        val suffixStep = case baseSpanOpt of
-            SOME (_, baseEnd) =>
-              let
-                fun skipWsAndClose i =
-                  if i >= fullEnd then i
-                  else let val c = String.sub(proofBody, i)
-                  in if Char.isSpace c orelse c = #")" then skipWsAndClose (i + 1) else i
+        val suffixSteps =
+          if allArmsDecomposable tree then
+            (* All arms are LThen1: decompose into individual e() steps *)
+            let
+              val innerExprs = collectLThen1Inners tree
+              fun armToStep expr =
+                case computeSpan expr of
+                  SOME (start, endPos) =>
+                    let val text = String.substring(proofBody, start, endPos - start)
+                    in SOME (endPos, "e(" ^ text ^ ");\n")
+                    end
+                | NONE => NONE
+            in
+              List.mapPartial armToStep innerExprs
+            end
+          else
+            (* Has >| or other non-LThen1 arm: keep suffix atomic.
+               Find operator position by scanning forward from base span end,
+               skipping whitespace and ')' (grouped bases like "(a >> b) >-"). *)
+            let
+              val baseSpanOpt = computeSpan base
+            in
+              case baseSpanOpt of
+                SOME (_, baseEnd) =>
+                  let
+                    fun skipWsAndClose i =
+                      if i >= fullEnd then i
+                      else let val c = String.sub(proofBody, i)
+                      in if Char.isSpace c orelse c = #")" then skipWsAndClose (i + 1) else i
+                      end
+                    val opStart = skipWsAndClose baseEnd
+                    val suffixText = String.substring(proofBody, opStart, fullEnd - opStart)
+                    (* `by` is sugar for `sg >- tac`. Replace "by" with ">-". *)
+                    val isByOp = String.size suffixText >= 2 andalso
+                      String.substring(suffixText, 0, 2) = "by" andalso
+                      (String.size suffixText = 2 orelse
+                       not (Char.isAlphaNum (String.sub(suffixText, 2))))
+                    val suffix =
+                      if isByOp
+                      then ">- " ^ String.extract(suffixText, 2, NONE)
+                      else suffixText
+                    val cmd = "elt(ALL_LT " ^ suffix ^ ");\n"
+                  in
+                    [(fullEnd, cmd)]
                   end
-                val opStart = skipWsAndClose baseEnd
-                val suffixText = String.substring(proofBody, opStart, fullEnd - opStart)
-                (* `by` is sugar for `sg >- tac`. After decomposing sg as a base
-                   step, the suffix needs >- (THEN1), not by (which expects a
-                   quotation as first arg). Replace "by" with ">-". *)
-                val isByOp = String.size suffixText >= 2 andalso
-                  String.substring(suffixText, 0, 2) = "by" andalso
-                  (String.size suffixText = 2 orelse
-                   not (Char.isAlphaNum (String.sub(suffixText, 2))))
-                val suffix =
-                  if isByOp
-                  then ">- " ^ String.extract(suffixText, 2, NONE)
-                  else suffixText
-                val cmd = "elt(ALL_LT " ^ suffix ^ ");\n"
-              in
-                [(fullEnd, cmd)]
-              end
-          | NONE =>
-              (* This shouldn't happen — hasThenLTAtTop guarantees arms exist.
-                 Fallback to atomic rather than crashing, but emit warning. *)
-              let
-                val _ = TextIO.output(TextIO.stdErr,
-                  "step_plan: WARNING: ThenLT with no arm spans, falling back to atomic\n")
-                val frags = TacticParse.sliceTacticBlock 0 fullEnd false defaultSpan tree
-                val cmd = TacticParse.printFragsAsE proofBody frags
-              in
-                [(fullEnd, cmd)]
-              end
+              | NONE =>
+                  let
+                    val _ = TextIO.output(TextIO.stdErr,
+                      "step_plan: WARNING: ThenLT with no arm spans, falling back to atomic\n")
+                    val frags = TacticParse.sliceTacticBlock 0 fullEnd false defaultSpan tree
+                    val cmd = TacticParse.printFragsAsE proofBody frags
+                  in
+                    [(fullEnd, cmd)]
+                  end
+            end
       in
-        baseSteps @ suffixStep
+        baseSteps @ suffixSteps
       end
     else
       (* No ThenLT at top: normal linearization *)
