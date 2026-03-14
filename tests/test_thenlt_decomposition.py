@@ -247,6 +247,16 @@ PROOF_CASES = [
         3,  # strip_tac, (`A` by fs[]), fs[]
         # `by` creates ThenLT inside Group which sits in the >> chain
     ),
+
+    # -----------------------------------------------------------------
+    # Grouped base — parens must not leak into suffix
+    # -----------------------------------------------------------------
+    (
+        "grouped_base",
+        "(A:bool) /\\ B ==> B /\\ A",
+        "(strip_tac >> conj_tac) >- (first_assum ACCEPT_TAC) >- (first_assum ACCEPT_TAC)",
+        3,  # strip_tac, conj_tac, >- suffix
+    ),
 ]
 
 
@@ -324,7 +334,9 @@ class TestStepPlanDecomposition:
         )
         assert result[0].cmd.strip().startswith("e(")
         for step in result[1:]:
-            assert step.cmd.strip().startswith("eall("), f"Non-eall step: {step.cmd}"
+            cmd = step.cmd.strip()
+            assert cmd.startswith("eall(") or cmd.startswith("elt("), \
+                f"Non-eall/elt step: {step.cmd}"
 
     async def test_ends_monotonic(self, hol_session_with_prefix):
         """End positions should be strictly increasing."""
@@ -335,6 +347,33 @@ class TestStepPlanDecomposition:
         ends = [step.end for step in result]
         for i in range(1, len(ends)):
             assert ends[i] > ends[i-1], f"Non-monotonic ends: {ends}"
+
+    async def test_by_outermost_rewrites_to_thenl(self, hol_session_with_prefix):
+        """`by` at outermost ThenLT decomposes with >- (not by) in suffix.
+
+        `by` = `sg >- tac`. After decomposing sg as base, suffix needs >-
+        because ALL_LT by tac is a type error (by expects quotation, not list_tactic).
+        """
+        result = await call_step_plan(
+            hol_session_with_prefix, "`P` by simp[]"
+        )
+        assert len(result) == 2
+        assert "sg" in result[0].cmd
+        suffix = result[1].cmd.strip()
+        assert suffix.startswith("elt(")
+        assert ">-" in suffix, f"by should be rewritten to >-: {suffix}"
+        assert " by " not in suffix, f"by should not appear in suffix: {suffix}"
+
+    async def test_grouped_base_no_paren_leak(self, hol_session_with_prefix):
+        """Grouped base (a >> b) >- c must not leak closing paren into suffix."""
+        result = await call_step_plan(
+            hol_session_with_prefix,
+            "(strip_tac >> conj_tac) >- (first_assum ACCEPT_TAC) >- (first_assum ACCEPT_TAC)"
+        )
+        assert len(result) == 3
+        suffix = result[-1].cmd
+        assert "ALL_LT )" not in suffix, f"Closing paren leaked into suffix: {suffix}"
+        assert "ALL_LT >-" in suffix, f"Expected 'ALL_LT >-' in suffix: {suffix}"
 
     async def test_suffix_contains_thenlt_operator(self, hol_session_with_prefix):
         """The >- suffix step should contain the routing operator."""

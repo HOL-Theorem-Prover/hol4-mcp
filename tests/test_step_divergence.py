@@ -62,18 +62,18 @@ class TestStepPlan:
         assert plan[2].cmd.strip().startswith("eall(")
 
     async def test_step_plan_thenl_multiple_steps(self, hol_session):
-        """THENL (>-) with arms returns multiple steps (linearize splits them)."""
+        """THENL (>-) with arms: base decomposed, suffix uses elt(ALL_LT ...)."""
         tactic = "conj_tac >- simp[] >- fs[]"
         escaped = escape_sml_string(tactic)
         result = await hol_session.send(f'step_plan_json "{escaped}";', timeout=10)
         plan = parse_step_plan_output(result)
         
-        # THENL is linearized into fragments
-        assert len(plan) >= 1
-        # All steps start with e( or eall(
+        # Base (conj_tac) + suffix (>- simp[] >- fs[])
+        assert len(plan) == 2
+        # All steps start with e(, eall(, or elt(
         for step in plan:
             cmd = step.cmd.strip()
-            assert cmd.startswith("e(") or cmd.startswith("eall(")
+            assert cmd.startswith("e(") or cmd.startswith("eall(") or cmd.startswith("elt(")
 
     async def test_step_plan_thenl_bracket(self, hol_session):
         """THENL with bracket (>|) returns steps."""
@@ -97,7 +97,7 @@ class TestStepPlan:
             assert plan[i].end >= plan[i-1].end
 
     async def test_step_plan_commands_are_executable(self, hol_session):
-        """Step commands should be valid e() or eall() calls."""
+        """Step commands should be valid e(), eall(), or elt() calls."""
         tactic = "conj_tac >- simp[] >- fs[]"
         escaped = escape_sml_string(tactic)
         result = await hol_session.send(f'step_plan_json "{escaped}";', timeout=10)
@@ -105,5 +105,5 @@ class TestStepPlan:
         
         for step in plan:
             cmd = step.cmd.strip()
-            assert cmd.startswith("e(") or cmd.startswith("eall(")
+            assert cmd.startswith("e(") or cmd.startswith("eall(") or cmd.startswith("elt(")
             assert cmd.endswith(");")

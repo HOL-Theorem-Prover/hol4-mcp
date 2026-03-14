@@ -482,16 +482,15 @@ class TestStepPlan:
         assert "gvs" in result[2].cmd
 
     async def test_thenlt_chain(self, hol_session):
-        """>- at top level is atomic (cannot be decomposed reliably).
+        """>- at top level decomposes >> base, keeps >- suffix atomic.
         
-        The >- combinator has complex goal routing that can't be replicated
-        with separate e()/eall() calls. Treating it as atomic ensures correctness.
+        e(a); elt(ALL_LT >- b) ≡ e(a >- b) for the suffix step.
         """
         result = await call_step_plan(hol_session, "Induct >- simp[]")
-        assert len(result) == 1
+        assert len(result) == 2
         assert "Induct" in result[0].cmd
-        assert ">-" in result[0].cmd
-        assert "simp" in result[0].cmd
+        assert ">-" in result[1].cmd
+        assert "simp" in result[1].cmd
 
     async def test_mixed_then_and_thenlt(self, hol_session):
         """Mixed >> and >- should handle both."""
@@ -547,10 +546,10 @@ class TestStepPlan:
         assert plan_ends == steps_ends
 
     async def test_by_construct(self, hol_session):
-        """`by` is parsed as ThenLT, so treated as atomic (same as >-)."""
+        """`by` is parsed as ThenLT — decomposes base, keeps >- suffix."""
         result = await call_step_plan(hol_session, "`P` by simp[]")
-        # `by` = ThenLT at top level → atomic
-        assert len(result) == 1
+        # `by` = ThenLT at top level → base + suffix
+        assert len(result) == 2
 
     async def test_by_in_chain(self, hol_session):
         """`by` in >> chain should be one step."""
