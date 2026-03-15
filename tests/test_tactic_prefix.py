@@ -118,17 +118,17 @@ class TestPrefixCommands:
 class TestByConstruct:
     """Tests for `by` and `suffices_by` constructs."""
 
-    async def test_by_atomic(self, hol_session):
-        """`by` should be treated as atomic."""
+    async def test_by_exposes_subgoal_boundary(self, hol_session):
+        """`by` exposes sg boundary for substep pinpointing."""
         result = await call_step_positions(hol_session, "`foo` by simp[]")
-        # by is atomic - one step
-        assert len(result) == 1
+        # by has 2 positions: sg boundary + end
+        assert len(result) == 2
 
     async def test_by_in_chain(self, hol_session):
-        """`by` in >> chain should be one of the steps."""
+        """`by` in >> chain exposes sg boundary within the by step."""
         result = await call_step_positions(hol_session, "rpt strip_tac >> `P x` by simp[] >> fs[]")
-        # Should be 3 steps
-        assert len(result) == 3
+        # 4 positions: rpt strip_tac end, sg end, by end, fs end
+        assert len(result) == 4
 
 
 class TestEdgeCases:

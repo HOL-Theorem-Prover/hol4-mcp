@@ -172,8 +172,33 @@ fun step_positions proofBody =
           case fragSpan f of
             SOME (_, endPos) => collectEnds fs (endPos :: acc)
           | NONE => collectEnds fs acc
+
+    val basePositions = collectEnds allFrags []
+
+    (* Find internal boundaries of `by` clauses (ThenLT(Subgoal, [LThen1])).
+       The Subgoal end position enables find_failing_substep to bisect
+       between sg selection and the by tactic. sliceTacticBlock handles
+       the correct prefix generation at these boundaries. *)
+    fun findByBoundaries (TacticParse.ThenLT (TacticParse.Subgoal (_, sgEnd), _)) acc =
+          sgEnd :: acc
+      | findByBoundaries (TacticParse.Then es) acc =
+          foldl (fn (e, a) => findByBoundaries e a) acc es
+      | findByBoundaries (TacticParse.ThenLT (e, arms)) acc =
+          foldl (fn (e, a) => findByBoundaries e a)
+            (findByBoundaries e acc) arms
+      | findByBoundaries (TacticParse.Group (_, _, e)) acc = findByBoundaries e acc
+      | findByBoundaries (TacticParse.LThen1 e) acc = findByBoundaries e acc
+      | findByBoundaries _ acc = acc
+
+    val byPositions = findByBoundaries tree []
+
+    (* Merge, sort, deduplicate *)
+    val allPositions = Portable.int_sort (basePositions @ byPositions)
+    fun dedup [] = []
+      | dedup [x] = [x]
+      | dedup (x :: y :: rest) = if x = y then dedup (y :: rest) else x :: dedup (y :: rest)
   in
-    collectEnds allFrags []
+    dedup allPositions
   end
 
 fun step_positions_json proofBody =

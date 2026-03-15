@@ -1511,3 +1511,89 @@ async def test_state_at_absolute_lines_with_blank_line(tmp_path):
         assert "hol_state_at(line=15" in r, f"Suggested line should be 15: {r}"
     finally:
         await hol_stop(session=session)
+
+
+# Script where the FIRST tactic fails (exercises tactic_to_loc(0) fallback)
+FIRST_TAC_FAILS_BLANK_LINE_SCRIPT = '''\
+open HolKernel Parse boolLib bossLib;
+
+val _ = new_theory "firstfail";
+
+Theorem first_tac_fails:
+  !a b. a /\\ b ==> b /\\ a
+Proof
+
+  FAIL_TAC "boom" >>
+  simp[]
+QED
+
+val _ = export_theory();
+'''
+
+
+@pytest.mark.asyncio
+async def test_state_at_first_tac_fails_blank_line(tmp_path):
+    """tactic_to_loc(0) uses proof_body_offset when first tactic fails.
+
+    File layout:
+      Line 7: Proof
+      Line 8: (blank)
+      Line 9: "  FAIL_TAC \\"boom\\" >>"  <- first tactic (fails)
+      Line 11: QED
+    """
+    test_file = tmp_path / "firstfailScript.sml"
+    test_file.write_text(FIRST_TAC_FAILS_BLANK_LINE_SCRIPT)
+    session = "first_tac_fail_test"
+
+    try:
+        await hol_file_init(file=str(test_file), session=session)
+
+        # Request state at QED line. First tactic fails → PROOF BROKEN.
+        r = await hol_state_at(session=session, line=11, col=1)
+        assert "PROOF BROKEN" in r
+        # Failure at line 9 (FAIL_TAC), not line 8 (blank after Proof)
+        assert "line 9" in r, f"Expected failure at line 9, got: {r}"
+        assert "hol_state_at(line=9" in r, f"Suggested line should be 9: {r}"
+    finally:
+        await hol_stop(session=session)
+
+
+# --- Tests for `by` clause substep pinpointing ---
+
+BY_SUBSTEP_SCRIPT = '''\
+open HolKernel Parse boolLib bossLib;
+
+val _ = new_theory "by_substep";
+
+Theorem by_tac_fails:
+  T /\\ T
+Proof
+  `T` by FAIL_TAC "boom" >>
+  simp[]
+QED
+
+val _ = export_theory();
+'''
+
+
+@pytest.mark.asyncio
+async def test_by_substep_pinpoints_tactic_failure(tmp_path):
+    """When `by` tactic fails, substep pinpointing identifies the tactic (not sg).
+
+    `T` by FAIL_TAC "boom" → sg succeeds, FAIL_TAC fails.
+    find_failing_substep should report substep 2/2 (the tactic), not 1/2 (sg).
+    """
+    test_file = tmp_path / "by_substepScript.sml"
+    test_file.write_text(BY_SUBSTEP_SCRIPT)
+    session = "by_substep_test"
+
+    try:
+        r = await hol_check_proof(
+            theorem="by_tac_fails", file=str(test_file), session=session, trace=False
+        )
+        assert "FAILED" in r
+        # Must identify the tactic as the failing part, not sg
+        assert "Failing substep 2/2" in r, f"Expected substep 2/2 (tactic), got: {r}"
+        assert "FAIL_TAC" in r, f"Should mention FAIL_TAC: {r}"
+    finally:
+        await hol_stop(session=session)
