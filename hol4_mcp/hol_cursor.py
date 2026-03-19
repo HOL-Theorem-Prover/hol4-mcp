@@ -1178,6 +1178,7 @@ class FileProofCursor:
         """Drop all goals and set up the proof goal for a theorem.
 
         Handles Theorem, Definition (TC goal), and Resume (goal + assumptions).
+        Re-extracts Resume/TC goals if not cached (e.g. after invalidation).
         Returns error string on failure, None on success.
         """
         thm = self._get_theorem(thm_name)
@@ -1186,7 +1187,15 @@ class FileProofCursor:
 
         await self.session.send('drop_all();', timeout=5)
 
-        if thm.kind == "Resume" and thm.name in self._resume_goals:
+        # Re-extract Resume/Definition goals if invalidated
+        if thm.kind == "Resume" and thm.name not in self._resume_goals:
+            await self._extract_resume_goal(thm)
+        elif thm.kind == "Definition" and thm.proof_body and thm.name not in self._tc_goals:
+            await self._extract_tc_goal(thm)
+
+        if thm.kind == "Resume":
+            if thm.name not in self._resume_goals:
+                return f"Failed to extract Resume goal for '{thm.name}'"
             rg = self._resume_goals[thm.name]
             asms = rg.get('asms', [])
             goal_str = rg.get('goal', '')

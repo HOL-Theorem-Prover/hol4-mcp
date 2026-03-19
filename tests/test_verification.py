@@ -1048,3 +1048,66 @@ val _ = export_theory();
     # The after-resume theorem should be accessible
     names = [t['name'] for t in result['theorems']]
     assert "still_works" in names
+
+
+@pytest.mark.asyncio
+async def test_resume_state_at_after_edit(hol_session_tmpdir: HOLSession, tmp_path: Path):
+    """state_at on Resume block should work after editing the proof body (issue #10)."""
+    script = tmp_path / "testSuspendScript.sml"
+    script.write_text("""\
+open HolKernel Parse boolLib bossLib markerLib;
+val _ = new_theory "testSuspend";
+
+Theorem foo:
+  (!n. n + 0 = n) /\\ (!n. 0 + n = n)
+Proof
+  conj_tac >- suspend "case1"
+  >> simp[]
+QED
+
+Resume foo[case1]:
+  simp[]
+QED
+
+Finalise foo
+
+val _ = export_theory();
+""")
+
+    cursor = FileProofCursor(script, hol_session_tmpdir)
+    await cursor.init()
+
+    # Step 1: Navigate into the Resume block — should work
+    thm = cursor._get_theorem("foo[case1]")
+    assert thm is not None
+    result1 = await cursor.state_at(thm.proof_start_line, 1)
+    assert not result1.error or "no goals" in result1.error.lower(), \
+        f"First state_at failed: {result1.error}"
+
+    # Step 2: Edit the Resume proof body
+    script.write_text("""\
+open HolKernel Parse boolLib bossLib markerLib;
+val _ = new_theory "testSuspend";
+
+Theorem foo:
+  (!n. n + 0 = n) /\\ (!n. 0 + n = n)
+Proof
+  conj_tac >- suspend "case1"
+  >> simp[]
+QED
+
+Resume foo[case1]:
+  rw[] >> simp[]
+QED
+
+Finalise foo
+
+val _ = export_theory();
+""")
+
+    # Step 3: Navigate into the same Resume block after edit — should NOT fail
+    thm2 = cursor._get_theorem_at_position(thm.proof_start_line)
+    # Re-fetch after reparse (state_at will trigger reparse)
+    result2 = await cursor.state_at(thm.proof_start_line, 1)
+    assert not result2.error or "no goals" in result2.error.lower(), \
+        f"state_at after edit failed: {result2.error}"
