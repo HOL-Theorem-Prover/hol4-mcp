@@ -139,6 +139,7 @@ class StepPlan:
     """A step with its end offset and command."""
     end: int       # End offset in proof body
     cmd: str       # e() command to execute this step
+    goal_routing: bool = False  # Step contains goal-routing structure (by, >-, >|, etc.)
 
 
 def parse_step_plan_output(output: str) -> list[StepPlan]:
@@ -156,7 +157,8 @@ def parse_step_plan_output(output: str) -> list[StepPlan]:
             for item in result['ok']:
                 end = int(item['end'])
                 cmd = str(item['cmd'])
-                steps.append(StepPlan(end=end, cmd=cmd))
+                gr = bool(item.get('gr', False))
+                steps.append(StepPlan(end=end, cmd=cmd, goal_routing=gr))
             return steps
         except (TypeError, ValueError, KeyError) as e:
             raise HOLParseError(f"Malformed step plan in output: {e}") from e

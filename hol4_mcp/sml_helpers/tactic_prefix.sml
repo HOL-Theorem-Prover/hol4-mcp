@@ -396,6 +396,39 @@ fun hasThenLTAtTop (TacticParse.ThenLT _) = true
   | hasThenLTAtTop (TacticParse.Group (_, _, e)) = hasThenLTAtTop e
   | hasThenLTAtTop _ = false
 
+(* Check if a tac_expr contains any goal-routing structure anywhere in the tree.
+   Goal-routing = ThenLT, Subgoal, LSelectGoal, LSelectGoals, LSelectThen,
+   LSplit, LReverse, LNthGoal, LLastGoal, LHeadGoal, LNullOk, etc.
+   These create or route between subgoals, making fine-grained stepping
+   impossible without restructuring the proof (e.g., via suspend/Resume). *)
+fun hasGoalRouting (TacticParse.ThenLT _) = true
+  | hasGoalRouting (TacticParse.Subgoal _) = true
+  | hasGoalRouting (TacticParse.LSelectGoal _) = true
+  | hasGoalRouting (TacticParse.LSelectGoals _) = true
+  | hasGoalRouting (TacticParse.LSelectThen _) = true
+  | hasGoalRouting (TacticParse.LSplit _) = true
+  | hasGoalRouting TacticParse.LReverse = true
+  | hasGoalRouting (TacticParse.LNthGoal _) = true
+  | hasGoalRouting (TacticParse.LLastGoal _) = true
+  | hasGoalRouting (TacticParse.LHeadGoal _) = true
+  | hasGoalRouting (TacticParse.LNullOk _) = true
+  | hasGoalRouting (TacticParse.LThen1 _) = true
+  | hasGoalRouting (TacticParse.LThenLT _) = true
+  | hasGoalRouting (TacticParse.LThen _) = true
+  | hasGoalRouting (TacticParse.Then es) = List.exists hasGoalRouting es
+  | hasGoalRouting (TacticParse.First es) = List.exists hasGoalRouting es
+  | hasGoalRouting (TacticParse.LFirst es) = List.exists hasGoalRouting es
+  | hasGoalRouting (TacticParse.Group (_, _, e)) = hasGoalRouting e
+  | hasGoalRouting (TacticParse.RepairGroup (_, _, e, _)) = hasGoalRouting e
+  | hasGoalRouting (TacticParse.Try e) = hasGoalRouting e
+  | hasGoalRouting (TacticParse.LTry e) = hasGoalRouting e
+  | hasGoalRouting (TacticParse.Repeat e) = hasGoalRouting e
+  | hasGoalRouting (TacticParse.LRepeat e) = hasGoalRouting e
+  | hasGoalRouting (TacticParse.LTacsToLT _) = true
+  | hasGoalRouting (TacticParse.LAllGoals e) = hasGoalRouting e
+  | hasGoalRouting (TacticParse.LFirstLT _) = true
+  | hasGoalRouting _ = false
+
 (* Check if a list_tac_expr is LThen1 (>- arm, decomposable) *)
 fun isLThen1Arm (TacticParse.LThen1 _) = true
   | isLThen1Arm _ = false
@@ -439,21 +472,30 @@ fun step_plan proofBody =
       | fragSpan (TacticParse.FGroup (p, _)) = SOME p
       | fragSpan _ = NONE
 
-    (* Collect end positions from fragments *)
-    fun collectEnds [] acc = rev acc
-      | collectEnds (f::fs) acc =
-          case fragSpan f of
-            SOME (_, endPos) => collectEnds fs (endPos :: acc)
-          | NONE => collectEnds fs acc
+    (* Collect end positions and AST exprs from fragments *)
+    fun collectEndExprs [] acc = rev acc
+      | collectEndExprs (f::fs) acc =
+          case f of
+            TacticParse.FAtom a =>
+              (case (case TacticParse.topSpan a of SOME sp => SOME sp | NONE => computeSpan a) of
+                 SOME (_, endPos) => collectEndExprs fs ((endPos, SOME a) :: acc)
+               | NONE => collectEndExprs fs acc)
+          | TacticParse.FGroup (p, _) =>
+              collectEndExprs fs ((#2 p, NONE) :: acc)
+          | _ => collectEndExprs fs acc
 
-    (* Generate steps from fragments and end positions *)
+    (* Generate steps from fragments, end positions and AST exprs.
+       Returns (endOff, cmd, goalRouting) triples. *)
     fun makeSteps baseTree [] _ _ acc = rev acc
-      | makeSteps baseTree (endPos::rest) prevEnd isFirst acc =
+      | makeSteps baseTree ((endPos, exprOpt)::rest) prevEnd isFirst acc =
           let
             val frags = TacticParse.sliceTacticBlock prevEnd endPos false defaultSpan baseTree
             val rawCmd = TacticParse.printFragsAsE proofBody frags
             val cmd = if isFirst then rawCmd else eToEall rawCmd
-            val step = if String.size cmd > 0 then [(endPos, cmd)] else []
+            val gr = case exprOpt of
+                       SOME e => hasGoalRouting e
+                     | NONE => false
+            val step = if String.size cmd > 0 then [(endPos, cmd, gr)] else []
           in
             makeSteps baseTree rest endPos false (step @ acc)
           end
@@ -474,19 +516,20 @@ fun step_plan proofBody =
       let
         val base = extractThenLTBase tree
         val baseFrags = TacticParse.linearize isAtom base
-        val baseEndPositions = collectEnds baseFrags []
-        val baseSteps = makeSteps base baseEndPositions 0 true []
+        val baseEndExprs = collectEndExprs baseFrags []
+        val baseSteps = makeSteps base baseEndExprs 0 true []
         
         val suffixSteps =
           if allArmsDecomposable tree then
-            (* All arms are LThen1: decompose into individual e() steps *)
+            (* All arms are LThen1: decompose into individual e() steps.
+               Each arm may itself contain goal-routing (e.g., nested by). *)
             let
               val innerExprs = collectLThen1Inners tree
               fun armToStep expr =
                 case computeSpan expr of
                   SOME (start, endPos) =>
                     let val text = String.substring(proofBody, start, endPos - start)
-                    in SOME (endPos, "e(" ^ text ^ ");\n")
+                    in SOME (endPos, "e(" ^ text ^ ");\n", hasGoalRouting expr)
                     end
                 | NONE => NONE
             in
@@ -520,7 +563,7 @@ fun step_plan proofBody =
                       else suffixText
                     val cmd = "elt(ALL_LT " ^ suffix ^ ");\n"
                   in
-                    [(fullEnd, cmd)]
+                    [(fullEnd, cmd, true)]  (* elt = always goal-routing *)
                   end
               | NONE =>
                   let
@@ -529,7 +572,7 @@ fun step_plan proofBody =
                     val frags = TacticParse.sliceTacticBlock 0 fullEnd false defaultSpan tree
                     val cmd = TacticParse.printFragsAsE proofBody frags
                   in
-                    [(fullEnd, cmd)]
+                    [(fullEnd, cmd, true)]  (* fallback for ThenLT = goal-routing *)
                   end
             end
       in
@@ -539,9 +582,9 @@ fun step_plan proofBody =
       (* No ThenLT at top: normal linearization *)
       let
         val allFrags = TacticParse.linearize isAtom tree
-        val endPositions = collectEnds allFrags []
+        val endExprs = collectEndExprs allFrags []
       in
-        makeSteps tree endPositions 0 true []
+        makeSteps tree endExprs 0 true []
       end
   end
 
@@ -552,8 +595,9 @@ fun step_plan_json proofBody =
     (* No synthetic fallback here.
        If there are no executable steps (e.g., empty body/comments-only),
        return []. Parse errors still surface via {"err":...} through handler. *)
-    fun stepToJson (endOff, cmd) =
-      "{\"end\":" ^ json_int endOff ^ ",\"cmd\":" ^ json_string cmd ^ "}"
+    fun stepToJson (endOff, cmd, gr) =
+      "{\"end\":" ^ json_int endOff ^ ",\"cmd\":" ^ json_string cmd ^
+      (if gr then ",\"gr\":true" else "") ^ "}"
     val stepsJson = "[" ^ String.concatWith "," (map stepToJson steps) ^ "]"
   in
     print (json_ok stepsJson ^ "\n")

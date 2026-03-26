@@ -858,6 +858,33 @@ async def test_check_proof_by_sg_theorems(tmp_path):
         await hol_stop(session=session)
 
 
+async def test_state_at_nested_subgoal_suggestion(tmp_path):
+    """state_at inside a `by` step shows suspend/Resume suggestion."""
+    test_file = tmp_path / "bysgScript.sml"
+    test_file.write_text(BY_SG_SCRIPT)
+    session = "nested_sg_test"
+
+    try:
+        result = await hol_file_init(file=str(test_file), session=session)
+        assert "Theorems: 3" in result
+
+        # Line 10 col 30 is inside the `by` clause of by_in_chain,
+        # within `first_assum ACCEPT_TAC`. This is inside a step with
+        # goal routing — should suggest suspend/Resume.
+        r = await hol_state_at(session=session, line=10, col=30)
+        assert "suspend" in r.lower() or "Resume" in r, (
+            f"Should suggest suspend/Resume for nested subgoal: {r}"
+        )
+
+        # Step boundary (line 9 col 3 = start of rpt strip_tac) should NOT suggest.
+        r = await hol_state_at(session=session, line=9, col=3)
+        assert "suspend" not in r.lower() and "Resume" not in r, (
+            f"Should NOT suggest suspend/Resume at step boundary: {r}"
+        )
+    finally:
+        await hol_stop(session=session)
+
+
 # Test script with a broken ThenLT proof (1 coarse step, failure at FAIL_TAC)
 # strip_tac >> conj_tac >- arm1 >- FAIL_TAC gives 1 atomic step.
 # Uses strip_tac (not rpt) so conj_tac is the intended splitter.

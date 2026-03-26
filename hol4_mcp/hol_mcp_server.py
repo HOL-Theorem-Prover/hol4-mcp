@@ -992,6 +992,24 @@ async def hol_state_at(
         else:
             lines.append("No goals (proof complete)")
 
+    # Suggest suspend/Resume when inside a nested subgoal step
+    if result.inside_nested_subgoal and not is_broken:
+        lines.append("")
+        lines.append(
+            "NOTE: This position is inside a nested subgoal step (by, >-, etc. "
+            "within a >> chain). Goals shown mix the subgoal with the outer proof "
+            "state. For fine-grained inspection, restructure using suspend/Resume:\n"
+            "  Theorem foo:\n"
+            "    <goal>\n"
+            "  Proof\n"
+            "    strip_tac >> ... >> subgoal_tac `P` >> ...\n"
+            "    ~~ [`P`] by suspend\n"
+            "  QED\n"
+            "  Resume foo[`P`]:\n"
+            "    <prove P here — fully inspectable with hol_state_at>\n"
+            "  QED"
+        )
+
     # Add timing info if available
     if result.timings:
         t = result.timings

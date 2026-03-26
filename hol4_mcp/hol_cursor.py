@@ -237,6 +237,7 @@ class StateAtResult:
     file_hash: str            # Content hash when this state was computed
     error: str | None = None  # Error message if replay failed
     timings: dict[str, float] | None = None  # Timing breakdown (ms)
+    inside_nested_subgoal: bool = False  # Position is inside a nested by/>- step
 
 
 @dataclass
@@ -1459,6 +1460,15 @@ class FileProofCursor:
         need_partial = proof_body_offset > step_before_end and proof_body_offset < current_step_end
         actual_replayed = 0
 
+        # Detect if cursor is inside a step with goal-routing structure
+        # (by, >-, >|, >~, suffices_by, etc.). Detected by SML-side AST
+        # analysis (hasGoalRouting) and reported via step_plan's gr flag.
+        inside_nested_subgoal = (
+            need_partial
+            and tactic_idx < total_tactics
+            and self._step_plan[tactic_idx].goal_routing
+        )
+
         # Two paths for navigation:
         # 1. Checkpoint path: O(1) to step boundaries via checkpoint + backup_n
         # 2. Prefix/targeted replay path for fine-grained positions or broken proofs
@@ -1604,6 +1614,7 @@ class FileProofCursor:
             file_hash=self._content_hash,
             error=error_msg,
             timings=timings,
+            inside_nested_subgoal=inside_nested_subgoal,
         )
 
     def _parse_goals_json(self, output: str) -> list[dict]:

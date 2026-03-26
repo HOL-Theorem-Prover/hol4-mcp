@@ -633,3 +633,49 @@ class TestStepPlan:
         # (conj_tac appears twice in the original, so 2 occurrences is correct)
         assert joined.count("conj_tac") == 2, f"conj_tac should appear twice"
         assert joined.count("simp") == 1, f"simp should appear once"
+
+    async def test_goal_routing_flag_simple_chain(self, hol_session):
+        """Plain >> chain should not have goal_routing on any step."""
+        result = await call_step_plan(hol_session, "simp[] >> gvs[] >> fs[]")
+        for step in result:
+            assert not step.goal_routing, f"No goal routing expected: {step.cmd}"
+
+    async def test_goal_routing_flag_by_in_chain(self, hol_session):
+        """`by` inside >> chain marks the step as goal_routing."""
+        result = await call_step_plan(hol_session, "strip_tac >> `T` by simp[] >> fs[]")
+        assert len(result) == 3
+        assert not result[0].goal_routing  # strip_tac
+        assert result[1].goal_routing       # `T` by simp[]
+        assert not result[2].goal_routing  # fs[]
+
+    async def test_goal_routing_flag_thenlt_suffix(self, hol_session):
+        """Non-decomposable ThenLT suffix (>|) gets goal_routing."""
+        result = await call_step_plan(hol_session, "strip_tac >> conj_tac >| [simp[], fs[]]")
+        assert len(result) == 3
+        assert not result[0].goal_routing  # strip_tac
+        assert not result[1].goal_routing  # conj_tac
+        assert result[2].goal_routing       # elt(ALL_LT >| [...])
+
+    async def test_goal_routing_flag_nested_by_in_arm(self, hol_session):
+        """Decomposed >- arm containing `by` gets goal_routing."""
+        result = await call_step_plan(hol_session,
+            "conj_tac >- (simp[] >> `T` by fs[]) >- rw[]")
+        assert len(result) == 3
+        assert not result[0].goal_routing  # conj_tac
+        assert result[1].goal_routing       # arm with by
+        assert not result[2].goal_routing  # rw[]
+
+    async def test_goal_routing_flag_suffices_by(self, hol_session):
+        """`suffices_by` inside >> chain marks step as goal_routing."""
+        result = await call_step_plan(hol_session, "strip_tac >> `T` suffices_by simp[]")
+        assert len(result) == 2
+        assert not result[0].goal_routing  # strip_tac
+        assert result[1].goal_routing       # suffices_by
+
+    async def test_goal_routing_flag_thenlt_inside_chain(self, hol_session):
+        """>- nested inside >> chain gets goal_routing."""
+        result = await call_step_plan(hol_session, "strip_tac >> (foo >- bar) >> baz")
+        assert len(result) == 3
+        assert not result[0].goal_routing  # strip_tac
+        assert result[1].goal_routing       # (foo >- bar)
+        assert not result[2].goal_routing  # baz
