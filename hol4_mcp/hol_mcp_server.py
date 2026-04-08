@@ -533,7 +533,7 @@ _PROGRESS_INTERVAL = 10  # seconds
 
 
 @mcp.tool()
-async def holmake(workdir: str, target: str = None, env: dict = None, log_limit: int = 1024, timeout: int = 90, heap_size: int = 12288, ctx: Context = None) -> str:
+async def holmake(workdir: str, target: str = None, env: dict = None, log_limit: int = 1024, timeout: int = 90, heap_size: int = 12288, jobs: int = None, ctx: Context = None) -> str:
     """Run Holmake --qof in directory.
 
     Args:
@@ -543,6 +543,7 @@ async def holmake(workdir: str, target: str = None, env: dict = None, log_limit:
         log_limit: Max bytes per log file to include on failure (default 1024)
         timeout: Max seconds to wait (default 90, max 1800)
         heap_size: Max heap size in MB for Poly/ML builds (default 12288)
+        jobs: Max parallel jobs (-j flag). Default from HOL4_MCP_HOLMAKE_JOBS env var, or 1.
 
     Returns: Holmake output (stdout + stderr). On failure, includes recent build logs.
 
@@ -571,7 +572,14 @@ async def holmake(workdir: str, target: str = None, env: dict = None, log_limit:
             if log_file.is_file():
                 log_file.unlink()
 
+    # Resolve parallelism: explicit param > env var > 1
+    if jobs is None:
+        jobs = int(os.environ.get("HOL4_MCP_HOLMAKE_JOBS", "1"))
+    jobs = max(1, jobs)
+
     cmd = [str(holmake_bin), "--qof", f"--heap-size={heap_size}"]
+    if jobs > 1:
+        cmd.extend(["-j", str(jobs)])
     if target:
         cmd.append(target)
 
