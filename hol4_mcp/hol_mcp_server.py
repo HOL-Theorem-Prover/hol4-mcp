@@ -310,6 +310,7 @@ _PROOF_STATE_PATTERNS = [
     (re.compile(r"^\s*g\s*[`(]"), "g()/g`...`"),
     (re.compile(r"^\s*p\s*\(\s*\)"), "p()"),
     (re.compile(r"^\s*r\s*\(\s*\)"), "r()"),
+    (re.compile(r"^\s*prove\s*\("), "prove(...)"),
     (re.compile(r"proofManagerLib\."), "proofManagerLib.*"),
 ]
 
