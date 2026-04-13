@@ -123,20 +123,24 @@ async def test_goaltree_raw_hol_send(workdir):
 async def test_p_output_multiline_integration(workdir):
     """Integration test: parse_p_output handles multi-line val it format from real HOL."""
     from hol4_mcp.hol_file_parser import parse_p_output
+    from hol4_mcp.hol_mcp_server import _sessions
 
     await hol_stop(session="p_multi_test")
     await hol_start(workdir=workdir, name="p_multi_test")
 
     try:
-        # Create a proof with multiple tactics to produce multi-line p() output
-        await hol_send(session="p_multi_test", command="gt `A /\\ B ==> B /\\ A`;")
-        await hol_send(session="p_multi_test", command='etq "strip_tac";')
-        await hol_send(session="p_multi_test", command='etq "conj_tac";')
-        await hol_send(session="p_multi_test", command='etq "first_assum ACCEPT_TAC";')
-        await hol_send(session="p_multi_test", command='etq "first_assum ACCEPT_TAC";')
+        # Use session.send directly to bypass hol_send proof-state guard
+        session = _sessions["p_multi_test"].session
+        await session.send("gt `A /\\ B ==> B /\\ A`;")
+        await session.send('etq "strip_tac";')
+        await session.send('etq "conj_tac";')
+        await session.send('etq "first_assum ACCEPT_TAC";')
+        await session.send('etq "first_assum ACCEPT_TAC";')
 
         # p() on complete proof can produce multi-line "val it = ..." format
-        result = await hol_send(session="p_multi_test", command="p();")
+        result = await session.send("p();")
+        # Strip timing suffix that session.send doesn't add but format may include
+        result = result.strip()
 
         # Verify we got multi-line format with ": proof" type annotation
         assert "\n" in result.strip(), f"Expected multi-line output, got: {result!r}"
@@ -906,11 +910,10 @@ val _ = export_theory();
 
 
 async def test_check_proof_substep_pinpoints_failure(tmp_path):
-    """Test hol_check_proof binary-searches within a coarse ThenLT step.
+    """Test hol_check_proof pinpoints the failing tactic in a ThenLT proof.
 
     Proof: strip_tac >> conj_tac >- ACCEPT >- FAIL_TAC
-    step_plan gives 1 step. Binary search should pinpoint FAIL_TAC as
-    the failing substep (not conj_tac or strip_tac).
+    ThenLT arm decomposition gives 4 steps, directly pinpointing FAIL_TAC.
     """
     test_file = tmp_path / "brokenScript.sml"
     test_file.write_text(BROKEN_THENLT_SCRIPT)
@@ -921,17 +924,15 @@ async def test_check_proof_substep_pinpoints_failure(tmp_path):
             theorem="broken_thenlt", file=str(test_file), session=session, trace=False
         )
         assert "FAILED" in r, f"Should fail: {r}"
-        # Binary search should pinpoint the FAIL_TAC substep
-        assert "Failing substep" in r, f"Should show failing substep: {r}"
-        assert "FAIL_TAC" in r, f"Should identify FAIL_TAC as the failing substep: {r}"
-        # hol_state_at hint should point to the substep location
+        # ThenLT decomposition pinpoints FAIL_TAC directly as its own step
+        assert "FAIL_TAC" in r, f"Should identify FAIL_TAC as failing: {r}"
+        # hol_state_at hint should point to the failure location
         assert "hol_state_at" in r
 
-        # Also verify trace=True annotates the failing step inline
+        # Also verify trace=True shows FAIL_TAC
         r2 = await hol_check_proof(
             theorem="broken_thenlt", file=str(test_file), session=session, trace=True
         )
-        assert "Failing substep" in r2, f"Trace mode should also show substep: {r2}"
         assert "FAIL_TAC" in r2, f"Trace mode should identify FAIL_TAC: {r2}"
     finally:
         await hol_stop(session=session)
