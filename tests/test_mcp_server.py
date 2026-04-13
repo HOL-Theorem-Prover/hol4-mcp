@@ -355,7 +355,7 @@ async def test_state_at_returns_goals(tmp_path):
         # Should show tactic info (even if 0/N since cheat is the only tactic)
         assert "Tactic" in result
         # Should show goals (proof is not complete since cheat doesn't prove anything)
-        assert "Goals" in result or "goals" in result.lower()
+        assert "Goal" in result or "goal" in result.lower()
         # Should NOT have error about position outside theorem
         assert "not within any theorem" not in result
     finally:
@@ -702,7 +702,7 @@ val _ = export_theory();
 
         # Should show goal at start (before THEN chain executes)
         # The THEN chain is ONE step, so position inside it maps to before it
-        assert "Goals remaining:" in result2 or "goals" in result2.lower()
+        assert "Goal" in result2 or "goal" in result2.lower()
     finally:
         await hol_stop(session="then_test")
 
@@ -771,7 +771,7 @@ async def test_state_at_by_in_chain(tmp_path):
         assert "Tactic" in r
         assert "ERROR" not in r
         # Should show goals (some remain since simp[] hasn't run yet)
-        assert "Goals" in r
+        assert "Goal" in r
 
         # Line 11: simp[] — after by clause
         r = await hol_state_at(session=session, line=11, col=3)
@@ -1015,7 +1015,7 @@ async def test_state_at_broken_show_partial(tmp_path):
             session=session, line=10, col=1, show_partial=True
         )
         assert "PROOF BROKEN" in r
-        assert "Goals at failure point" in r
+        assert "Goal" in r and "failure point" in r
         # conj_tac succeeded, so we should see 2 subgoals (T and T)
     finally:
         await hol_stop(session=session)
@@ -1053,7 +1053,7 @@ async def test_state_at_broken_before_failure_shows_goals(tmp_path):
         # Line 8 is at/before conj_tac (first tactic) — should work fine
         r = await hol_state_at(session=session, line=8, col=3)
         assert "PROOF BROKEN" not in r
-        assert "Goals" in r
+        assert "Goal" in r
     finally:
         await hol_stop(session=session)
 

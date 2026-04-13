@@ -848,11 +848,15 @@ async def hol_state_at(
     max_output: int = DEFAULT_MAX_OUTPUT,
     session: str = "default",
     show_partial: bool = False,
+    all_goals: bool = False,
 ) -> str:
     """Get proof state at a file position.
 
     Replays tactics from theorem start up to (but not including) the tactic at
     the given position, then shows current goals. Auto-enters theorem if needed.
+
+    By default only the top goal is shown (with total count). Set all_goals=True
+    to see every goal on the stack.
 
     If replay fails before reaching the requested position, the default behavior
     is to refuse to show goals (they would be from the wrong proof state).
@@ -867,6 +871,7 @@ async def hol_state_at(
         session: Session name (default: "default")
         show_partial: If True, show best-effort goals even when replay fails
                       before reaching the requested position (default: False)
+        all_goals: If True, show all goals; otherwise only the top goal (default: False)
 
     Returns: Tactic position (N/M), goals at that position, errors if any
     """
@@ -960,9 +965,12 @@ async def hol_state_at(
             )
 
         if show_partial and result.goals:
+            display_goals = result.goals if all_goals else result.goals[:1]
+            total = len(result.goals)
+            goal_label = f"Goals at failure point" if all_goals else f"Goal at failure point (1 of {total})"
             lines.append("")
-            lines.append(f"=== Goals at failure point ({stuck_str}, tactic {result.tactics_replayed}/{result.tactics_total}) ===")
-            for i, g in enumerate(result.goals):
+            lines.append(f"=== {goal_label} ({stuck_str}, tactic {result.tactics_replayed}/{result.tactics_total}) ===")
+            for i, g in enumerate(display_goals):
                 if i > 0:
                     lines.append("")
                 if g.get('asms'):
@@ -985,10 +993,14 @@ async def hol_state_at(
         if result.error and not is_proof_complete:
             error_footer = f"ERROR: {result.error}"
         lines.append("")
-        lines.append("=== Goals ===")
-
         if result.goals:
-            for i, g in enumerate(result.goals):
+            display_goals = result.goals if all_goals else result.goals[:1]
+            total = len(result.goals)
+            if all_goals:
+                lines.append(f"=== Goals ({total}) ===")
+            else:
+                lines.append(f"=== Goal (1 of {total}) ===")
+            for i, g in enumerate(display_goals):
                 if i > 0:
                     lines.append("")  # Blank line between goals
                 if g.get('asms'):
@@ -997,8 +1009,10 @@ async def hol_state_at(
                     lines.append("  " + "-" * 40)
                 lines.append(f"  {g['goal']}")
         elif is_proof_complete:
+            lines.append("=== Goals ===")
             lines.append("No goals (proof complete)")
         else:
+            lines.append("=== Goals ===")
             lines.append("No goals (proof complete)")
 
     # Suggest suspend/Resume when inside a nested subgoal step
