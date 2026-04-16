@@ -218,7 +218,10 @@ async def get_script_dependencies(script_path: Path) -> list[str]:
     )
     stdout, stderr = await proc.communicate()
     if proc.returncode != 0:
-        raise RuntimeError(f"holdeptool.exe failed: {stderr.decode()}")
+        raise RuntimeError(
+            f"holdeptool.exe failed: {stderr.decode()}"
+            # e.g. lexical error when .sml has syntax issues (missing QED, etc.)
+        )
 
     return [line.strip() for line in stdout.decode().splitlines() if line.strip()]
 
@@ -811,8 +814,8 @@ class FileProofCursor:
                         "cheats": [],
                         "error": f"Failed to load dependency {dep}: {result[:200]}",
                     }
-        except FileNotFoundError:
-            pass  # holdeptool not available, skip dep loading
+        except (FileNotFoundError, RuntimeError):
+            pass  # holdeptool not available or failed (parse error), skip dep loading
 
         thm_list = [
             {"name": t.name, "line": t.start_line, "has_cheat": t.has_cheat}
@@ -1823,8 +1826,8 @@ class FileProofCursor:
                     result = await self.session.send(f'load "{dep}";', timeout=60)
                     if _is_hol_error(result) and "Cannot find file" not in result:
                         break  # Stop on real errors
-            except FileNotFoundError:
-                pass  # holdeptool not available
+            except (FileNotFoundError, RuntimeError):
+                pass  # holdeptool not available or failed (parse error)
 
         content_lines = self._content.split('\n')
         current_line = 0
