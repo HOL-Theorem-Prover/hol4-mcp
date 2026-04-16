@@ -156,6 +156,21 @@ class HOLSession:
             except (ProcessLookupError, PermissionError):
                 pass
 
+    def kill_sync(self):
+        """SIGKILL the HOL process group. Safe from signal handlers / atexit.
+
+        Sync, best-effort: no waits, no asyncio. Used by shutdown paths
+        (atexit, SIGTERM) where the event loop may be dead or unsafe to
+        re-enter. SIGKILL (not SIGTERM) because we can't afford to wait for
+        a graceful shutdown in these contexts.
+        """
+        if self.process and self.process.returncode is None:
+            try:
+                pgid = os.getpgid(self.process.pid)
+                os.killpg(pgid, signal.SIGKILL)
+            except (ProcessLookupError, PermissionError, OSError):
+                pass
+
     async def stop(self):
         """Kill the HOL process group and wait for cleanup."""
         if self.process and self.process.returncode is None:

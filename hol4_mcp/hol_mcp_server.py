@@ -6,6 +6,7 @@ Sessions are in-memory only. They survive within a single MCP server lifetime
 """
 
 import asyncio
+import atexit
 import hashlib
 import json
 import os
@@ -112,6 +113,33 @@ def _sigint_handler(signum, frame):
 
 # Install SIGINT handler (replaces default KeyboardInterrupt behavior)
 signal.signal(signal.SIGINT, _sigint_handler)
+
+
+def _kill_all_sessions_sync():
+    """Best-effort SIGKILL all HOL process groups. Safe from atexit/signal.
+
+    Covers abnormal shutdown paths where async `hol_stop` won't run:
+    - stdio_client's _terminate_process_tree sends SIGTERM to *our* pgid
+      but HOL is in its own pgid (start_new_session=True in HOLSession).
+    - atexit fires on normal interpreter shutdown.
+    Without this, HOL children (multi-GB RSS) get reparented to PID 1 and leak.
+    """
+    for entry in list(_sessions.values()):
+        try:
+            entry.session.kill_sync()
+        except Exception:
+            pass  # best effort
+
+
+def _sigterm_handler(signum, frame):
+    """Kill HOL children, then re-raise default SIGTERM so we actually exit."""
+    _kill_all_sessions_sync()
+    signal.signal(signum, signal.SIG_DFL)
+    os.kill(os.getpid(), signum)
+
+
+signal.signal(signal.SIGTERM, _sigterm_handler)
+atexit.register(_kill_all_sessions_sync)
 
 
 _SESSION_IDLE_TIMEOUT = 1800  # 30 minutes
