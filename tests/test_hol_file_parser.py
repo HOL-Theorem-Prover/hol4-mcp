@@ -709,3 +709,42 @@ end
     lines = content.split('\n')
     end_idx = next(i for i, l in enumerate(lines) if l.strip() == 'end')
     assert lb.end_line == end_idx + 1
+
+
+def test_parse_local_blocks_with_let_inside():
+    """local block containing let...in...end must not close on let's end."""
+    content = '''local
+  val gim = 1
+in
+  fun lift_monoid_thm suffix = let
+    val x = suffix
+  in
+    x + 1
+  end
+
+end
+'''
+    blocks = parse_local_blocks(content)
+    assert len(blocks) == 1
+    lb = blocks[0]
+    assert lb.local_line == 1
+    assert lb.in_line == 3
+    assert lb.end_line == 10  # the 'end' on line 10 closes 'local', NOT line 8
+
+
+def test_parse_local_blocks_with_multiple_lets_inside():
+    """local block with multiple nested let blocks."""
+    content = '''local
+  val a = 1
+in
+  fun f x = let val y = x in y end
+  fun g x = let val z = x in let val w = z in w end end
+
+end
+'''
+    blocks = parse_local_blocks(content)
+    assert len(blocks) == 1
+    lb = blocks[0]
+    assert lb.local_line == 1
+    assert lb.in_line == 3
+    assert lb.end_line == 7

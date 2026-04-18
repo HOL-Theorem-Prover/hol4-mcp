@@ -267,46 +267,73 @@ def parse_local_blocks(content: str) -> list[LocalBlock]:
     stripped = _strip_strings(stripped)
 
     blocks = []
-    stack: list[tuple[int, int]] = []  # (local_line, in_line)
+    # Stack entries: ('local', local_line, in_line) or ('let',) etc.
+    # All SML block openers that require 'end' must be tracked so 'end'
+    # pops the innermost opener, not just the nearest 'local'.
+    stack: list[tuple] = []
     lines = stripped.split('\n')
 
-    # Pattern: 'local' at line start (with optional whitespace)
-    local_re = re.compile(r'^[ \t]*local\b')
-    # Pattern: 'in' as a standalone keyword — either at line start or
-    # after 'local ... open ...' on the same line. We match 'in' at line
-    # start (common) AND 'local.*\bin\b' for same-line usage.
-    in_re = re.compile(r'^[ \t]*in\b')
-    in_same_line_re = re.compile(r'\bin\b')
-    end_re = re.compile(r'^[ \t]*end\b')
+    # Word-boundary patterns — match anywhere in line, not just at start.
+    # SML 'let' commonly appears mid-line (e.g. "fun f x = let ...").
+    local_re = re.compile(r'\blocal\b')
+    in_re = re.compile(r'\bin\b')
+    let_re = re.compile(r'\blet\b')
+    end_re = re.compile(r'\bend\b')
 
     for line_num, line in enumerate(lines, start=1):
-        # Check for 'local' keyword
-        if local_re.match(line):
-            stack.append((line_num, 0))
-            # Check if 'in' follows on the same line (e.g. "local open X in")
-            rest_after_local = line[local_re.match(line).end():]
-            if in_same_line_re.search(rest_after_local):
-                local_line, _ = stack[-1]
-                stack[-1] = (local_line, line_num)
+        # Find all keywords in order of appearance on this line.
+        # Sort by position to handle cases like "let ... in ... end" on one line
+        # or "local ... in" on one line.
+        keywords = []
+        for m in local_re.finditer(line):
+            keywords.append((m.start(), 'local'))
+        for m in in_re.finditer(line):
+            keywords.append((m.start(), 'in'))
+        for m in let_re.finditer(line):
+            keywords.append((m.start(), 'let'))
+        for m in end_re.finditer(line):
+            keywords.append((m.start(), 'end'))
+        keywords.sort()
+
+        if not keywords:
             continue
 
-        # Check for 'in' at line start
-        if stack and stack[-1][1] == 0 and in_re.match(line):
-            local_line, _ = stack[-1]
-            stack[-1] = (local_line, line_num)
-            continue
-
-        # Check for 'end' at line start
-        if end_re.match(line) and stack:
-            local_line, in_line = stack.pop()
-            if in_line > 0:
-                blocks.append(LocalBlock(
-                    local_line=local_line,
-                    in_line=in_line,
-                    end_line=line_num,
-                ))
+        for _, kw in keywords:
+            if kw == 'local':
+                stack.append(('local', line_num, 0))
+            elif kw == 'let':
+                stack.append(('let',))
+            elif kw == 'in':
+                # 'in' closes the most recent opener (local or let)
+                # For 'local', we record the in_line; for 'let', we just
+                # note it so a subsequent 'end' pops the right layer.
+                if stack and stack[-1][0] in ('local', 'let') and not _has_in(stack[-1]):
+                    entry = stack.pop()
+                    if entry[0] == 'local':
+                        stack.append(('local', entry[1], line_num))
+                    else:
+                        stack.append(('let', line_num))
+            elif kw == 'end':
+                if stack:
+                    entry = stack.pop()
+                    if entry[0] == 'local' and entry[2] > 0:
+                        blocks.append(LocalBlock(
+                            local_line=entry[1],
+                            in_line=entry[2],
+                            end_line=line_num,
+                        ))
+                    # 'let' entries are just discarded — inner block closed
 
     return blocks
+
+
+def _has_in(entry: tuple) -> bool:
+    """Check if a stack entry already has its 'in' recorded."""
+    if entry[0] == 'local':
+        return entry[2] > 0
+    if entry[0] == 'let':
+        return len(entry) > 1 and entry[1] > 0
+    return False
 
 
 def _strip_strings(content: str) -> str:
