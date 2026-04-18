@@ -249,6 +249,100 @@ def _strip_comments(content: str) -> str:
     return ''.join(result)
 
 
+@dataclass
+class LocalBlock:
+    """An SML local ... in ... end block spanning lines."""
+    local_line: int   # Line of 'local' keyword (1-indexed)
+    in_line: int      # Line of 'in' keyword (1-indexed)
+    end_line: int     # Line of 'end' keyword (1-indexed)
+
+
+def parse_local_blocks(content: str) -> list[LocalBlock]:
+    """Parse SML local ... in ... end blocks from file content.
+
+    Uses comment-stripped and string-stripped content to avoid false matches.
+    Returns blocks sorted by local_line.
+    """
+    stripped = _strip_comments(content)
+    stripped = _strip_strings(stripped)
+
+    blocks = []
+    stack: list[tuple[int, int]] = []  # (local_line, in_line)
+    lines = stripped.split('\n')
+
+    # Pattern: 'local' at line start (with optional whitespace)
+    local_re = re.compile(r'^[ \t]*local\b')
+    # Pattern: 'in' as a standalone keyword — either at line start or
+    # after 'local ... open ...' on the same line. We match 'in' at line
+    # start (common) AND 'local.*\bin\b' for same-line usage.
+    in_re = re.compile(r'^[ \t]*in\b')
+    in_same_line_re = re.compile(r'\bin\b')
+    end_re = re.compile(r'^[ \t]*end\b')
+
+    for line_num, line in enumerate(lines, start=1):
+        # Check for 'local' keyword
+        if local_re.match(line):
+            stack.append((line_num, 0))
+            # Check if 'in' follows on the same line (e.g. "local open X in")
+            rest_after_local = line[local_re.match(line).end():]
+            if in_same_line_re.search(rest_after_local):
+                local_line, _ = stack[-1]
+                stack[-1] = (local_line, line_num)
+            continue
+
+        # Check for 'in' at line start
+        if stack and stack[-1][1] == 0 and in_re.match(line):
+            local_line, _ = stack[-1]
+            stack[-1] = (local_line, line_num)
+            continue
+
+        # Check for 'end' at line start
+        if end_re.match(line) and stack:
+            local_line, in_line = stack.pop()
+            if in_line > 0:
+                blocks.append(LocalBlock(
+                    local_line=local_line,
+                    in_line=in_line,
+                    end_line=line_num,
+                ))
+
+    return blocks
+
+
+def _strip_strings(content: str) -> str:
+    """Replace SML string literals with spaces, preserving newlines.
+
+    Preserves character offsets so that line calculations on the result
+    match the original content. Handles escaped quotes (\"\").
+    """
+    result = list(content)
+    i = 0
+    n = len(content)
+    while i < n:
+        if content[i] == '"':
+            # Found string start
+            j = i + 1
+            while j < n:
+                if content[j] == '\\' and j + 1 < n:
+                    j += 2  # Skip escaped character
+                elif content[j] == '"':
+                    j += 1  # Include closing quote
+                    break
+                elif content[j] == '\n':
+                    # SML strings can't span lines without \  at end
+                    break
+                else:
+                    j += 1
+            # Blank out i..j, keeping newlines
+            for k in range(i, min(j, n)):
+                if result[k] != '\n':
+                    result[k] = ' '
+            i = j
+        else:
+            i += 1
+    return ''.join(result)
+
+
 def parse_theorems(content: str) -> list[TheoremInfo]:
     """Parse .sml file content, return all theorems in order."""
     theorems = []

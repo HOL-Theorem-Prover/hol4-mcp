@@ -9,7 +9,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 
 from .hol_file_parser import (
-    TheoremInfo, parse_theorems,
+    TheoremInfo, parse_theorems, LocalBlock, parse_local_blocks,
     build_line_starts, line_col_to_offset, HOLParseError,
     parse_step_plan_output, StepPlan,
     parse_prefix_commands_output,
@@ -312,6 +312,7 @@ class FileProofCursor:
         self._content_hash: str = ""
         self._line_starts: list[int] = []
         self._theorems: list[TheoremInfo] = []
+        self._local_blocks: list[LocalBlock] = []
 
         # Active theorem state
         self._active_theorem: str | None = None
@@ -401,6 +402,7 @@ class FileProofCursor:
         self._content_hash = content_hash
         self._line_starts = build_line_starts(content)
         self._theorems = parse_theorems(content)
+        self._local_blocks = parse_local_blocks(content)
 
         # Invalidate checkpoints and traces for theorems at or after the change
         if first_changed is not None:
@@ -925,87 +927,142 @@ class FileProofCursor:
         self._failed_proofs.add(thm.name)
         return None
 
+    def _local_block_at(self, line: int) -> LocalBlock | None:
+        """Return the local block containing the given line, or None."""
+        for lb in self._local_blocks:
+            if lb.local_line <= line <= lb.end_line:
+                return lb
+        return None
+
+    def _local_block_overlapping(self, start_line: int, end_line: int) -> LocalBlock | None:
+        """Return the first local block that overlaps [start_line, end_line].
+
+        Used to check if pre-content (the gap between current position and
+        next theorem) includes the start of a local block.
+        """
+        for lb in self._local_blocks:
+            if lb.local_line <= end_line and lb.end_line >= start_line:
+                return lb
+        return None
+
+    def _line_to_idx(self, line: int) -> int:
+        """Convert 1-indexed line to 0-indexed array index, clamped to valid range."""
+        if line <= 0:
+            return 0
+        return line - 1
+
+    async def _send_and_check(self, content: str, timeout: float) -> str | None:
+        """Send content to HOL, return error string on fatal error, else None."""
+        if not content.strip():
+            return None
+        result = await self.session.send(content, timeout=timeout)
+        if _is_fatal_hol_error(result):
+            return f"Error executing file content: {_format_context_error(result)}"
+        return None
+
+    async def _handle_theorem_error(self, thm: TheoremInfo, result: str) -> str | None:
+        """Handle HOL error from a theorem send. Returns error string or None."""
+        if thm.kind == "Definition":
+            return f"Definition '{thm.name}' failed (line {thm.start_line}): {result[:300]}"
+        return await self._cheat_failed_theorem(thm)
+
+    async def _extract_goals_for(self, theorems: list[TheoremInfo]) -> None:
+        """Extract Definition/Resume goals before theorems are processed."""
+        for thm in theorems:
+            if thm.kind == "Definition" and thm.proof_body and thm.name not in self._tc_goals:
+                await self._extract_tc_goal(thm)
+            if thm.kind == "Resume" and thm.name not in self._resume_goals:
+                await self._extract_resume_goal(thm)
+
     async def _load_remaining_content(self) -> str | None:
         """Load remaining file content, theorem-by-theorem.
+
+        When theorems fall inside SML `local ... in ... end` blocks, the entire
+        block is sent as one chunk because Poly/ML requires the complete local
+        declaration as a syntactic unit.
 
         Returns:
             Error message if a fatal load error occurs, else None.
         """
         content_lines = self._content.split('\n')
-
-        # Find theorems we haven't loaded yet
         remaining_thms = [t for t in self._theorems if t.proof_end_line > self._loaded_to_line]
 
-        for thm in remaining_thms:
-            # Load any content between current position and theorem start
-            if thm.start_line > self._loaded_to_line:
-                # _loaded_to_line is 1-indexed (first unloaded line), convert to 0-index
-                start_idx = self._loaded_to_line - 1 if self._loaded_to_line > 0 else 0
-                to_load = '\n'.join(content_lines[start_idx:thm.start_line - 1])
-                if to_load.strip():
-                    result = await self.session.send(to_load, timeout=60)
-                    if _is_fatal_hol_error(result):
+        i = 0
+        while i < len(remaining_thms):
+            thm = remaining_thms[i]
+            # Check if either the theorem or the pre-content (gap before it)
+            # falls inside a local block.
+            local_block = self._local_block_at(thm.start_line)
+            if local_block is None and self._loaded_to_line < thm.start_line:
+                local_block = self._local_block_overlapping(self._loaded_to_line, thm.start_line - 1)
+
+            if local_block is None:
+                # Normal theorem
+                if thm.start_line > self._loaded_to_line:
+                    err = await self._send_and_check(
+                        '\n'.join(content_lines[self._line_to_idx(self._loaded_to_line):self._line_to_idx(thm.start_line)]),
+                        timeout=60)
+                    if err:
+                        return err
+                    self._loaded_to_line = thm.start_line
+
+                await self._extract_goals_for([thm])
+
+                thm_content = '\n'.join(content_lines[self._line_to_idx(thm.start_line):self._line_to_idx(thm.proof_end_line)])
+                if thm_content.strip():
+                    result = await self.session.send(thm_content, timeout=60)
+                    if result.startswith("TIMEOUT") and thm.kind != "Definition":
+                        self.session.interrupt()
+                        await asyncio.sleep(0.5)
+                        err = await self._cheat_failed_theorem(thm)
+                        if err:
+                            return f"Error executing file content: {_format_context_error(result)}"
+                    elif _is_fatal_hol_error(result):
                         return f"Error executing file content: {_format_context_error(result)}"
-                self._loaded_to_line = thm.start_line
+                    elif _is_hol_error(result):
+                        err = await self._handle_theorem_error(thm, result)
+                        if err:
+                            return err
+                self._loaded_to_line = thm.proof_end_line
+                i += 1
+            else:
+                # Local block: collect all theorems inside, send as one chunk
+                lb = local_block
+                block_thms = []
+                while i < len(remaining_thms) and lb.local_line <= remaining_thms[i].start_line <= lb.end_line:
+                    block_thms.append(remaining_thms[i])
+                    i += 1
 
-            # For Definition blocks with Termination: extract TC goal BEFORE
-            # processing the block. Hol_defn is called inside try_grammar_extension
-            # + try_theory_extension so all theory/grammar changes are rolled back.
-            # Must happen before the constant exists (rollback won't undo replacement).
-            if thm.kind == "Definition" and thm.proof_body:
-                await self._extract_tc_goal(thm)
+                await self._extract_goals_for(block_thms)
 
-            # For Resume blocks: extract goal from suspension BEFORE loading
-            # (loading resolves the suspension label)
-            if thm.kind == "Resume":
-                await self._extract_resume_goal(thm)
+                block_end = lb.end_line + 1  # line after 'end'
+                if block_end > self._loaded_to_line:
+                    block_content = '\n'.join(content_lines[self._line_to_idx(self._loaded_to_line):self._line_to_idx(block_end)])
+                    if block_content.strip():
+                        result = await self.session.send(block_content, timeout=60)
+                        if _is_fatal_hol_error(result):
+                            return f"Error executing file content: {_format_context_error(result)}"
+                        if _is_hol_error(result):
+                            for bt in block_thms:
+                                err = await self._handle_theorem_error(bt, result)
+                                if err:
+                                    return err
+                    self._loaded_to_line = block_end
 
-            # Load the theorem (header through QED/End)
-            thm_content = '\n'.join(content_lines[thm.start_line - 1:thm.proof_end_line - 1])
-            if thm_content.strip():
-                result = await self.session.send(thm_content, timeout=60)
-                # Timeout during theorem proof: interrupt and auto-cheat
-                # (the HOL process is still computing, must interrupt first)
-                if result.startswith("TIMEOUT") and thm.kind not in ("Definition",):
-                    self.session.interrupt()
-                    # Small delay for HOL to process the interrupt
-                    await asyncio.sleep(0.5)
-                    cheat_err = await self._cheat_failed_theorem(thm)
-                    if cheat_err:
-                        return f"Error executing file content: {_format_context_error(result)}"
-                elif _is_fatal_hol_error(result):
-                    return f"Error executing file content: {_format_context_error(result)}"
-                # On proof failure, cheat the theorem so its name is bound.
-                # Without this, later theorems that reference it get a fatal
-                # Poly/ML compile error ("Value or constructor not declared").
-                elif _is_hol_error(result):
-                    if thm.kind == "Definition":
-                        # Definition failures are fatal — they create constants
-                        # and can't be cheated. Report clearly.
-                        return (
-                            f"Definition '{thm.name}' failed (line {thm.start_line}): "
-                            f"{result[:300]}"
-                        )
-                    cheat_err = await self._cheat_failed_theorem(thm)
-                    if cheat_err:
-                        return cheat_err
-            # proof_end_line is "line after QED/End" (1-indexed); we loaded through it
-            self._loaded_to_line = thm.proof_end_line
-
-        # Load any trailing content after last theorem
-        last_thm = self._theorems[-1] if self._theorems else None
-        if last_thm:
+        # Trailing content after last theorem
+        if self._theorems:
             total_lines = len(content_lines)
             if self._loaded_to_line <= total_lines:
-                start_idx = self._loaded_to_line - 1 if self._loaded_to_line > 0 else 0
-                trailing = '\n'.join(content_lines[start_idx:])
-                if trailing.strip():
-                    result = await self.session.send(trailing, timeout=60)
-                    if _is_fatal_hol_error(result):
-                        return f"Error executing file content: {_format_context_error(result)}"
+                trailing_start = self._loaded_to_line + 1
+                lb = self._local_block_overlapping(trailing_start, total_lines)
+                if lb:
+                    total_lines = max(total_lines, lb.end_line)
+                trailing = '\n'.join(content_lines[self._line_to_idx(self._loaded_to_line):total_lines])
+                err = await self._send_and_check(trailing, timeout=60)
+                if err:
+                    return err
                 self._loaded_to_line = total_lines + 1
 
-        # Track content hash so _check_stale_state works correctly
         self._loaded_content_hash = self._content_hash
         return None
 
@@ -1014,6 +1071,10 @@ class FileProofCursor:
         
         Loads content granularly - theorem by theorem - so that a broken proof
         in one theorem doesn't prevent loading of subsequent content.
+
+        When theorems fall inside SML `local ... in ... end` blocks, the entire
+        block is sent as one chunk because Poly/ML requires the complete local
+        declaration as a syntactic unit.
         
         Args:
             target_line: 1-indexed line to load up to (exclusive)
@@ -1023,79 +1084,111 @@ class FileProofCursor:
             Error message if failed, None if success.
         """
         if target_line <= self._loaded_to_line:
-            return None  # Already loaded
+            return None
             
         content_lines = self._content.split('\n')
-        
-        # Find theorems that are in the range we need to load
-        # These need special handling because broken proofs can stop HOL processing
         theorems_in_range = [
             t for t in self._theorems
             if self._loaded_to_line < t.proof_end_line <= target_line
         ]
         
         if not theorems_in_range:
-            # No theorems in range - simple case, load everything at once
-            start_idx = max(0, self._loaded_to_line - 1) if self._loaded_to_line > 0 else 0
-            to_load = '\n'.join(content_lines[start_idx:target_line - 1])
-            if to_load.strip():
-                result = await self.session.send(to_load, timeout=timeout)
-                if _is_fatal_hol_error(result):
-                    return f"Error executing file content: {_format_context_error(result)}"
+            # No theorems in range — but check if the content spans a local block.
+            # If pre-content includes 'local ... in' without the matching 'end',
+            # we must extend the load to include 'end'.
+            actual_target = target_line
+            start_line = self._loaded_to_line + 1
+            lb = self._local_block_overlapping(start_line, target_line - 1)
+            if lb:
+                actual_target = max(target_line, lb.end_line + 1)
+            start_idx = self._line_to_idx(self._loaded_to_line)
+            to_load = '\n'.join(content_lines[start_idx:actual_target - 1])
+            err = await self._send_and_check(to_load, timeout)
+            if err:
+                return err
+            self._loaded_to_line = actual_target
+            loaded_content = '\n'.join(content_lines[:actual_target - 1])
+            self._loaded_content_hash = self._compute_hash(loaded_content)
+            return None
         else:
-            # Theorems in range - load piece by piece to isolate failures
             current_line = self._loaded_to_line
+            i = 0
             
-            for thm in theorems_in_range:
-                # Load content before this theorem
-                if thm.start_line > current_line:
-                    start_idx = current_line - 1 if current_line > 0 else 0
-                    pre_content = '\n'.join(content_lines[start_idx:thm.start_line - 1])
-                    if pre_content.strip():
-                        result = await self.session.send(pre_content, timeout=timeout)
+            while i < len(theorems_in_range):
+                thm = theorems_in_range[i]
+                # Check if either the theorem or the pre-content gap before it
+                # overlaps a local block. If pre-content contains 'local ... in',
+                # it must be sent together with theorems + 'end'.
+                local_block = self._local_block_at(thm.start_line)
+                if local_block is None and current_line < thm.start_line:
+                    local_block = self._local_block_overlapping(current_line, thm.start_line - 1)
+
+                if local_block is None:
+                    # Normal theorem (no local block overlap)
+                    if thm.start_line > current_line:
+                        pre = '\n'.join(content_lines[self._line_to_idx(current_line):self._line_to_idx(thm.start_line)])
+                        err = await self._send_and_check(pre, timeout)
+                        if err:
+                            return err
+
+                    await self._extract_goals_for([thm])
+
+                    thm_content = '\n'.join(content_lines[self._line_to_idx(thm.start_line):self._line_to_idx(thm.proof_end_line)])
+                    if thm_content.strip():
+                        result = await self.session.send(thm_content, timeout=timeout)
                         if _is_fatal_hol_error(result):
                             return f"Error executing file content: {_format_context_error(result)}"
-                
-                # For Definition blocks: extract TC goal before processing
-                if thm.kind == "Definition" and thm.proof_body and thm.name not in self._tc_goals:
-                    await self._extract_tc_goal(thm)
+                        if _is_hol_error(result):
+                            err = await self._handle_theorem_error(thm, result)
+                            if err:
+                                return err
 
-                # For Resume blocks: extract goal before loading
-                if thm.kind == "Resume" and thm.name not in self._resume_goals:
-                    await self._extract_resume_goal(thm)
+                    current_line = thm.proof_end_line
+                    i += 1
+                else:
+                    # Local block: collect theorems, send as one chunk from
+                    # current_line through the block's 'end'
+                    lb = local_block
+                    block_thms = []
+                    while i < len(theorems_in_range) and lb.local_line <= theorems_in_range[i].start_line <= lb.end_line:
+                        block_thms.append(theorems_in_range[i])
+                        i += 1
 
-                # Load the theorem
-                thm_content = '\n'.join(content_lines[thm.start_line - 1:thm.proof_end_line - 1])
-                if thm_content.strip():
-                    result = await self.session.send(thm_content, timeout=timeout)
-                    if _is_fatal_hol_error(result):
-                        return f"Error executing file content: {_format_context_error(result)}"
-                    # On proof failure, cheat so later theorems can reference it
-                    if _is_hol_error(result):
-                        if thm.kind == "Definition":
-                            return (
-                                f"Definition '{thm.name}' failed (line {thm.start_line}): "
-                                f"{result[:300]}"
-                            )
-                        cheat_err = await self._cheat_failed_theorem(thm)
-                        if cheat_err:
-                            return cheat_err
-                
-                # proof_end_line is "line after QED/End" (1-indexed); we loaded through it
-                current_line = thm.proof_end_line
-            
-            # Load remaining content after last theorem (up to target_line)
+                    await self._extract_goals_for(block_thms)
+
+                    # Must include 'end' even if target_line falls inside the
+                    # local block — Poly/ML requires the complete local...end
+                    block_end = lb.end_line + 1
+                    if block_end > current_line:
+                        block_content = '\n'.join(content_lines[self._line_to_idx(current_line):self._line_to_idx(block_end)])
+                        if block_content.strip():
+                            result = await self.session.send(block_content, timeout=timeout)
+                            if _is_fatal_hol_error(result):
+                                return f"Error executing file content: {_format_context_error(result)}"
+                            if _is_hol_error(result):
+                                for bt in block_thms:
+                                    err = await self._handle_theorem_error(bt, result)
+                                    if err:
+                                        return err
+                        current_line = block_end
+
+            # Remaining content after last theorem — check for local block
+            # overlap (pre-content may include 'local ... in' without 'end')
             if current_line < target_line:
-                start_idx = current_line - 1
-                remaining = '\n'.join(content_lines[start_idx:target_line - 1])
-                if remaining.strip():
-                    result = await self.session.send(remaining, timeout=timeout)
-                    if _is_fatal_hol_error(result):
-                        return f"Error executing file content: {_format_context_error(result)}"
+                actual_target = target_line
+                lb = self._local_block_overlapping(current_line, target_line - 1)
+                if lb:
+                    actual_target = max(target_line, lb.end_line + 1)
+                remaining = '\n'.join(content_lines[self._line_to_idx(current_line):self._line_to_idx(actual_target)])
+                err = await self._send_and_check(remaining, timeout)
+                if err:
+                    return err
+                current_line = actual_target
         
-        # Update tracking
-        loaded_content = '\n'.join(content_lines[:target_line - 1])
-        self._loaded_to_line = target_line
+        # Update tracking — current_line may be past target_line if we loaded
+        # an entire local block
+        self._loaded_to_line = max(target_line, current_line)
+        loaded_content = '\n'.join(content_lines[:self._loaded_to_line - 1])
         self._loaded_content_hash = self._compute_hash(loaded_content)
         return None
 
@@ -1796,6 +1889,8 @@ class FileProofCursor:
 
         Executes each proof exactly once: times tactics, then stores theorem
         so subsequent proofs can use it.
+
+        TODO: Handle local blocks (batch with block) like _load_context_to_line.
 
         Returns:
             Dict mapping theorem name to trace (empty list for cheats/no tactics)

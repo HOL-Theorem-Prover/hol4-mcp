@@ -5,6 +5,7 @@ from pathlib import Path
 
 from hol4_mcp.hol_file_parser import (
     parse_theorems, parse_file, parse_p_output,
+    parse_local_blocks,
 )
 
 FIXTURES_DIR = Path(__file__).parent / "fixtures"
@@ -594,3 +595,117 @@ End
     # Only rec_def should be parsed (has Termination proof)
     assert len(thms) == 1
     assert thms[0].name == "rec_def"
+
+
+# =============================================================================
+# Local block parsing
+# =============================================================================
+
+
+def test_parse_local_blocks_same_line():
+    """local open X in on one line (common HOL4 pattern)."""
+    content = '''local open fooTheory barTheory in
+  Theorem x: T Proof simp[] QED
+  Theorem y: T Proof simp[] QED
+end
+'''
+    blocks = parse_local_blocks(content)
+    assert len(blocks) == 1
+    assert blocks[0].local_line == 1
+    assert blocks[0].in_line == 1
+    assert blocks[0].end_line == 4
+
+
+def test_parse_local_blocks_multi_line():
+    """local and in on separate lines."""
+    content = '''local
+  open fooTheory
+  open barTheory
+in
+  Theorem x: T Proof simp[] QED
+end
+'''
+    blocks = parse_local_blocks(content)
+    assert len(blocks) == 1
+    assert blocks[0].local_line == 1
+    assert blocks[0].in_line == 4
+    assert blocks[0].end_line == 6
+
+
+def test_parse_local_blocks_nested():
+    """Nested local blocks."""
+    content = '''local
+  open fooTheory
+in
+  local open barTheory in
+    Theorem x: T Proof simp[] QED
+  end
+
+  Theorem y: T Proof simp[] QED
+end
+'''
+    blocks = parse_local_blocks(content)
+    assert len(blocks) == 2
+    inner = [b for b in blocks if b.local_line == 4][0]
+    assert inner.in_line == 4
+    assert inner.end_line == 6
+    outer = [b for b in blocks if b.local_line == 1][0]
+    assert outer.in_line == 3
+    assert outer.end_line == 9
+
+
+def test_parse_local_blocks_stripping():
+    """Keywords inside comments/strings should not create false blocks."""
+    content = '''(* local open fooTheory in *)
+val x = "local open barTheory in"
+local open bazTheory in
+  Theorem x: T Proof simp[] QED
+end
+'''
+    blocks = parse_local_blocks(content)
+    assert len(blocks) == 1
+    assert blocks[0].local_line == 3
+
+
+def test_parse_local_blocks_multiple():
+    """Multiple non-nested local blocks."""
+    content = '''local open A in
+  val x = 1
+end
+
+local open B in
+  val y = 2
+end
+'''
+    blocks = parse_local_blocks(content)
+    assert len(blocks) == 2
+    assert blocks[0].local_line == 1
+    assert blocks[1].local_line == 5
+
+
+def test_parse_local_blocks_cakeml_style():
+    """CakeML-style multi-theorem local block."""
+    content = '''local open fooTheory barTheory bazTheory in
+
+Theorem thm1:
+  !x. P x
+Proof
+  simp[]
+QED
+
+Theorem thm2:
+  !y. Q y
+Proof
+  rw[]
+QED
+
+end
+'''
+    blocks = parse_local_blocks(content)
+    assert len(blocks) == 1
+    lb = blocks[0]
+    assert lb.local_line == 1
+    assert lb.in_line == 1
+    lines = content.split('\n')
+    end_idx = next(i for i, l in enumerate(lines) if l.strip() == 'end')
+    assert lb.end_line == end_idx + 1
