@@ -823,9 +823,17 @@ class FileProofCursor:
         When content changes at line N, all theorems starting at N or later,
         OR containing line N, have invalid checkpoints/traces.
         Also invalidates for deleted theorems (not in new parse).
+
+        Resume goals have special handling: they're only invalidated when the
+        change affects the main theorem containing the corresponding `suspend`,
+        because re-extraction requires the original suspension to still hold
+        its label (which may already be consumed after the Resume ran).
         """
         current_thm_names = {thm.name for thm in self._theorems}
-        
+
+        # Build name → theorem lookup for fast suspension-source queries
+        name_to_thm = {thm.name: thm for thm in self._theorems}
+
         # Invalidate checkpoints/traces/tc_goals for theorems that no longer exist
         for name in list(self._checkpoints.keys()):
             if name not in current_thm_names:
@@ -839,7 +847,7 @@ class FileProofCursor:
         for name in list(self._resume_goals.keys()):
             if name not in current_thm_names:
                 del self._resume_goals[name]
-        
+
         # Invalidate checkpoints/traces/tc_goals/resume_goals for theorems at or after change point
         for thm in self._theorems:
             if thm.proof_end_line >= start_line:
@@ -848,7 +856,37 @@ class FileProofCursor:
                     del self._proof_traces[thm.name]
                 if thm.name in self._tc_goals:
                     del self._tc_goals[thm.name]
-                if thm.name in self._resume_goals:
+                # Resume goals: invalidate only when change affects the
+                # extraction context (main theorem or a nested suspending
+                # Resume earlier in the chain). Once a Resume's label has
+                # been consumed by its own run, re-extraction is impossible
+                # without session rollback.
+                if thm.kind == "Resume" and thm.name in self._resume_goals:
+                    source_thm = name_to_thm.get(thm.suspension_name) if thm.suspension_name else None
+                    # The main `suspend "X"` for a Resume block lives either
+                    # in the original Theorem or in an earlier Resume of the
+                    # same theorem chain. Walk the chain to see if any
+                    # ancestor's body was touched.
+                    affected = False
+                    if source_thm and start_line <= source_thm.proof_end_line:
+                        affected = True
+                    if not affected:
+                        # Check earlier Resume blocks on the same suspension:
+                        # their bodies can contain further `suspend` calls
+                        # whose labels this Resume depends on.
+                        for other in self._theorems:
+                            if other is thm:
+                                break
+                            if (other.kind == "Resume"
+                                    and other.suspension_name == thm.suspension_name
+                                    and other.start_line < thm.start_line
+                                    and start_line <= other.proof_end_line):
+                                affected = True
+                                break
+                    if affected:
+                        del self._resume_goals[thm.name]
+                elif thm.name in self._resume_goals:
+                    # Non-Resume (shouldn't happen, but keep safe): drop
                     del self._resume_goals[thm.name]
 
     async def init(self) -> dict:
