@@ -1796,12 +1796,15 @@ class FileProofCursor:
         if not thm:
             return []
 
-        # Restore to deps-only state only when the target theorem is not
-        # already covered by the incrementally loaded prefix. If it is
-        # already loaded, the session is at clean top-level (verify_theorem_json
-        # always drop_all()s on entry/exit with store=false), so skipping the
-        # restore avoids re-replaying the entire file prefix on every call.
-        if self._deps_checkpoint_saved and thm.start_line > self._loaded_to_line:
+        # Restore to deps-only state only on a cold cursor (nothing loaded yet).
+        # Once any prefix is loaded, enter_theorem handles both cases cheaply:
+        #   - target theorem past _loaded_to_line → incremental forward load
+        #   - target theorem already in prefix → already stored in theory, and
+        #     verify_theorem_json does drop_all(); g(goal); tactics itself
+        # (store=false, so no theory pollution, and drop_all() runs on exit).
+        # Restoring unconditionally was wiping _loaded_to_line on every call
+        # and forcing a full file-prefix replay for each hol_check_proof.
+        if self._deps_checkpoint_saved and self._loaded_to_line == 0:
             await self._restore_to_deps()
 
         # Load context up to theorem
