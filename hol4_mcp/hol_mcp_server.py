@@ -482,10 +482,8 @@ async def hol_restart(session: str = "default") -> str:
 
     workdir = entry.workdir
     env = entry.env  # Preserve env through restart
-    # hol_stop/hol_start are @mcp.tool()-wrapped FunctionTool objects in
-    # FastMCP 3.x — the raw coroutine is exposed via `.fn`.
-    await hol_stop.fn(session)
-    return await hol_start.fn(workdir=str(workdir), name=session, env=env)
+    await hol_stop(session)
+    return await hol_start(workdir=str(workdir), name=session, env=env)
 
 
 @mcp.tool()
@@ -514,7 +512,7 @@ async def hol_setenv(env: dict, session: str = "default") -> str:
 
     # Auto-restart to apply new env to running process
     if entry.session.is_running:
-        restart_result = await hol_restart.fn(session)
+        restart_result = await hol_restart(session)
         return f"Environment updated and session restarted: {env}\n{restart_result}"
 
     return f"Environment updated for session '{session}': {env}"
@@ -818,7 +816,7 @@ async def _init_file_cursor(
     if s and s.is_running:
         # Check if workdir differs - need to restart
         if entry and entry.workdir != target_workdir:
-            await hol_stop.fn(session)
+            await hol_stop(session)
             s = None
         # Check if file content changed - session has stale definitions
         elif entry and entry.cursor:
@@ -830,13 +828,13 @@ async def _init_file_cursor(
                 new_hash = hashlib.sha256(new_content.encode()).hexdigest()
                 if old_hash and new_hash != old_hash:
                     # File changed - restart session to clear stale definitions
-                    await hol_stop.fn(session)
+                    await hol_stop(session)
                     s = None
 
     if not s or not s.is_running:
         # Preserve per-session HOL env (e.g., VFMDIR) across auto-restarts.
         start_env = entry.env if entry else None
-        start_result = await hol_start.fn(workdir=str(target_workdir), name=session, env=start_env)
+        start_result = await hol_start(workdir=str(target_workdir), name=session, env=start_env)
         if start_result.startswith("ERROR"):
             return start_result
         s = await _get_session(session)
