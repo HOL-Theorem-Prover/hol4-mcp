@@ -135,7 +135,7 @@ class HOLSession:
             while not self._buffer.endswith(b'\0'):
                 chunk = await self.process.stdout.read(65536)
                 if not chunk:
-                    raise RuntimeError("HOL process died unexpectedly")
+                    raise RuntimeError(await self._death_reason())
                 self._buffer += chunk
 
             parts = self._buffer.split(b'\0')
@@ -144,6 +144,23 @@ class HOLSession:
             return strip_ansi(result) if self.strip_ansi else result
 
         return await asyncio.wait_for(read_loop(), timeout=timeout)
+
+    async def _death_reason(self) -> str:
+        """Diagnostic for unexpected HOL death. Detects memcg OOM."""
+        try:
+            rc = await asyncio.wait_for(self.process.wait(), timeout=0.5)
+        except asyncio.TimeoutError:
+            return "HOL process died unexpectedly (no exit code yet)"
+        if rc == -signal.SIGKILL:
+            return (
+                "HOL process OOM-killed (SIGKILL from kernel cgroup). "
+                "The tactic or goal exceeded the memory cap. "
+                "Simplify the tactic (avoid large rewrites/EVAL on big terms), "
+                "split the lemma, or reduce case-splits."
+            )
+        if rc is not None and rc < 0:
+            return f"HOL process killed by signal {-rc} (returncode={rc})"
+        return f"HOL process died unexpectedly (returncode={rc})"
 
     def interrupt(self):
         """Send SIGINT to entire process group."""
