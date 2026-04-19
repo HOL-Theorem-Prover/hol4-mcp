@@ -406,8 +406,16 @@ def test_parse_linearize_no_json():
     output = '''No JSON here
 Just some text
 val it = () : unit'''
-    with pytest.raises(HOLParseError, match="No valid JSON"):
+    with pytest.raises(HOLParseError, match="No JSON object found"):
         parse_linearize_with_spans_output(output)
+
+
+def test_parse_linearize_embedded_json():
+    """JSON embedded after other output (e.g. metis progress) should be found."""
+    output = 'metis: {"ok":[{"t":"tac","s":0,"e":3,"a":false}]}'
+    result = parse_linearize_with_spans_output(output)
+    assert len(result) == 1
+    assert result[0][0] == "tac"
 
 
 def test_parse_linearize_malformed_json_then_valid():

@@ -49,10 +49,12 @@ class HOLParseError(Exception):
 
 
 def _find_json_line(output: str, context: str) -> dict:
-    """Find and parse the first JSON object line in output.
+    """Find and parse a JSON object in HOL output.
 
-    HOL may print warnings/messages before the JSON line. This scans for the
-    first line starting with '{' and attempts to parse it as JSON.
+    HOL may print warnings, val bindings, or other output before the JSON.
+    This handles two cases:
+    1. A line starting with a JSON object (common case)
+    2. A JSON object embedded after other output (e.g., "metis: {\"ok\":...}")
 
     Args:
         output: Raw output from HOL
@@ -66,15 +68,30 @@ def _find_json_line(output: str, context: str) -> dict:
     """
     import json
 
-    for line in output.strip().split('\n'):
-        line = line.strip()
-        if line.startswith('{'):
-            try:
-                return json.loads(line)
-            except json.JSONDecodeError:
-                continue
+    markers = ['{"ok":', '{"err":']
 
-    raise HOLParseError(f"No valid JSON object found in {context} output")
+    for line in output.strip().split('\n'):
+        stripped = line.strip()
+        # Try exact line match first (most common case)
+        if stripped.startswith('{'):
+            try:
+                return json.loads(stripped)
+            except json.JSONDecodeError:
+                pass
+        # Then look for embedded JSON after other output
+        for marker in markers:
+            idx = stripped.find(marker)
+            if idx >= 0:
+                try:
+                    return json.loads(stripped[idx:])
+                except json.JSONDecodeError:
+                    pass
+
+    # Include snippet of raw output in error for debugging
+    preview = output.strip()[:200]
+    raise HOLParseError(
+        f"No JSON object found in {context} output. Raw output: {preview}"
+    )
 
 
 def parse_linearize_with_spans_output(output: str) -> list[tuple[str, int, int, bool]]:

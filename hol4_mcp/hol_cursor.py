@@ -2,7 +2,6 @@
 
 import asyncio
 import hashlib
-import json
 import re
 import time
 from dataclasses import dataclass, field
@@ -14,38 +13,17 @@ from .hol_file_parser import (
     parse_step_plan_output, StepPlan,
     parse_prefix_commands_output,
     parse_step_positions_output,
+    _find_json_line,
 )
 from .hol_session import HOLSession, HOLDIR, escape_sml_string
 
 
-def _find_json_line(output: str, prefix: str = "") -> dict:
-    """Find and parse a JSON line from HOL output.
-
-    Looks for {"ok":...} or {"err":...} patterns, either at the start of a line
-    or embedded after other output (e.g., "metis: {"ok":...}").
-    If prefix is provided, only looks for lines after that prefix.
-    """
-    for line in output.split('\n'):
-        line = line.strip()
-        # First try exact line match (most common case)
-        if line.startswith('{"ok":') or line.startswith('{"err":'):
-            try:
-                return json.loads(line)
-            except json.JSONDecodeError:
-                pass
-        # Then try to find embedded JSON (e.g., after metis progress output)
-        # Look for {"ok": or {"err": anywhere in line
-        for marker in ['{"ok":', '{"err":']:
-            idx = line.find(marker)
-            if idx >= 0:
-                # Try to parse JSON starting from this position
-                candidate = line[idx:]
-                try:
-                    return json.loads(candidate)
-                except json.JSONDecodeError:
-                    # JSON might be truncated or malformed, continue
-                    pass
-    return {}
+def _try_find_json_line(output: str, context: str = "") -> dict:
+    """Best-effort JSON parse from HOL output. Returns {} on failure."""
+    try:
+        return _find_json_line(output, context)
+    except HOLParseError:
+        return {}
 
 
 def _is_hol_error(output: str) -> bool:
@@ -965,7 +943,7 @@ class FileProofCursor:
         tc_result = await self.session.send(
             f'extract_tc_goal_json "{escaped}";', timeout=30
         )
-        tc_data = _find_json_line(tc_result)
+        tc_data = _try_find_json_line(tc_result)
         if 'ok' in tc_data and tc_data['ok']:
             self._tc_goals[thm.name] = tc_data['ok']
 
@@ -985,7 +963,7 @@ class FileProofCursor:
             f'extract_resume_goal_json "{escaped_susp}" "{escaped_label}";',
             timeout=30
         )
-        data = _find_json_line(result)
+        data = _try_find_json_line(result)
         if 'ok' in data:
             self._resume_goals[thm.name] = data['ok']
 
@@ -2035,7 +2013,7 @@ class FileProofCursor:
             )
 
         # Parse response into TraceEntry list
-        parsed = _find_json_line(result)
+        parsed = _try_find_json_line(result)
         trace = []
         steps = [step for step in self._step_plan if step.cmd.strip()]
         if 'ok' in parsed:
@@ -2236,7 +2214,7 @@ class FileProofCursor:
                 )
 
             # Parse response and convert to TraceEntry list
-            parsed = _find_json_line(result)
+            parsed = _try_find_json_line(result)
             trace = []
             steps = [step for step in step_plan if step.cmd.strip()]
             if 'ok' in parsed:
