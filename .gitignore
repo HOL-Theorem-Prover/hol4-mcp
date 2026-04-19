@@ -10,3 +10,4 @@ build/
 node_modules/
 uv.lock
 .sandbox
+scratch/

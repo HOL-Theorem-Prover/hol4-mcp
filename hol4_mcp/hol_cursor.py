@@ -260,10 +260,18 @@ class TraceEntry:
 
 @dataclass
 class TheoremCheckpoint:
-    """Checkpoint state for a theorem."""
+    """Checkpoint state for a theorem.
+
+    Two types of checkpoints with different semantics:
+    - context_path: theory state after loading theorem content (QED → stored).
+      Valid prefix for successor theorems. Saved during _load_context_to_line.
+    - end_of_proof_path: proof replay state after all tactics (for backup_n).
+      NOT a valid prefix — theorem not bound. Saved during state_at.
+    """
     theorem_name: str
-    tactics_count: int            # Number of tactics when checkpoint saved
-    end_of_proof_path: Path | None = None   # Checkpoint after all tactics (for state_at)
+    tactics_count: int            # Number of tactics when end_of_proof saved
+    end_of_proof_path: Path | None = None   # Proof replay checkpoint (for state_at)
+    context_path: Path | None = None       # Context checkpoint (theory state, for navigation)
     last_accessed: float = field(default_factory=time.time)  # For LRU eviction
     content_hash: str = ""        # File hash when checkpoint was saved
 
@@ -604,14 +612,24 @@ class FileProofCursor:
         return True
 
     def _is_checkpoint_valid(self, theorem_name: str) -> bool:
-        """Check if cached checkpoint exists and file is present."""
+        """Check if end_of_proof checkpoint exists and is valid."""
         ckpt = self._checkpoints.get(theorem_name)
-        if not ckpt:
+        if ckpt is None:
             return False
-        if not ckpt.end_of_proof_path or not ckpt.end_of_proof_path.exists():
+        if ckpt.end_of_proof_path is None or not ckpt.end_of_proof_path.exists():
             return False
-        # Check content_hash matches current file (checkpoint may be stale after edit)
-        if ckpt.content_hash and ckpt.content_hash != self._content_hash:
+        if ckpt.content_hash != "" and ckpt.content_hash != self._content_hash:
+            return False
+        return True
+
+    def _is_context_checkpoint_valid(self, theorem_name: str) -> bool:
+        """Check if context checkpoint exists and is valid."""
+        ckpt = self._checkpoints.get(theorem_name)
+        if ckpt is None:
+            return False
+        if ckpt.context_path is None or not ckpt.context_path.exists():
+            return False
+        if ckpt.content_hash != "" and ckpt.content_hash != self._content_hash:
             return False
         return True
 
@@ -648,16 +666,62 @@ class FileProofCursor:
         if _is_hol_error(result):
             return False
 
-        self._checkpoints[theorem_name] = TheoremCheckpoint(
-            theorem_name=theorem_name,
-            tactics_count=tactics_count,
-            end_of_proof_path=ckpt_path,
-            last_accessed=time.time(),
-            content_hash=self._content_hash,
-        )
+        # Merge with existing entry (may already have context_path)
+        if theorem_name in self._checkpoints:
+            self._checkpoints[theorem_name].end_of_proof_path = ckpt_path
+            self._checkpoints[theorem_name].tactics_count = tactics_count
+            self._checkpoints[theorem_name].last_accessed = time.time()
+        else:
+            self._checkpoints[theorem_name] = TheoremCheckpoint(
+                theorem_name=theorem_name,
+                tactics_count=tactics_count,
+                end_of_proof_path=ckpt_path,
+                last_accessed=time.time(),
+                content_hash=self._content_hash,
+            )
         # Evict old checkpoints if over limit
         self._evict_lru_checkpoints()
         return True
+
+    async def _save_context_checkpoint(self, theorem_name: str) -> None:
+        """Save context checkpoint: theory state after theorem content is loaded.
+
+        The session has the theorem stored (QED → store_thm) and clean
+        top-level proof state. This checkpoint is a valid prefix for
+        successor theorems — unlike end_of_proof checkpoints which have
+        proof replay state but no theorem binding.
+
+        Called after each theorem loads in _load_context_to_line.
+        Unconditional — frequent checkpoints keep saveChild deltas small
+        and bound replay distance for backward navigation.
+        """
+        if not self._base_checkpoint_saved:
+            return
+
+        self._checkpoint_dir.mkdir(parents=True, exist_ok=True)
+        ckpt_path = self._get_checkpoint_path(theorem_name, "context")
+        ckpt_path_str = escape_sml_string(str(ckpt_path))
+
+        depth = await self._get_hierarchy_depth()
+        result = await self.session.send(
+            f'PolyML.SaveState.saveChild ("{ckpt_path_str}", {depth});', timeout=60
+        )
+        if _is_hol_error(result):
+            return
+
+        # Update checkpoint dict (merge with any existing end_of_proof entry)
+        if theorem_name in self._checkpoints:
+            self._checkpoints[theorem_name].context_path = ckpt_path
+            self._checkpoints[theorem_name].last_accessed = time.time()
+        else:
+            self._checkpoints[theorem_name] = TheoremCheckpoint(
+                theorem_name=theorem_name,
+                tactics_count=0,
+                context_path=ckpt_path,
+                last_accessed=time.time(),
+                content_hash=self._content_hash,
+            )
+        self._evict_lru_checkpoints()
 
     async def _load_checkpoint_and_backup(self, theorem_name: str, target_tactic_idx: int) -> bool:
         """Load checkpoint and backup to target position.
@@ -672,7 +736,7 @@ class FileProofCursor:
         Returns True if successful, False if checkpoint invalid or load failed.
         """
         ckpt = self._checkpoints.get(theorem_name)
-        if not ckpt or not self._is_checkpoint_valid(theorem_name):
+        if ckpt is None or not self._is_checkpoint_valid(theorem_name):
             return False
 
         # Update access time for LRU
@@ -693,10 +757,12 @@ class FileProofCursor:
             self._proof_initialized = False
             return False
         
-        # Checkpoint (child of base) has all file content, mark as fully loaded
-        # Restore the hash from when checkpoint was saved for correct staleness detection
-        last_thm = self._theorems[-1] if self._theorems else None
-        self._loaded_to_line = last_thm.proof_end_line if last_thm else 0
+        # End-of-proof checkpoint has proof replay state but NO theorem binding
+        # (proof was replayed via g/e, not loaded via QED). Set _loaded_to_line
+        # to this theorem's proof_end_line — the session has content up to here
+        # from the checkpoint's parent chain (base + context), but NOT later theorems.
+        thm = self._get_theorem(theorem_name)
+        self._loaded_to_line = thm.proof_end_line if thm else 0
         self._loaded_content_hash = ckpt.content_hash
 
         # Backup to target position (~11ms for any N)
@@ -710,11 +776,69 @@ class FileProofCursor:
         self._proof_initialized = True
         return True
 
+    def _find_predecessor_checkpoint(self, target_thm: TheoremInfo) -> TheoremInfo | None:
+        """Find latest predecessor with a valid context checkpoint.
+
+        Walks theorems backward from target, returning the closest one
+        whose context checkpoint exists and content_hash matches.
+        """
+        for thm in reversed(self._theorems):
+            if thm.proof_end_line > target_thm.start_line:
+                continue  # Not a predecessor
+            if self._is_context_checkpoint_valid(thm.name):
+                return thm
+        return None
+
+    async def _load_context_checkpoint(self, theorem_name: str) -> bool:
+        """Load a context checkpoint (theory state after theorem stored).
+
+        Unlike _load_checkpoint_and_backup, this loads a checkpoint that
+        has the theorem bound in theory — valid prefix for successors.
+        Sets _loaded_to_line to the theorem's proof_end_line.
+
+        Returns True if loaded successfully.
+        """
+        ckpt = self._checkpoints.get(theorem_name)
+        if ckpt is None or ckpt.context_path is None:
+            return False
+        if not ckpt.context_path.exists():
+            # File gone — clean up the stale reference
+            ckpt.context_path = None
+            if ckpt.end_of_proof_path is None:
+                self._checkpoints.pop(theorem_name, None)
+            return False
+
+        ckpt.last_accessed = time.time()
+        ckpt_path_str = escape_sml_string(str(ckpt.context_path))
+        result = await self.session.send(
+            f'PolyML.SaveState.loadState "{ckpt_path_str}";', timeout=30
+        )
+        if _is_hol_error(result):
+            # Remove just the context_path (keep end_of_proof if any)
+            if ckpt.context_path and ckpt.context_path.exists():
+                ckpt.context_path.unlink()
+            ckpt.context_path = None
+            self._loaded_to_line = 0
+            self._loaded_content_hash = ""
+            # If no paths remain, remove dict entry entirely
+            if ckpt.end_of_proof_path is None and ckpt.context_path is None:
+                self._checkpoints.pop(theorem_name, None)
+            return False
+
+        thm = self._get_theorem(theorem_name)
+        self._loaded_to_line = thm.proof_end_line if thm else 0
+        self._loaded_content_hash = ckpt.content_hash
+        return True
+
     def _invalidate_checkpoint(self, theorem_name: str) -> None:
         """Invalidate and delete checkpoint for a theorem."""
         ckpt = self._checkpoints.pop(theorem_name, None)
-        if ckpt and ckpt.end_of_proof_path and ckpt.end_of_proof_path.exists():
+        if not ckpt:
+            return
+        if ckpt.end_of_proof_path and ckpt.end_of_proof_path.exists():
             ckpt.end_of_proof_path.unlink()
+        if ckpt.context_path and ckpt.context_path.exists():
+            ckpt.context_path.unlink()
 
     def _invalidate_all_checkpoints(self) -> None:
         """Invalidate all checkpoints (e.g., when file changes significantly)."""
@@ -834,6 +958,12 @@ class FileProofCursor:
 
         # Save deps-only checkpoint for clean verification
         await self._save_deps_checkpoint()
+
+        # Save base checkpoint now (same state as deps-only) so that context
+        # checkpoints can be saved as children of base from the very first
+        # _load_context_to_line call. Without this, _base_checkpoint_saved is False
+        # during the first load and no context checkpoints are created.
+        await self._save_base_checkpoint()
 
         # File content loading is LAZY — handled by enter_theorem →
         # _load_context_to_line when a specific theorem is requested.
@@ -1144,6 +1274,7 @@ class FileProofCursor:
                                 return err
 
                     current_line = thm.proof_end_line
+                    await self._save_context_checkpoint(thm.name)
                     i += 1
                 else:
                     # Local block: collect theorems, send as one chunk from
@@ -1171,6 +1302,9 @@ class FileProofCursor:
                                     if err:
                                         return err
                         current_line = block_end
+                        # Save context checkpoint for last theorem in local block
+                        if block_thms:
+                            await self._save_context_checkpoint(block_thms[-1].name)
 
             # Remaining content after last theorem — check for local block
             # overlap (pre-content may include 'local ... in' without 'end')
@@ -1233,9 +1367,9 @@ class FileProofCursor:
         if thm.kind == "Resume" and thm.name not in self._resume_goals:
             await self._extract_resume_goal(thm)
 
-        # Lazily save base checkpoint after first context load
+        # Base checkpoint should have been saved in init(). If somehow it
+        # wasn't, save it now (without drop_all — we just loaded context).
         if not self._base_checkpoint_saved:
-            await self.session.send('(drop_all(); PolyML.fullGC());', timeout=10)
             await self._save_base_checkpoint()
 
         # Parse step plan from proof body using TacticParse
@@ -1796,16 +1930,26 @@ class FileProofCursor:
         if not thm:
             return []
 
-        # Restore to deps-only state only on a cold cursor (nothing loaded yet).
-        # Once any prefix is loaded, enter_theorem handles both cases cheaply:
-        #   - target theorem past _loaded_to_line → incremental forward load
-        #   - target theorem already in prefix → already stored in theory, and
-        #     verify_theorem_json does drop_all(); g(goal); tactics itself
-        # (store=false, so no theory pollution, and drop_all() runs on exit).
-        # Restoring unconditionally was wiping _loaded_to_line on every call
-        # and forcing a full file-prefix replay for each hol_check_proof.
-        if self._deps_checkpoint_saved and self._loaded_to_line == 0:
-            await self._restore_to_deps()
+        # Navigation to correct theory prefix for holmake-matching verification.
+        # Three cases:
+        # 1. Cold cursor (_loaded_to_line == 0): restore to deps-only, enter_theorem
+        #    does full incremental load.
+        # 2. Forward/prefix already loaded (_loaded_to_line <= thm.start_line):
+        #    enter_theorem handles incremental delta or is a no-op. No restore needed.
+        # 3. Backward (_loaded_to_line > thm.start_line): loaded prefix extends past
+        #    target, so later theorems may be in scope. Try loading the nearest
+        #    predecessor context checkpoint, which has the correct theory prefix
+        #    without later theorems. Fallback to deps-only restore if none exists.
+        if self._deps_checkpoint_saved:
+            if self._loaded_to_line == 0:
+                await self._restore_to_deps()
+            elif self._loaded_to_line > thm.start_line:
+                predecessor = self._find_predecessor_checkpoint(thm)
+                if predecessor is not None:
+                    if not await self._load_context_checkpoint(predecessor.name):
+                        await self._restore_to_deps()
+                else:
+                    await self._restore_to_deps()
 
         # Load context up to theorem
         enter_result = await self.enter_theorem(theorem_name)
