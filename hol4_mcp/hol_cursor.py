@@ -1796,8 +1796,12 @@ class FileProofCursor:
         if not thm:
             return []
 
-        # Restore to deps-only state for holmake-matching verification
-        if self._deps_checkpoint_saved:
+        # Restore to deps-only state only when the target theorem is not
+        # already covered by the incrementally loaded prefix. If it is
+        # already loaded, the session is at clean top-level (verify_theorem_json
+        # always drop_all()s on entry/exit with store=false), so skipping the
+        # restore avoids re-replaying the entire file prefix on every call.
+        if self._deps_checkpoint_saved and thm.start_line > self._loaded_to_line:
             await self._restore_to_deps()
 
         # Load context up to theorem
