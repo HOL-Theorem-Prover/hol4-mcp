@@ -1066,9 +1066,10 @@ async def hol_state_at(
     if result.timings:
         t = result.timings
         lines.append("")
+        method = 'reused' if t.get('reused_state') else ('checkpoint' if t.get('used_checkpoint') else 'replay')
         lines.append(f"[Timing: total={t.get('total', 0)*1000:.0f}ms, "
                      f"replay={t.get('replay', 0)*1000:.0f}ms, "
-                     f"checkpoint={'yes' if t.get('used_checkpoint') else 'no'}]")
+                     f"method={method}]")
 
     _schedule_gc(session)
     return _truncate_output("\n".join(lines), max_output, footer=error_footer)

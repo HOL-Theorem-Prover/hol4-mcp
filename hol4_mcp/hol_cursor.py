@@ -326,7 +326,9 @@ class FileProofCursor:
         self._active_theorem: str | None = None
         self._step_plan: list[StepPlan] = []  # Step boundaries aligned with e() commands
         self._current_tactic_idx: int = 0  # Current position in proof (for backup optimization)
+        self._current_proof_offset: int | None = None  # Proof body offset for partial replay tracking
         self._proof_initialized: bool = False  # Whether g/gt has been called for current theorem
+        self._state_content_hash: str = ""  # Content hash when session state was established
 
         # What's been loaded into HOL
         self._loaded_to_line: int = 0
@@ -429,6 +431,8 @@ class FileProofCursor:
                 self._loaded_content_hash = ""
                 self._proof_initialized = False
                 self._current_tactic_idx = 0
+                self._current_proof_offset = None
+                self._state_content_hash = ""
                 self._active_theorem = None
 
                 # Invalidate all caches/checkpoints that depend on old context
@@ -505,6 +509,8 @@ class FileProofCursor:
         self._loaded_content_hash = ""
         self._proof_initialized = False
         self._current_tactic_idx = 0
+        self._current_proof_offset = None
+        self._state_content_hash = ""
         self._active_theorem = None
         self._step_plan = []
         self._needs_session_reinit = False
@@ -755,6 +761,8 @@ class FileProofCursor:
             self._loaded_to_line = 0
             self._loaded_content_hash = ""
             self._proof_initialized = False
+            self._current_proof_offset = None
+            self._state_content_hash = ""
             return False
         
         # End-of-proof checkpoint has proof replay state but NO theorem binding
@@ -773,6 +781,8 @@ class FileProofCursor:
                 return False
 
         self._current_tactic_idx = target_tactic_idx
+        self._current_proof_offset = None  # At a step boundary, not a partial offset
+        self._state_content_hash = self._content_hash
         self._proof_initialized = True
         return True
 
@@ -1387,6 +1397,8 @@ class FileProofCursor:
 
         self._active_theorem = name
         self._current_tactic_idx = 0  # Reset position for new theorem
+        self._current_proof_offset = None
+        self._state_content_hash = ""
         self._proof_initialized = False  # Will be set on first state_at
 
         # For Resume blocks, show the extracted goal if available
@@ -1450,8 +1462,13 @@ class FileProofCursor:
 
         if _is_hol_error(gt_result):
             self._proof_initialized = False
+            self._current_proof_offset = None
+            self._state_content_hash = ""
             return f"Failed to set up goal: {gt_result[:300]}"
         self._proof_initialized = True
+        self._current_tactic_idx = 0
+        self._current_proof_offset = None
+        self._state_content_hash = self._content_hash
         return None
 
     async def _try_prefix_at(self, thm_name: str, offset: int) -> tuple[bool, str | None]:
@@ -1699,7 +1716,55 @@ class FileProofCursor:
             and self._step_plan[tactic_idx].goal_routing
         )
 
-        # Two paths for navigation:
+        # Session state reuse: if proof state is already at the target position
+        # (or can reach it by executing a few forward steps), skip full replay.
+        #
+        # Three cases:
+        # 1. Exact match: same position → just goals_json(), no replay
+        # 2. Forward step: current < target, both at step boundaries → send delta
+        # 3. Forward partial: at step boundary, target is partial within next step
+        #    → send prefix for remaining offset
+        # Requirements: same theorem, file unchanged, proof state initialized.
+        can_reuse = (
+            self._proof_initialized
+            and self._state_content_hash == self._content_hash
+            and not changed  # File edit invalidates session state
+        )
+
+        reused_state = False
+        if can_reuse:
+            at_step_boundary = self._current_proof_offset is None
+            if need_partial:
+                # Partial position reuse: exact offset match only
+                if (self._current_proof_offset == proof_body_offset
+                        and self._current_tactic_idx == tactic_idx):
+                    reused_state = True
+                    actual_replayed = tactic_idx
+            else:
+                # Step boundary reuse
+                if at_step_boundary and self._current_tactic_idx == tactic_idx:
+                    # Exact same step boundary — skip replay entirely
+                    reused_state = True
+                    actual_replayed = tactic_idx
+                elif (at_step_boundary
+                      and self._current_tactic_idx < tactic_idx
+                      and thm.proof_body and total_tactics > 0):
+                    # Forward: execute only the delta steps
+                    delta_cmds = [step.cmd for step in self._step_plan[self._current_tactic_idx:tactic_idx]]
+                    delta_count = len(delta_cmds)
+                    batch_cmds = "".join(delta_cmds)
+                    if batch_cmds.strip():
+                        step_timeout = self._tactic_timeout or 30
+                        batch_timeout = max(30, int(step_timeout * delta_count))
+                        result = await self.session.send(batch_cmds, timeout=batch_timeout)
+                        if not _is_hol_error(result):
+                            reused_state = True
+                            actual_replayed = tactic_idx
+                    else:
+                        reused_state = True
+                        actual_replayed = tactic_idx
+
+        # Full replay paths (when session state can't be reused):
         # 1. Checkpoint path: O(1) to step boundaries via checkpoint + backup_n
         # 2. Prefix/targeted replay path for fine-grained positions or broken proofs
         #
@@ -1741,7 +1806,9 @@ class FileProofCursor:
 
         used_checkpoint = False
 
-        if need_partial and thm.proof_body:
+        if reused_state:
+            pass  # Session already at target position
+        elif need_partial and thm.proof_body:
             # Fine-grained position: use prefix replay from theorem start
             # This correctly handles ThenLT semantics via sliceTacticBlock.
             ok, prefix_err = await self._try_prefix_at(thm.name, proof_body_offset)
@@ -1823,6 +1890,14 @@ class FileProofCursor:
 
         timings['replay'] = time.perf_counter() - t3
         timings['used_checkpoint'] = 1.0 if used_checkpoint else 0.0
+        timings['reused_state'] = 1.0 if reused_state else 0.0
+
+        # Update session position tracking for future reuse
+        if error_msg is None:
+            self._current_tactic_idx = tactic_idx
+            self._current_proof_offset = proof_body_offset if need_partial else None
+            self._state_content_hash = self._content_hash
+            self._proof_initialized = True
 
         # Get current goals as JSON
         t4 = time.perf_counter()

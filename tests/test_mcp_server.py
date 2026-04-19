@@ -669,6 +669,51 @@ async def test_state_at_uses_checkpoint_on_repeat(tmp_path):
         await hol_stop(session="checkpoint_test")
 
 
+async def test_state_at_reuses_session_state(tmp_path):
+    """Test that state_at reuses session state for same/forward positions."""
+    # Simple proof: simp[] solves T. Navigate via Proof line (tactic_idx=0)
+    # and QED line (tactic_idx=total) to stay on step boundaries.
+    test_file = tmp_path / "testScript.sml"
+    test_file.write_text(
+        'open HolKernel boolLib bossLib;\n'       # line 1
+        '\n'                                       # line 2
+        'val _ = new_theory "test";\n'             # line 3
+        '\n'                                       # line 4
+        'Theorem simple:\n'                         # line 5
+        '  T\n'                                     # line 6
+        'Proof\n'                                    # line 7
+        '  simp[]\n'                                 # line 8: step 0
+        'QED\n'                                      # line 9
+        '\n'
+        'val _ = export_theory();\n'
+    )
+
+    try:
+        await hol_file_init(file=str(test_file), session="reuse_test")
+
+        # Navigate to QED to build checkpoint (all steps replayed)
+        result_qed = await hol_state_at(session="reuse_test", line=9, col=1)
+        assert "proof complete" in result_qed.lower() or "Goals remaining: 0" in result_qed
+
+        # Navigate to Proof line (tactic_idx=0) via checkpoint
+        result1 = await hol_state_at(session="reuse_test", line=7, col=1)
+        assert "method=checkpoint" in result1, f"Expected checkpoint: {result1}"
+
+        # Same position again — should reuse (exact match)
+        result2 = await hol_state_at(session="reuse_test", line=7, col=1)
+        assert "method=reused" in result2, f"Expected reused: {result2}"
+
+        # Forward to QED (tactic_idx=total) — incremental forward
+        result3 = await hol_state_at(session="reuse_test", line=9, col=1)
+        assert "method=reused" in result3, f"Expected reused (forward): {result3}"
+
+        # Backward to Proof line — can't reuse, needs checkpoint
+        result4 = await hol_state_at(session="reuse_test", line=7, col=1)
+        assert "method=reused" not in result4, f"Backward should not reuse: {result4}"
+    finally:
+        await hol_stop(session="reuse_test")
+
+
 async def test_checkpoint_with_then_chain(tmp_path):
     """Test O(1) checkpoint navigation with THEN chain (>>) treats it as one step.
 
