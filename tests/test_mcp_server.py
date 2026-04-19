@@ -714,6 +714,121 @@ async def test_state_at_reuses_session_state(tmp_path):
         await hol_stop(session="reuse_test")
 
 
+async def test_state_at_reuse_invalidation_on_edit(tmp_path):
+    """File edit must invalidate session state reuse — stale goals are wrong."""
+    test_file = tmp_path / "testScript.sml"
+    test_file.write_text(
+        'open HolKernel boolLib bossLib;\n'
+        '\n'
+        'val _ = new_theory "test";\n'
+        '\n'
+        'Theorem simple:\n'
+        '  T\n'
+        'Proof\n'
+        '  simp[]\n'
+        'QED\n'
+        '\n'
+        'val _ = export_theory();\n'
+    )
+
+    try:
+        await hol_file_init(file=str(test_file), session="reuse_inval")
+
+        # Navigate to Proof line — establishes session state
+        result1 = await hol_state_at(session="reuse_inval", line=7, col=1)
+        assert "method=reused" in result1 or "method=checkpoint" in result1 or "method=replay" in result1
+
+        # Same position again — should reuse
+        result2 = await hol_state_at(session="reuse_inval", line=7, col=1)
+        assert "method=reused" in result2, f"Expected reused: {result2}"
+
+        # Edit file on disk — change simp[] to strip_tac (breaks proof)
+        content = test_file.read_text()
+        test_file.write_text(content.replace('simp[]', 'strip_tac'))
+
+        # Same position — MUST NOT reuse (file changed)
+        result3 = await hol_state_at(session="reuse_inval", line=7, col=1)
+        assert "method=reused" not in result3, f"Reuse after file edit! {result3}"
+    finally:
+        await hol_stop(session="reuse_inval")
+
+
+async def test_state_at_reuse_partial_offset(tmp_path):
+    """Partial offset reuse: navigating to same mid-step position twice reuses."""
+    test_file = tmp_path / "testScript.sml"
+    # Proof with `by` creates a partial position inside the step
+    test_file.write_text(
+        'open HolKernel boolLib bossLib;\n'
+        '\n'
+        'val _ = new_theory "test";\n'
+        '\n'
+        'Theorem by_test:\n'
+        '  T /\\ T\n'
+        'Proof\n'
+        '  `T` by simp[] >> simp[]\n'
+        'QED\n'
+        '\n'
+        'val _ = export_theory();\n'
+    )
+
+    try:
+        await hol_file_init(file=str(test_file), session="reuse_partial")
+
+        # First navigation to partial position (inside `by` step)
+        # Line 9 col 3 lands inside the `by` substep
+        result1 = await hol_state_at(session="reuse_partial", line=9, col=3)
+        assert "ERROR" not in result1
+
+        # Same partial position again — should reuse (exact offset match)
+        result2 = await hol_state_at(session="reuse_partial", line=9, col=3)
+        assert "method=reused" in result2, f"Expected reused for same partial: {result2}"
+
+        # Step boundary (Proof line, tactic_idx=0) — currently at partial, can't reuse
+        result3 = await hol_state_at(session="reuse_partial", line=8, col=1)
+        assert "method=reused" not in result3, f"Partial->boundary should not reuse: {result3}"
+    finally:
+        await hol_stop(session="reuse_partial")
+
+
+async def test_state_at_reuse_multi_step_forward(tmp_path):
+    """Forward delta: multi-step forward reuses by executing only delta commands."""
+    test_file = tmp_path / "testScript.sml"
+    # 2-step proof: conj_tac >- conj_tac, simp[]
+    test_file.write_text(
+        'open HolKernel boolLib bossLib;\n'
+        '\n'
+        'val _ = new_theory "test";\n'
+        '\n'
+        'Theorem multi:\n'
+        '  T /\\ T\n'
+        'Proof\n'
+        '  conj_tac >> simp[]\n'
+        'QED\n'
+        '\n'
+        'val _ = export_theory();\n'
+    )
+
+    try:
+        await hol_file_init(file=str(test_file), session="reuse_fwd")
+
+        # Go to QED (tactic_idx=total) first to ensure full proof replayed
+        result_qed = await hol_state_at(session="reuse_fwd", line=9, col=1)
+
+        # Navigate to Proof line (tactic_idx=0, before any tactic)
+        result0 = await hol_state_at(session="reuse_fwd", line=8, col=1)
+        # Should use checkpoint (backward from end)
+
+        # Same position — exact match reuse
+        result1 = await hol_state_at(session="reuse_fwd", line=8, col=1)
+        assert "method=reused" in result1, f"Expected reused: {result1}"
+
+        # Forward to QED (multi-step: tactic_idx 0 -> total) — reuse via delta
+        result2 = await hol_state_at(session="reuse_fwd", line=9, col=1)
+        assert "method=reused" in result2, f"Expected reused (multi-step forward): {result2}"
+    finally:
+        await hol_stop(session="reuse_fwd")
+
+
 async def test_checkpoint_with_then_chain(tmp_path):
     """Test O(1) checkpoint navigation with THEN chain (>>) treats it as one step.
 
