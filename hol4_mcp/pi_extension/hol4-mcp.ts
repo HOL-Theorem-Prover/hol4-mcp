@@ -201,8 +201,12 @@ export default function hol4McpExtension(pi: ExtensionAPI) {
     if (connecting) return connecting;
 
     connecting = (async () => {
+      // Pass HOL_TACTIC_TIMEOUT via --tactic-timeout if set
+      const spawnArgs = ["--transport", "stdio"];
+      const tt = process.env.HOL_TACTIC_TIMEOUT;
+      if (tt) spawnArgs.push("--tactic-timeout", tt);
       const c = new McpClient();
-      await c.connect("hol4-mcp", ["--transport", "stdio"]);
+      await c.connect("hol4-mcp", spawnArgs);
       client = c;
       return c;
     })();

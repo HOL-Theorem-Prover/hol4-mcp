@@ -28,6 +28,9 @@ from .hol_file_parser import HOLParseError
 
 DEFAULT_MAX_OUTPUT = 4096
 
+# Server-level tactic timeout (set via --tactic-timeout CLI flag or HOL_TACTIC_TIMEOUT env)
+TACTIC_TIMEOUT = float(os.environ.get("HOL_TACTIC_TIMEOUT", "5.0"))
+
 
 def _file_offset_to_line_col(file_offset: int, content: str) -> tuple[int, int]:
     """Convert a byte offset in file content to absolute (line, col), both 1-indexed."""
@@ -784,7 +787,6 @@ async def _init_file_cursor(
     file: str,
     session: str = "default",
     workdir: str = None,
-    tactic_timeout: float = 5.0,
 ) -> str:
     """Initialize cursor for a HOL4 script file (internal helper).
 
@@ -795,7 +797,6 @@ async def _init_file_cursor(
         file: Path to *Script.sml file containing theorems
         session: Session name (default: "default")
         workdir: Working directory for HOL (default: file's parent directory)
-        tactic_timeout: Max seconds per tactic (default 5.0). Enforces fast proofs.
 
     Returns: List of theorems with line numbers and cheat status
     """
@@ -839,7 +840,7 @@ async def _init_file_cursor(
 
     t0 = time.perf_counter()
     
-    cursor = FileProofCursor(file_path, s, tactic_timeout=tactic_timeout)
+    cursor = FileProofCursor(file_path, s, tactic_timeout=TACTIC_TIMEOUT)
     result = await cursor.init()
     
     init_time = time.perf_counter() - t0
@@ -1463,12 +1464,14 @@ def main():
     serve_parser.add_argument("--port", type=int, default=8000, help="Port for HTTP/SSE (default: 8000)")
     serve_parser.add_argument("--host", default="127.0.0.1", help="Host for HTTP/SSE (default: 127.0.0.1)")
     serve_parser.add_argument("-v", "--verbose", action="store_true", help="Enable debug logging")
+    serve_parser.add_argument("--tactic-timeout", type=float, default=None, help="Max seconds per tactic during proof replay (default: 5.0, or HOL_TACTIC_TIMEOUT env)")
 
     # Also allow serve options at top level for backwards compat
     parser.add_argument("--transport", choices=["stdio", "http", "sse"], default="stdio", help=argparse.SUPPRESS)
     parser.add_argument("--port", type=int, default=8000, help=argparse.SUPPRESS)
     parser.add_argument("--host", default="127.0.0.1", help=argparse.SUPPRESS)
     parser.add_argument("-v", "--verbose", action="store_true", help=argparse.SUPPRESS)
+    parser.add_argument("--tactic-timeout", type=float, default=None, help=argparse.SUPPRESS)
 
     args = parser.parse_args()
 
@@ -1477,6 +1480,10 @@ def main():
         return
 
     # Default to serve behavior
+    global TACTIC_TIMEOUT
+    if args.tactic_timeout is not None:
+        TACTIC_TIMEOUT = args.tactic_timeout
+
     if args.verbose:
         logging.basicConfig(
             level=logging.DEBUG,
