@@ -772,15 +772,26 @@ fun extract_tc_goal_json body_str =
  * Returns: {"ok":{"asms":[...], "goal":"..."}} or {"err":"..."}
  *)
 
-fun extract_resume_goal_json suspension_name label_name =
+(* Look up (asms, concl) for a Resume block directly from the suspension DB.
+   Shared by display (extract_resume_goal_json) and verification
+   (verify_resume_json) so both use the same live term — no print/reparse
+   round-trip (which is lossy, e.g. "case SOME (a,b) => body" with unused
+   a,b collapses to "SOME v => body" on printing). *)
+fun resume_goal_terms suspension_name label_name =
   let
     val th = case boolLib.find_suspension suspension_name of
                  SOME th => th
                | NONE => raise Fail ("No suspension found: " ^ suspension_name)
     val goal_term = markerLib.extract_suspended_goal th label_name
-    val (asms, concl) = markerLib.resumption_to_goal goal_term
-    (* Use type-annotated term_to_string so goals round-trip through Parse.Term.
-       Without annotations, variables like "p" parse as 'a instead of bool. *)
+  in
+    markerLib.resumption_to_goal goal_term
+  end
+
+fun extract_resume_goal_json suspension_name label_name =
+  let
+    val (asms, concl) = resume_goal_terms suspension_name label_name
+    (* show_types on for display so users see accurate types; this string is
+       display-only and is NOT used to rebuild the goal for verification. *)
     fun typed_term_to_string t =
       Lib.with_flag (Globals.show_types, true) term_to_string t
     val json = "{\"asms\":" ^ json_string_array (map typed_term_to_string asms) ^
@@ -790,19 +801,14 @@ fun extract_resume_goal_json suspension_name label_name =
   end
   handle e => print (json_err (exnMessage e) ^ "\n");
 
-(* Like verify_theorem_json but with explicit assumptions for Resume blocks.
-   When asms is non-empty, uses proofManagerLib.set_goal to set assumptions. *)
-fun verify_theorem_with_asms_json goal asms name tactics store timeout_sec =
+(* Verify a Resume block. Re-extracts the suspended goal at verify time and
+   calls proofManagerLib.set_goal with the live term, avoiding any
+   pretty-print/reparse round-trip. *)
+fun verify_resume_json suspension_name label_name name tactics store timeout_sec =
   let
     val _ = drop_all ()
-    val _ = if null asms then
-              smlExecute.quse_string ("g `" ^ goal ^ "`;")
-            else
-              let val asm_terms = map (fn a => Parse.Term [QUOTE a]) asms
-                  val concl_term = Parse.Term [QUOTE goal]
-              in
-                proofManagerLib.set_goal(asm_terms, concl_term); true
-              end
+    val (asms, concl) = resume_goal_terms suspension_name label_name
+    val _ = proofManagerLib.set_goal (asms, concl)
   in
     verify_core name tactics store timeout_sec
   end

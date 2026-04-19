@@ -1814,32 +1814,28 @@ class FileProofCursor:
         # function constant, so it works even before the Definition is processed).
         # For Resume blocks, extract goal from suspension DB if not already cached
         # (suspension exists because enter_theorem loaded context to theorem start).
-        if thm.kind == "Resume":
+        is_resume = thm.kind == "Resume"
+        if is_resume:
             if thm.name not in self._resume_goals:
                 await self._extract_resume_goal(thm)
-            rg = self._resume_goals.get(thm.name)
-            if not rg:
+            if thm.name not in self._resume_goals:
                 return []  # Can't extract goal from suspension
-            goal = rg.get('goal', '')
-            asms = rg.get('asms', [])
+            goal = ""  # unused for Resume; verify_resume_json re-extracts live term
         elif thm.kind == "Definition" and thm.name in self._tc_goals:
             goal = self._tc_goals[thm.name]
-            asms = []
         else:
             goal = thm.goal.replace('\n', ' ').strip()
-            asms = []
         tactics_sml = "[" + ",".join(
             f'"{escape_sml_string(t)}"' for t in tactics
         ) + "]"
         tactic_timeout = self._tactic_timeout or 60.0
         # Python timeout = per-tactic timeout * num tactics + buffer
         python_timeout = tactic_timeout * len(tactics) + 10
-        if asms:
-            asms_sml = "[" + ",".join(
-                f'"{escape_sml_string(a)}"' for a in asms
-            ) + "]"
+        if is_resume:
+            # Resume: let SML re-extract the live goal term from the suspension DB
+            # to avoid a lossy term_to_string/Parse.Term round-trip.
             result = await self.session.send(
-                f'verify_theorem_with_asms_json "{escape_sml_string(goal)}" {asms_sml} "{theorem_name}" {tactics_sml} false {tactic_timeout:.1f};',
+                f'verify_resume_json "{escape_sml_string(thm.suspension_name or "")}" "{escape_sml_string(thm.label_name or "")}" "{theorem_name}" {tactics_sml} false {tactic_timeout:.1f};',
                 timeout=max(30, python_timeout)
             )
         else:
@@ -1981,15 +1977,14 @@ class FileProofCursor:
 
             # For Definitions: extract TC goal, verify with store=false for
             # timing, then load the full block to establish the definition.
-            # For Resume: extract goal from suspension DB.
-            asms = []
-            if thm.kind == "Resume":
+            # For Resume: verify_resume_json re-extracts the live goal term
+            # from the suspension DB (avoids lossy print/reparse round-trip).
+            is_resume = thm.kind == "Resume"
+            if is_resume:
                 if thm.name not in self._resume_goals:
                     await self._extract_resume_goal(thm)
-                rg = self._resume_goals.get(thm.name)
-                if rg:
-                    goal = rg.get('goal', '')
-                    asms = rg.get('asms', [])
+                if thm.name in self._resume_goals:
+                    goal = ""  # unused; SML re-extracts
                 else:
                     # Resume goal extraction failed — load as-is
                     thm_content = '\n'.join(content_lines[thm.start_line - 1:thm.proof_end_line - 1])
@@ -2039,12 +2034,9 @@ class FileProofCursor:
             store = "false" if thm.kind in ("Definition", "Resume") else "true"
             tactic_timeout = self._tactic_timeout or 60.0
             python_timeout = tactic_timeout * len(tactics) + 10
-            if asms:
-                asms_sml = "[" + ",".join(
-                    f'"{escape_sml_string(a)}"' for a in asms
-                ) + "]"
+            if is_resume:
                 result = await self.session.send(
-                    f'verify_theorem_with_asms_json "{escape_sml_string(goal)}" {asms_sml} "{thm.name}" {tactics_sml} {store} {tactic_timeout:.1f};',
+                    f'verify_resume_json "{escape_sml_string(thm.suspension_name or "")}" "{escape_sml_string(thm.label_name or "")}" "{thm.name}" {tactics_sml} {store} {tactic_timeout:.1f};',
                     timeout=max(30, python_timeout)
                 )
             else:
