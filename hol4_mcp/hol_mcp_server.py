@@ -453,9 +453,10 @@ async def hol_stop(session: str = "default") -> str:
 
     Returns: Confirmation message
     """
-    entry = _sessions.pop(session, None)
+    entry = _sessions.get(session)
     if entry:
         await entry.session.stop()
+        del _sessions[session]
         return f"Session '{session}' stopped."
     return f"Session '{session}' not found."
 

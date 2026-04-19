@@ -194,17 +194,20 @@ class HOLSession:
             try:
                 pgid = os.getpgid(self.process.pid)
                 os.killpg(pgid, signal.SIGTERM)
-            except (ProcessLookupError, PermissionError):
+            except (ProcessLookupError, PermissionError, OSError):
                 pass
             # Wait for process to actually terminate
             try:
                 await asyncio.wait_for(self.process.wait(), timeout=5)
             except asyncio.TimeoutError:
-                # Force kill if it doesn't terminate
+                # Force kill entire group if it doesn't terminate
                 try:
-                    self.process.kill()
-                    await self.process.wait()
-                except Exception:
+                    os.killpg(pgid, signal.SIGKILL)
+                except (ProcessLookupError, PermissionError, OSError):
+                    pass
+                try:
+                    await asyncio.wait_for(self.process.wait(), timeout=2)
+                except (asyncio.TimeoutError, Exception):
                     pass
         self.process = None
         self._buffer = b""
