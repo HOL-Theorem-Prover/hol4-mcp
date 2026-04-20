@@ -5,6 +5,7 @@ from pathlib import Path
 
 from hol4_mcp.hol_file_parser import (
     parse_theorems, parse_file, parse_p_output,
+    find_top_level_local_blocks, extend_chunk_end,
 )
 
 FIXTURES_DIR = Path(__file__).parent / "fixtures"
@@ -594,3 +595,107 @@ End
     # Only rec_def should be parsed (has Termination proof)
     assert len(thms) == 1
     assert thms[0].name == "rec_def"
+
+
+# ---------------------------------------------------------------------------
+# find_top_level_local_blocks
+# ---------------------------------------------------------------------------
+
+class TestFindTopLevelLocalBlocks:
+    def test_empty_content(self):
+        assert find_top_level_local_blocks("") == []
+
+    def test_no_local_blocks(self):
+        assert find_top_level_local_blocks("Theorem foo:\n  T\nProof\n  rw[]\nQED\n") == []
+
+    def test_simple_local_block(self):
+        content = "local\n  val x = 1\nin\n  val y = x\nend\n"
+        assert find_top_level_local_blocks(content) == [(1, 5)]
+
+    def test_end_with_semicolon(self):
+        content = "local\n  open listTheory\nin\n  val x = HD\nend;\n"
+        assert find_top_level_local_blocks(content) == [(1, 5)]
+
+    def test_indented_end_not_matched(self):
+        # `end` with leading whitespace is NOT top-level
+        content = "local\n  val x = let\n    val y = 1\n  in y end\nin\n  val z = x\nend\n"
+        assert find_top_level_local_blocks(content) == [(1, 7)]
+
+    def test_end_inside_comment(self):
+        content = "local\n  val x = 1\nin\n(* end *)\n  val y = x\nend\n"
+        # The `(* end *)` is blanked by _strip_comments, so line 4 is not `end`
+        assert find_top_level_local_blocks(content) == [(1, 6)]
+
+    def test_let_then_local(self):
+        # `let...in...end` at column 0 should not consume local's `end`
+        content = "let\n  val a = 1\nin\n  a + 1\nend\nlocal\n  val b = 2\nin\n  val c = b\nend\n"
+        blocks = find_top_level_local_blocks(content)
+        assert blocks == [(6, 10)]  # only the local block
+
+    def test_nested_locals(self):
+        content = "local\n  local\n    val x = 1\n  in\n    val y = x\n  end\nin\n  val z = y\nend\n"
+        # Inner: lines 2-6, outer: lines 1-9
+        # But inner has leading whitespace on `local`, `in`, `end` → NOT column 0
+        # So only outer is detected
+        assert find_top_level_local_blocks(content) == [(1, 9)]
+
+    def test_nested_locals_at_column_0(self):
+        content = "local\nlocal\nval x = 1\nend\nin\nval y = 2\nend\n"
+        # Inner: local at 2, end at 4 → pair (2, 4)
+        # Outer: local at 1, end at 7 → pair (1, 7)
+        blocks = find_top_level_local_blocks(content)
+        assert (2, 4) in blocks
+        assert (1, 7) in blocks
+
+    def test_unterminated_local(self):
+        content = "local\n  val x = 1\nin\n  val y = x\n"
+        # No matching `end` → dropped silently
+        assert find_top_level_local_blocks(content) == []
+
+    def test_crlf_line_endings(self):
+        content = "local\r\n  val x = 1\r\nin\r\n  val y = x\r\nend\r\n"
+        assert find_top_level_local_blocks(content) == [(1, 5)]
+
+
+# ---------------------------------------------------------------------------
+# extend_chunk_end
+# ---------------------------------------------------------------------------
+
+class TestExtendChunkEnd:
+    def test_no_local_blocks(self):
+        assert extend_chunk_end(1, 10, []) == 10
+
+    def test_chunk_before_block(self):
+        assert extend_chunk_end(1, 5, [(10, 20)]) == 5
+
+    def test_chunk_after_block(self):
+        assert extend_chunk_end(25, 30, [(10, 20)]) == 30
+
+    def test_chunk_covers_whole_block(self):
+        assert extend_chunk_end(1, 25, [(10, 20)]) == 25
+
+    def test_chunk_straddles_block_start(self):
+        # Chunk [1, 15) contains local at 10 but not end at 20
+        assert extend_chunk_end(1, 15, [(10, 20)]) == 21
+
+    def test_chunk_starts_at_block_start(self):
+        assert extend_chunk_end(10, 15, [(10, 20)]) == 21
+
+    def test_chunk_ends_at_block_end(self):
+        # proposed_end = 20 is still inside [10, 20] (end is inclusive)
+        assert extend_chunk_end(1, 20, [(10, 20)]) == 21
+
+    def test_chunk_ends_just_past_block(self):
+        assert extend_chunk_end(1, 21, [(10, 20)]) == 21
+
+    def test_two_adjacent_blocks(self):
+        # Chunk straddles both
+        assert extend_chunk_end(1, 15, [(5, 10), (12, 20)]) == 21
+
+    def test_nested_blocks_extend_to_outer(self):
+        # Inner (5,8), outer (3,12). Chunk [1, 6) straddles outer.
+        assert extend_chunk_end(1, 6, [(5, 8), (3, 12)]) == 13
+
+    def test_chunk_starts_inside_block(self):
+        # chunk_start=12 > lb_start=10 → guard fails, no extension
+        assert extend_chunk_end(12, 18, [(10, 20)]) == 18

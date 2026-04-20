@@ -249,6 +249,69 @@ def _strip_comments(content: str) -> str:
     return ''.join(result)
 
 
+# SML block-opening keywords that pair with `end` at the top level.
+# We track all of them so that a column-0 `let...in...end` doesn't
+# incorrectly pop a `local` from the stack.
+_BLOCK_OPENERS = frozenset(("local", "let", "struct", "sig"))
+
+
+def find_top_level_local_blocks(content: str) -> list[tuple[int, int]]:
+    """Find top-level ``local...in...end`` blocks via line-level scanning.
+
+    Returns a list of ``(local_line, end_line)`` pairs (1-indexed) for every
+    top-level ``local`` block in the file.  Only column-0 keywords are
+    considered (no leading whitespace).  ``let``, ``struct``, and ``sig``
+    are also tracked on the stack so their matching ``end`` doesn't
+    incorrectly close a ``local``.
+
+    Uses :func:`_strip_comments` to avoid false matches inside comments.
+    Known limitation: ``end`` inside multi-line string literals at column 0
+    could false-match (extremely rare in HOL4 scripts).
+    """
+    stripped = _strip_comments(content)
+    blocks: list[tuple[int, int]] = []
+    stack: list[tuple[str, int]] = []  # (keyword, 1-indexed line number)
+
+    for lineno_0, raw_line in enumerate(stripped.split('\n')):
+        s = raw_line.rstrip()
+        if s in _BLOCK_OPENERS:
+            stack.append((s, lineno_0 + 1))
+        elif s in ("end", "end;"):
+            if stack:
+                keyword, start_line = stack.pop()
+                if keyword == "local":
+                    blocks.append((start_line, lineno_0 + 1))
+            # Unmatched `end` → ignore (file may have syntax errors)
+
+    # Unmatched `local` → drop silently (Poly/ML will report the error)
+    return sorted(blocks, key=lambda pair: pair[0])
+
+
+def extend_chunk_end(
+    chunk_start: int, proposed_end: int,
+    local_blocks: list[tuple[int, int]],
+) -> int:
+    """Extend a chunk boundary so it doesn't split a ``local...end`` block.
+
+    All line numbers are **1-indexed**.  ``chunk_start`` is the first line
+    included; ``proposed_end`` is the first line *excluded* (half-open
+    interval ``[chunk_start, proposed_end)``).
+
+    If the half-open range contains a ``local`` line but not its matching
+    ``end``, ``proposed_end`` is pushed forward to ``end_line + 1`` so the
+    entire block is included.  The extension loops to a fixed point to
+    handle nested or adjacent blocks.
+    """
+    changed = True
+    while changed:
+        changed = False
+        for lb_start, lb_end in local_blocks:
+            if chunk_start <= lb_start < proposed_end <= lb_end:
+                proposed_end = lb_end + 1
+                changed = True
+    return proposed_end
+
+
 def parse_theorems(content: str) -> list[TheoremInfo]:
     """Parse .sml file content, return all theorems in order."""
     theorems = []
