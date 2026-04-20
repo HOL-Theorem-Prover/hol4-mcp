@@ -1111,3 +1111,98 @@ val _ = export_theory();
     result2 = await cursor.state_at(thm.proof_start_line, 1)
     assert not result2.error or "no goals" in result2.error.lower(), \
         f"state_at after edit failed: {result2.error}"
+
+
+# ---------------------------------------------------------------------------
+# local...in...end block handling
+# ---------------------------------------------------------------------------
+
+LOCAL_BLOCK_SCRIPT = """\
+open HolKernel Parse boolLib bossLib;
+val _ = new_theory "local_block";
+
+Theorem before_block:
+  T
+Proof
+  REWRITE_TAC []
+QED
+
+local
+  open listTheory
+in
+
+Theorem inside_block_a:
+  LENGTH [1;2;3] = 3
+Proof
+  simp[]
+QED
+
+Theorem inside_block_b:
+  !l. LENGTH (APPEND l []) = LENGTH l
+Proof
+  Induct \\\\ simp[]
+QED
+
+end
+
+Theorem after_block:
+  T
+Proof
+  REWRITE_TAC []
+QED
+
+val _ = export_theory();
+"""
+
+
+@pytest.mark.asyncio
+async def test_execute_proof_inside_local_block(
+    hol_session_tmpdir: HOLSession, tmp_path: Path
+):
+    """execute_proof_traced on a theorem inside a local...in...end block
+    should not fail with a context_load_failure."""
+    script = tmp_path / "local_blockScript.sml"
+    script.write_text(LOCAL_BLOCK_SCRIPT)
+
+    cursor = FileProofCursor(script, hol_session_tmpdir)
+    await cursor.init()
+
+    result = await cursor.execute_proof_traced("inside_block_a")
+    # Should not return a context-load error. The result may be an empty
+    # trace (if the theorem was absorbed into a local block chunk) or a
+    # non-empty trace, both are fine.
+    assert isinstance(result, list), f"Expected list, got: {result}"
+
+
+@pytest.mark.asyncio
+async def test_execute_proof_after_local_block(
+    hol_session_tmpdir: HOLSession, tmp_path: Path
+):
+    """Theorems after a local...in...end block should still work —
+    bindings from inside the block must survive."""
+    script = tmp_path / "local_blockScript.sml"
+    script.write_text(LOCAL_BLOCK_SCRIPT)
+
+    cursor = FileProofCursor(script, hol_session_tmpdir)
+    await cursor.init()
+
+    result = await cursor.execute_proof_traced("after_block")
+    assert isinstance(result, list), f"Expected list, got: {result}"
+
+
+@pytest.mark.asyncio
+async def test_verify_all_proofs_with_local_block(
+    hol_session_tmpdir: HOLSession, tmp_path: Path
+):
+    """verify_all_proofs should return all theorems without errors."""
+    script = tmp_path / "local_blockScript.sml"
+    script.write_text(LOCAL_BLOCK_SCRIPT)
+
+    cursor = FileProofCursor(script, hol_session_tmpdir)
+    await cursor.init()
+
+    results = await cursor.verify_all_proofs()
+    assert "before_block" in results
+    assert "inside_block_a" in results
+    assert "inside_block_b" in results
+    assert "after_block" in results
