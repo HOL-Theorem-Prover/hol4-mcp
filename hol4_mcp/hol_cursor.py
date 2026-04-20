@@ -14,6 +14,7 @@ from .hol_file_parser import (
     parse_step_plan_output, StepPlan,
     parse_prefix_commands_output,
     parse_step_positions_output,
+    find_top_level_local_blocks, extend_chunk_end,
 )
 from .hol_session import HOLSession, HOLDIR, escape_sml_string
 
@@ -309,6 +310,7 @@ class FileProofCursor:
         self._content_hash: str = ""
         self._line_starts: list[int] = []
         self._theorems: list[TheoremInfo] = []
+        self._local_blocks: list[tuple[int, int]] = []
 
         # Active theorem state
         self._active_theorem: str | None = None
@@ -398,6 +400,7 @@ class FileProofCursor:
         self._content_hash = content_hash
         self._line_starts = build_line_starts(content)
         self._theorems = parse_theorems(content)
+        self._local_blocks = find_top_level_local_blocks(content)
 
         # Invalidate checkpoints and traces for theorems at or after the change
         if first_changed is not None:
@@ -451,6 +454,10 @@ class FileProofCursor:
             if thm.name == name:
                 return thm
         return None
+
+    def _extend_chunk_end(self, chunk_start: int, proposed_end: int) -> int:
+        """Extend a chunk boundary to preserve balanced local...end blocks."""
+        return extend_chunk_end(chunk_start, proposed_end, self._local_blocks)
 
     def _get_theorem_at_position(self, line: int) -> TheoremInfo | None:
         """Get theorem containing the given line number."""
@@ -934,16 +941,25 @@ class FileProofCursor:
         remaining_thms = [t for t in self._theorems if t.proof_end_line > self._loaded_to_line]
 
         for thm in remaining_thms:
+            # Skip theorems absorbed into a previous extended chunk
+            if thm.proof_end_line <= self._loaded_to_line:
+                continue
+
             # Load any content between current position and theorem start
             if thm.start_line > self._loaded_to_line:
-                # _loaded_to_line is 1-indexed (first unloaded line), convert to 0-index
                 start_idx = self._loaded_to_line - 1 if self._loaded_to_line > 0 else 0
-                to_load = '\n'.join(content_lines[start_idx:thm.start_line - 1])
+                end_idx = self._extend_chunk_end(
+                    start_idx + 1, thm.start_line)
+                to_load = '\n'.join(content_lines[start_idx:end_idx - 1])
                 if to_load.strip():
                     result = await self.session.send(to_load, timeout=60)
                     if _is_fatal_hol_error(result):
                         return f"Error executing file content: {_format_context_error(result)}"
-                self._loaded_to_line = thm.start_line
+                self._loaded_to_line = end_idx
+
+            # Skip if extended pre-content absorbed this theorem
+            if thm.proof_end_line <= self._loaded_to_line:
+                continue
 
             # For Definition blocks with Termination: extract TC goal BEFORE
             # processing the block. Hol_defn is called inside try_grammar_extension
@@ -958,7 +974,9 @@ class FileProofCursor:
                 await self._extract_resume_goal(thm)
 
             # Load the theorem (header through QED/End)
-            thm_content = '\n'.join(content_lines[thm.start_line - 1:thm.proof_end_line - 1])
+            thm_start = max(thm.start_line, self._loaded_to_line)
+            end_idx = self._extend_chunk_end(thm_start, thm.proof_end_line)
+            thm_content = '\n'.join(content_lines[thm_start - 1:end_idx - 1])
             if thm_content.strip():
                 result = await self.session.send(thm_content, timeout=60)
                 # Timeout during theorem proof: interrupt and auto-cheat
@@ -986,8 +1004,7 @@ class FileProofCursor:
                     cheat_err = await self._cheat_failed_theorem(thm)
                     if cheat_err:
                         return cheat_err
-            # proof_end_line is "line after QED/End" (1-indexed); we loaded through it
-            self._loaded_to_line = thm.proof_end_line
+            self._loaded_to_line = end_idx
 
         # Load any trailing content after last theorem
         last_thm = self._theorems[-1] if self._theorems else None
@@ -995,12 +1012,14 @@ class FileProofCursor:
             total_lines = len(content_lines)
             if self._loaded_to_line <= total_lines:
                 start_idx = self._loaded_to_line - 1 if self._loaded_to_line > 0 else 0
-                trailing = '\n'.join(content_lines[start_idx:])
+                end_idx = self._extend_chunk_end(
+                    self._loaded_to_line, total_lines + 1)
+                trailing = '\n'.join(content_lines[start_idx:end_idx - 1])
                 if trailing.strip():
                     result = await self.session.send(trailing, timeout=60)
                     if _is_fatal_hol_error(result):
                         return f"Error executing file content: {_format_context_error(result)}"
-                self._loaded_to_line = total_lines + 1
+                self._loaded_to_line = end_idx
 
         # Track content hash so _check_stale_state works correctly
         self._loaded_content_hash = self._content_hash
@@ -1034,25 +1053,38 @@ class FileProofCursor:
         if not theorems_in_range:
             # No theorems in range - simple case, load everything at once
             start_idx = max(0, self._loaded_to_line - 1) if self._loaded_to_line > 0 else 0
-            to_load = '\n'.join(content_lines[start_idx:target_line - 1])
+            end_idx = self._extend_chunk_end(start_idx + 1, target_line)
+            to_load = '\n'.join(content_lines[start_idx:end_idx - 1])
             if to_load.strip():
                 result = await self.session.send(to_load, timeout=timeout)
                 if _is_fatal_hol_error(result):
                     return f"Error executing file content: {_format_context_error(result)}"
         else:
-            # Theorems in range - load piece by piece to isolate failures
+            # Theorems in range - load piece by piece to isolate failures.
+            # Chunk boundaries are extended to preserve balanced local...end blocks.
             current_line = self._loaded_to_line
-            
+
             for thm in theorems_in_range:
+                # Skip theorems absorbed into a previous extended chunk
+                if thm.proof_end_line <= current_line:
+                    continue
+
                 # Load content before this theorem
                 if thm.start_line > current_line:
                     start_idx = current_line - 1 if current_line > 0 else 0
-                    pre_content = '\n'.join(content_lines[start_idx:thm.start_line - 1])
+                    end_idx = self._extend_chunk_end(
+                        start_idx + 1, thm.start_line)
+                    pre_content = '\n'.join(content_lines[start_idx:end_idx - 1])
                     if pre_content.strip():
                         result = await self.session.send(pre_content, timeout=timeout)
                         if _is_fatal_hol_error(result):
                             return f"Error executing file content: {_format_context_error(result)}"
-                
+                    current_line = end_idx
+
+                # Skip if the extended pre-content absorbed this theorem
+                if thm.proof_end_line <= current_line:
+                    continue
+
                 # For Definition blocks: extract TC goal before processing
                 if thm.kind == "Definition" and thm.proof_body and thm.name not in self._tc_goals:
                     await self._extract_tc_goal(thm)
@@ -1062,7 +1094,9 @@ class FileProofCursor:
                     await self._extract_resume_goal(thm)
 
                 # Load the theorem
-                thm_content = '\n'.join(content_lines[thm.start_line - 1:thm.proof_end_line - 1])
+                thm_start = max(thm.start_line, current_line)
+                end_idx = self._extend_chunk_end(thm_start, thm.proof_end_line)
+                thm_content = '\n'.join(content_lines[thm_start - 1:end_idx - 1])
                 if thm_content.strip():
                     result = await self.session.send(thm_content, timeout=timeout)
                     if _is_fatal_hol_error(result):
@@ -1077,14 +1111,14 @@ class FileProofCursor:
                         cheat_err = await self._cheat_failed_theorem(thm)
                         if cheat_err:
                             return cheat_err
-                
-                # proof_end_line is "line after QED/End" (1-indexed); we loaded through it
-                current_line = thm.proof_end_line
-            
+
+                current_line = end_idx
+
             # Load remaining content after last theorem (up to target_line)
             if current_line < target_line:
                 start_idx = current_line - 1
-                remaining = '\n'.join(content_lines[start_idx:target_line - 1])
+                end_idx = self._extend_chunk_end(current_line, target_line)
+                remaining = '\n'.join(content_lines[start_idx:end_idx - 1])
                 if remaining.strip():
                     result = await self.session.send(remaining, timeout=timeout)
                     if _is_fatal_hol_error(result):
@@ -1830,11 +1864,25 @@ class FileProofCursor:
         current_line = 0
 
         for thm in self._theorems:
+            # Skip theorems absorbed into a previous extended chunk
+            if thm.proof_end_line - 1 <= current_line:
+                results[thm.name] = []  # absorbed into a local block chunk
+                continue
+
             # Load content between previous theorem and this one (definitions, etc.)
+            # Extend to preserve balanced local...end blocks.
             if thm.start_line > current_line + 1:
-                pre_content = '\n'.join(content_lines[current_line:thm.start_line - 1])
+                end_idx = self._extend_chunk_end(
+                    current_line + 1, thm.start_line)
+                pre_content = '\n'.join(content_lines[current_line:end_idx - 1])
                 if pre_content.strip():
                     await self.session.send(pre_content, timeout=60)
+                current_line = end_idx - 1
+
+            # Skip if the extended pre-content absorbed this theorem
+            if thm.proof_end_line - 1 <= current_line:
+                results[thm.name] = []  # absorbed into a local block chunk
+                continue
 
             if thm.has_cheat:
                 # Load cheat theorem as-is (stores it with cheat)
