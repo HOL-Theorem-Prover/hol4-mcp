@@ -150,6 +150,58 @@ _PRUNE_INTERVAL = 300  # Check every 5 minutes at most
 _last_prune_time = 0.0
 
 
+def _gc_cursor_checkpoints(cursor: FileProofCursor):
+    """Delete orphaned per-theorem checkpoint .save files from a dying cursor.
+
+    Keeps base_deps.save and deps_only.save (expensive ~200MB rebuilds).
+    Removes per-theorem context/end_of_proof saves (cheap to rebuild via replay).
+    """
+    ckpt_dir = cursor._checkpoint_dir
+    if not ckpt_dir or not ckpt_dir.exists():
+        return
+    for f in ckpt_dir.glob("*_context.save"):
+        f.unlink(missing_ok=True)
+    for f in ckpt_dir.glob("*_end_of_proof.save"):
+        f.unlink(missing_ok=True)
+    try:
+        ckpt_dir.rmdir()  # only removes if empty
+    except OSError:
+        pass
+
+
+def _gc_dir_full(ckpt_dir: Path):
+    """Remove all .save files and the checkpoint directory."""
+    if not ckpt_dir or not ckpt_dir.exists():
+        return
+    for f in ckpt_dir.glob("*.save"):
+        f.unlink(missing_ok=True)
+    try:
+        ckpt_dir.rmdir()
+    except OSError:
+        pass
+
+
+def _gc_workdir_orphans(workdir: Path):
+    """Clean orphaned per-theorem checkpoints from a workdir.
+
+    Called on hol_start when no existing session owns the workdir.
+    Deletes *_context.save and *_end_of_proof.save (cheap replay rebuilds)
+    across all cursor_checkpoints/ dirs under the workdir.
+    Keeps base_deps.save and deps_only.save (expensive ~200MB rebuilds).
+    """
+    for ckpt_dir in workdir.glob("**/cursor_checkpoints"):
+        if not ckpt_dir.is_dir():
+            continue
+        for f in ckpt_dir.glob("*_context.save"):
+            f.unlink(missing_ok=True)
+        for f in ckpt_dir.glob("*_end_of_proof.save"):
+            f.unlink(missing_ok=True)
+        try:
+            ckpt_dir.rmdir()
+        except OSError:
+            pass
+
+
 async def _prune_idle_sessions():
     """Stop and remove sessions idle longer than _SESSION_IDLE_TIMEOUT.
 
@@ -172,6 +224,8 @@ async def _prune_idle_sessions():
         if time.time() - entry.last_used <= _SESSION_IDLE_TIMEOUT:
             continue
         _sessions.pop(name, None)
+        if entry.cursor:
+            _gc_cursor_checkpoints(entry.cursor)
         await entry.session.stop()
 
 
@@ -292,6 +346,9 @@ async def hol_start(workdir: str, name: str = "default", env: dict = None) -> st
         return f"Session '{name}' already running.\n\n=== Goals ===\n{goals}"
 
     _sessions[name] = SessionEntry(session, datetime.now(), workdir_path, env=env)
+
+    # Clean orphaned per-theorem checkpoints left by previous server lifetimes
+    _gc_workdir_orphans(workdir_path)
 
     return f"Session '{name}' started. {result}\nWorkdir: {workdir_path}"
 
@@ -455,6 +512,8 @@ async def hol_stop(session: str = "default") -> str:
     """
     entry = _sessions.get(session)
     if entry:
+        if entry.cursor:
+            _gc_cursor_checkpoints(entry.cursor)
         await entry.session.stop()
         del _sessions[session]
         return f"Session '{session}' stopped."
@@ -838,6 +897,10 @@ async def _init_file_cursor(
         if start_result.startswith("ERROR"):
             return start_result
         s = await _get_session(session)
+
+    # GC stale per-theorem checkpoints from old cursor before replacing
+    if entry and entry.cursor:
+        _gc_cursor_checkpoints(entry.cursor)
 
     t0 = time.perf_counter()
     
