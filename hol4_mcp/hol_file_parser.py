@@ -114,17 +114,37 @@ def parse_linearize_with_spans_output(output: str) -> list[tuple[str, int, int, 
         raise HOLParseError(f"Unexpected JSON structure: {result}")
 
 
-def parse_prefix_commands_output(output: str) -> str:
+def _frag_to_cmd(kind: str, text: str) -> str:
+    """Wrap a fragment (type, text) into an SML ef() command string.
+
+    - expand: ef(goalFrag.expand(<text>));
+    - open/mid/close: ef(goalFrag.<text>);
+    """
+    if kind == "expand":
+        return f"ef(goalFrag.expand({text}));"
+    else:
+        return f"ef(goalFrag.{text});"
+
+
+def parse_prefix_commands_output(output: str) -> list[tuple[str, str]]:
     """Parse JSON output from goalfrag_prefix_commands_json.
 
-    Expects: {"ok":"ef(...);\n"} or {"err":"message"}
-    Returns: The ef() command string to execute.
+    Expects: {"ok":[{"type":"expand","text":"strip_tac"},...]} or {"err":"message"}
+    Returns: list of (type, text) fragment pairs.
     Raises: HOLParseError if HOL4 returned an error or output is malformed.
     """
     result = _find_json_line(output, "goalfrag_prefix_commands_json")
 
     if 'ok' in result:
-        return result['ok']
+        try:
+            frags = []
+            for item in result['ok']:
+                t = str(item['type'])
+                x = str(item['text'])
+                frags.append((t, x))
+            return frags
+        except (TypeError, ValueError, KeyError) as e:
+            raise HOLParseError(f"Malformed prefix commands in output: {e}") from e
     elif 'err' in result:
         raise HOLParseError(f"goalfrag_prefix_commands_json: {result['err']}")
     else:
@@ -133,15 +153,21 @@ def parse_prefix_commands_output(output: str) -> str:
 
 @dataclass
 class StepPlan:
-    """A step with its end offset and command."""
+    """A step with its end offset and fragment data."""
     end: int       # End offset in proof body
-    cmd: str       # ef() command to execute this step
+    kind: str      # Fragment type: "expand", "open", "mid", "close"
+    text: str      # Raw tactic text or goalFrag function name
+
+    @property
+    def cmd(self) -> str:
+        """SML ef() command to execute this step."""
+        return _frag_to_cmd(self.kind, self.text)
 
 
 def parse_step_plan_output(output: str) -> list[StepPlan]:
     """Parse JSON output from step_plan_json.
 
-    Expects: {"ok":[{"end":N,"cmd":"e(...);\\n"}, ...]} or {"err":"message"}
+    Expects: {"ok":[{"end":N,"type":"expand","text":"..."}, ...]} or {"err":"message"}
     Returns: list of StepPlan objects, one per executable step.
     Raises: HOLParseError if HOL4 returned an error or output is malformed.
     """
@@ -152,8 +178,9 @@ def parse_step_plan_output(output: str) -> list[StepPlan]:
             steps = []
             for item in result['ok']:
                 end = int(item['end'])
-                cmd = str(item['cmd'])
-                steps.append(StepPlan(end=end, cmd=cmd))
+                kind = str(item['type'])
+                text = str(item['text'])
+                steps.append(StepPlan(end=end, kind=kind, text=text))
             return steps
         except (TypeError, ValueError, KeyError) as e:
             raise HOLParseError(f"Malformed step plan in output: {e}") from e

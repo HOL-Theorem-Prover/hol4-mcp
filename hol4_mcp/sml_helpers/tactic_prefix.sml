@@ -5,12 +5,16 @@
    fragments are natively steppable via ef(open/close). No heuristics needed
    — structural boundaries ARE step boundaries.
 
+   SML emits raw fragment data (type + text). Python wraps with
+   ef(goalFrag.expand(<text>)) or ef(goalFrag.<text>).
+   This avoids text-level rewriting of e() output which breaks on multiline.
+
    Usage:
      goalfrag_step_plan_json "rpt strip_tac >> simp[] >> fs[]";
-     => {"ok":[{"end":9,"cmd":"ef(goalFrag.expand(rpt strip_tac));"}, ...]}
+     => {"ok":[{"end":9,"type":"expand","text":"rpt strip_tac"}, ...]}
 
      goalfrag_prefix_commands_json "strip_tac >- (simp[])" 15;
-     => {"ok":"ef(goalFrag.expand(strip_tac));\nef(goalFrag.open_then1);\n"}
+     => {"ok":[{"type":"expand","text":"strip_tac"},{"type":"open","text":"open_then1"}]}
 *)
 
 (* Load dependencies *)
@@ -155,26 +159,28 @@ fun altSpan (TacticParse.Subgoal (s, e)) = SOME (s, e)
   | altSpan (TacticParse.LSelectGoals p) = SOME p
   | altSpan _ = NONE
 
-(* Map a single flat fragment to an ef() command string.
-   FAtom -> ef(goalFrag.expand(text)) where text comes from proofBody substring.
-   FFOpen/FFMid/FFClose -> ef(goalFrag.<function>). *)
-fun frag_to_cmd proofBody (TacticParse.FAtom a) =
+(* Extract fragment type: "expand", "open", "mid", or "close" *)
+fun frag_type (TacticParse.FAtom _) = "expand"
+  | frag_type (TacticParse.FFOpen _) = "open"
+  | frag_type (TacticParse.FFMid _) = "mid"
+  | frag_type (TacticParse.FFClose _) = "close"
+  | frag_type _ = ""
+
+(* Extract raw text from a fragment (no ef() wrapping).
+   FAtom -> tactic text from proofBody substring.
+   FFOpen/FFMid/FFClose -> goalFrag function name (e.g. "open_then1").
+   Returns "" for span-less atoms. *)
+fun frag_text proofBody (TacticParse.FAtom a) =
       (case (TacticParse.topSpan a, altSpan a) of
          (SOME (start, endPos), _) =>
-           let val text = String.substring(proofBody, start, endPos - start)
-           in "ef(goalFrag.expand(" ^ text ^ "));"
-           end
+           String.substring(proofBody, start, endPos - start)
        | (NONE, SOME (start, endPos)) =>
-           let val text = String.substring(proofBody, start, endPos - start)
-           in "ef(goalFrag.expand(" ^ text ^ "));"
-           end
-       | (NONE, NONE) => "")  (* truly span-less atom = skip *)
-  | frag_to_cmd _ (TacticParse.FFOpen opn) =
-      "ef(goalFrag." ^ openFragName opn ^ ");"
-  | frag_to_cmd _ (TacticParse.FFMid mid) =
-      "ef(goalFrag." ^ midFragName mid ^ ");"
-  | frag_to_cmd _ (TacticParse.FFClose cls) =
-      "ef(goalFrag." ^ closeFragName cls ^ ");"
+           String.substring(proofBody, start, endPos - start)
+       | (NONE, NONE) => "")
+  | frag_text _ (TacticParse.FFOpen opn) = openFragName opn
+  | frag_text _ (TacticParse.FFMid mid) = midFragName mid
+  | frag_text _ (TacticParse.FFClose cls) = closeFragName cls
+
 
 (* Get the end offset for an FAtom fragment *)
 fun fragEnd (TacticParse.FAtom a) =
@@ -184,8 +190,8 @@ fun fragEnd (TacticParse.FAtom a) =
        | _ => 0)
   | fragEnd _ = 0  (* structural frag -- caller assigns position *)
 
-(* goalfrag_step_plan: Generate ef() step commands from linearize fragments.
-   Returns (end_offset, cmd) pairs for every navigable position.
+(* goalfrag_step_plan: Generate fragment steps from linearize fragments.
+   Returns (end_offset, type, text) triples for every navigable position.
    Every fragment boundary is a step boundary -- no heuristics needed. *)
 fun goalfrag_step_plan proofBody =
   let
@@ -201,14 +207,15 @@ fun goalfrag_step_plan proofBody =
     fun assignEnds [] _ acc = rev acc
       | assignEnds (f :: rest) lastAtomEnd acc =
           let
-            val cmd = frag_to_cmd proofBody f
+            val t = frag_type f
+            val x = frag_text proofBody f
             val (endPos, newLast) = case f of
                 TacticParse.FAtom _ =>
                   (let val e = fragEnd f in (e, e) end)
               | _ => (lastAtomEnd, lastAtomEnd)
           in
-            if String.size cmd > 0
-            then assignEnds rest newLast ((endPos, cmd) :: acc)
+            if String.size x > 0
+            then assignEnds rest newLast ((endPos, t, x) :: acc)
             else assignEnds rest lastAtomEnd acc
           end
   in
@@ -218,18 +225,19 @@ fun goalfrag_step_plan proofBody =
 fun goalfrag_step_plan_json proofBody =
   let
     val steps = goalfrag_step_plan proofBody
-    fun stepToJson (endOff, cmd) =
-      "{\"end\":" ^ json_int endOff ^ ",\"cmd\":" ^ json_string cmd ^ "}"
+    fun stepToJson (endOff, t, x) =
+      "{\"end\":" ^ json_int endOff ^ ",\"type\":" ^ json_string t ^ ",\"text\":" ^ json_string x ^ "}"
     val stepsJson = "[" ^ String.concatWith "," (map stepToJson steps) ^ "]"
   in
     print (json_ok stepsJson ^ "\n")
   end
   handle e => print (json_err (exnMessage e) ^ "\n");
 
-(* goalfrag_prefix_commands: Generate ef() commands to replay up to an offset.
-   For positions at fragment boundaries, use the flat fragment list.
-   For positions inside an FAtom span, use sliceTacticBlock to generate
-   a single ef(expand(<prefix>)) command. *)
+(* goalfrag_prefix_commands: Generate fragment list to replay up to an offset.
+   Returns (type, text) pairs. Python wraps with ef(goalFrag.*()).
+   For positions at fragment boundaries, collect complete fragments.
+   For positions inside an FAtom span, use sliceTacticBlock to extract
+   the sliced tactic text directly from spans. *)
 fun goalfrag_prefix_commands proofBody endOffset =
   let
     val tree = parseTacticBlockFromString proofBody
@@ -250,51 +258,66 @@ fun goalfrag_prefix_commands proofBody endOffset =
            | NONE => findPartialAtom rest)
       | findPartialAtom (_ :: rest) = findPartialAtom rest
 
-    (* Collect ef() commands for all complete fragments up to endOffset *)
-    fun collectCmds [] _ acc = rev acc
-      | collectCmds (TacticParse.FAtom a :: rest) lastEnd acc =
+    (* Collect (type, text) for all complete fragments up to endOffset *)
+    fun collectFrags [] _ acc = rev acc
+      | collectFrags (TacticParse.FAtom a :: rest) lastEnd acc =
           (case TacticParse.topSpan a of
              SOME (_, endP) =>
                if endP <= endOffset
                then
-                 let val cmd = frag_to_cmd proofBody (TacticParse.FAtom a)
-                 in collectCmds rest endP (if String.size cmd > 0 then cmd :: acc else acc) end
+                 let val t = frag_type (TacticParse.FAtom a)
+                     val x = frag_text proofBody (TacticParse.FAtom a)
+                 in collectFrags rest endP
+                    (if String.size x > 0 then (t, x) :: acc else acc) end
                else rev acc  (* past the target -- done *)
-           | NONE => collectCmds rest lastEnd acc)
-      | collectCmds (f :: rest) lastEnd acc =
+           | NONE => collectFrags rest lastEnd acc)
+      | collectFrags (f :: rest) lastEnd acc =
           if lastEnd <= endOffset
           then
-            let val cmd = frag_to_cmd proofBody f
-            in collectCmds rest lastEnd (if String.size cmd > 0 then cmd :: acc else acc) end
+            let val t = frag_type f
+                val x = frag_text proofBody f
+            in collectFrags rest lastEnd
+               (if String.size x > 0 then (t, x) :: acc else acc) end
           else rev acc
 
     val partialAtom = findPartialAtom flatFrags
   in
     case partialAtom of
       SOME (start, endP) =>
-        (* Inside an FAtom: use sliceTacticBlock for the prefix,
-           then rewrite e() -> ef(goalFrag.expand()). *)
+        (* Inside an FAtom: use sliceTacticBlock to get valid fragments up to
+           endOffset. Walk the slice fragments and emit (type, text) pairs.
+           Uses frag_type/frag_text to emit (type, text) pairs. *)
         let
           val sliceFrags = TacticParse.sliceTacticBlock 0 endOffset false defaultSpan tree
-          val eCmd = TacticParse.printFragsAsE proofBody sliceFrags
-          fun rewriteEtoEf s =
-            if String.isPrefix "e(" s then
-              "ef(goalFrag.expand(" ^ String.extract(s, 2, NONE)
-            else if String.isPrefix "eall(" s then
-              "ef(goalFrag.expand(" ^ String.extract(s, 5, NONE)
-            else s
+          (* Flatten the list-of-groups into individual fragments *)
+          fun extractFrags [] acc = rev acc
+            | extractFrags (group :: rest) acc =
+                let fun walk [] acc = acc
+                      | walk (f :: fs) acc =
+                          let val t = frag_type f
+                              val x = frag_text proofBody f
+                          in if String.size x > 0
+                             then walk fs ((t, x) :: acc)
+                             else walk fs acc
+                          end
+                in extractFrags rest (walk group acc) end
         in
-          String.concat (map rewriteEtoEf (String.tokens (fn c => c = #"\n") eCmd))
+          extractFrags sliceFrags []
         end
     | NONE =>
-      (* At a fragment boundary: collect ef() commands for all complete frags *)
-      let val cmds = collectCmds flatFrags 0 [] in
-        String.concatWith "\n" cmds ^ "\n"
-      end
+      (* At a fragment boundary: collect all complete frags up to endOffset *)
+      collectFrags flatFrags 0 []
   end
 
 fun goalfrag_prefix_commands_json proofBody endOffset =
-  print (json_ok (json_string (goalfrag_prefix_commands proofBody endOffset)) ^ "\n")
+  let
+    val frags = goalfrag_prefix_commands proofBody endOffset
+    fun fragToJson (t, x) =
+      "{\"type\":" ^ json_string t ^ ",\"text\":" ^ json_string x ^ "}"
+    val fragsJson = "[" ^ String.concatWith "," (map fragToJson frags) ^ "]"
+  in
+    print (json_ok fragsJson ^ "\n")
+  end
   handle e => print (json_err (exnMessage e) ^ "\n");
 
 (* backup_n - undo N ef()/e() calls via History.undo *)

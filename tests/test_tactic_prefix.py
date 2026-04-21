@@ -180,16 +180,27 @@ class TestGoalfragPrefixCommands:
     """Tests for goalfrag_prefix_commands_json — generating ef() prefix for partial offsets."""
 
     async def test_full_prefix(self, hol_session):
-        """Prefix at end returns all ef() commands."""
+        """Prefix at end returns all fragment pairs."""
         tactic = "a >> b >> c"
         result = await call_prefix_commands(hol_session, tactic, 100)
-        assert "ef(goalFrag.expand(" in result
+        # Result is list of (type, text) tuples
+        assert len(result) == 3
+        assert result[0] == ("expand", "a")
+        assert result[1] == ("expand", "b")
+        assert result[2] == ("expand", "c")
 
     async def test_partial_prefix(self, hol_session):
-        """Prefix at a mid-point returns commands up to that offset."""
+        """Prefix at a mid-point returns fragments up to that offset."""
         tactic = "simp[] >> rpt strip_tac >> gvs[]"
         result = await call_prefix_commands(hol_session, tactic, 6)
-        assert "ef(goalFrag.expand(simp[]))" in result
+        # offset 6 is inside "rpt strip_tac" (partial atom)
+        # Should get: (expand, "simp[]"), (expand, "rpt ") — sliced prefix
+        assert len(result) >= 1
+        assert result[0] == ("expand", "simp[]")
+        # Second entry is the partial atom (sliced text)
+        if len(result) > 1:
+            assert result[1][0] == "expand"
+            assert "rpt" in result[1][1]
 
 
 # =============================================================================

@@ -12,7 +12,7 @@ from .hol_file_parser import (
     build_line_starts, line_col_to_offset, HOLParseError,
     parse_step_plan_output, StepPlan,
     parse_prefix_commands_output,
-    _find_json_line,
+    _find_json_line, _frag_to_cmd,
 )
 from .hol_session import HOLSession, HOLDIR, escape_sml_string
 
@@ -1473,13 +1473,15 @@ class FileProofCursor:
             timeout=30
         )
         try:
-            prefix_cmd = parse_prefix_commands_output(prefix_result)
+            prefix_frags = parse_prefix_commands_output(prefix_result)
         except HOLParseError as e:
             return False, f"Failed to get prefix commands: {e}"
 
-        if not prefix_cmd.strip():
+        if not prefix_frags:
             return True, None
 
+        # Wrap each fragment with ef(goalFrag.*()) and send as one batch
+        prefix_cmd = '\n'.join(_frag_to_cmd(t, x) for t, x in prefix_frags)
         result = await self.session.send(
             prefix_cmd, timeout=self._tactic_timeout or 30
         )
