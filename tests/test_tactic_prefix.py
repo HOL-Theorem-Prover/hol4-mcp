@@ -296,31 +296,42 @@ class TestThenLTReexpand:
         assert result[3].kind == "close" and result[3].text == "close_paren"
         assert result[4].kind == "expand" and result[4].text == "fs[]"
 
-    async def test_by_in_then_chain_NOT_reexpanded(self, hol_session):
-        """`by` inside >> chain is NOT decomposed — Subgoal can't be expanded alone."""
+    async def test_by_in_then_chain(self, hol_session):
+        """`by` inside >> chain decomposes: `Q` gets sg prefix, tactic base stays as-is."""
         result = await call_step_plan(hol_session, r"strip_tac >> `Q` by simp[] >> fs[]")
-        # Stays atomic: strip_tac, `Q` by simp[], fs[]
-        assert len(result) == 3, f"Expected 3 steps (by kept atomic), got {len(result)}: {[s.text for s in result]}"
-        assert all(s.kind == "expand" for s in result)
-        assert "by" in result[1].text
+        # strip_tac, sg `Q`, open_then1, simp[], close_paren, fs[]
+        assert len(result) == 6, f"Expected 6 steps, got {len(result)}: {[s.text for s in result]}"
+        assert result[0].kind == "expand" and result[0].text == "strip_tac"
+        assert result[1].kind == "expand" and result[1].text.startswith("sg")
+        assert result[2].kind == "open" and result[2].text == "open_then1"
+        assert result[3].kind == "expand" and "simp" in result[3].text
+        assert result[4].kind == "close" and result[4].text == "close_paren"
+        assert result[5].kind == "expand" and result[5].text == "fs[]"
+
+    async def test_by_tactic_base_no_sg_prefix(self, hol_session):
+        """`by` with tactic base (not term quotation) keeps base text unchanged."""
+        result = await call_step_plan(hol_session, "strip_tac by simp[]")
+        # strip_tac (not "sg strip_tac"), open_then1, simp[], close_paren
+        assert len(result) == 4, f"Expected 4 steps, got {len(result)}: {[s.text for s in result]}"
+        assert result[0].text == "strip_tac", f"Tactic base should not get sg: {result[0].text}"
 
     async def test_sg_in_then_chain_decomposes(self, hol_session):
-        """`sg >-` inside >> chain DOES decompose — base is Then, not bare Subgoal."""
+        """`sg >-` inside >> chain decomposes."""
         result = await call_step_plan(hol_session, r"strip_tac >> sg `Q` >- simp[] >> fs[]")
-        # sg parses as ThenLT(Then[strip_tac, Subgoal(Q)], ...) — base is Then, expandable
         # strip_tac, sg `Q`, open_then1, simp[], close_paren, fs[]
         assert len(result) == 6, f"Expected 6 steps, got {len(result)}: {[s.text for s in result]}"
         assert result[1].kind == "expand" and "sg" in result[1].text.lower()
         assert result[2].kind == "open"
 
-    async def test_bare_by_decomposes(self, hol_session):
-        """Standalone `by` (top level, not in >> chain) decomposes correctly."""
+    async def test_by_term_base_gets_sg_prefix(self, hol_session):
+        """Standalone `by` with term quotation base gets sg prefix."""
         result = await call_step_plan(hol_session, r"`Q` by simp[]")
-        # `Q`, open_then1, simp[], close_paren
+        # sg `Q`, open_then1, simp[], close_paren
         assert len(result) == 4, f"Expected 4 steps, got {len(result)}: {[s.text for s in result]}"
+        assert result[0].text.startswith("sg"), f"Term base should get sg: {result[0].text}"
         assert result[1].kind == "open"
 
-    async def test_bare_thenlt_decomposes(self, hol_session):
+    async def test_thenlt_bare_decomposes(self, hol_session):
         """Standalone >- (top level, not in >> chain) decomposes correctly."""
         result = await call_step_plan(hol_session, "conj_tac >- simp[]")
         assert len(result) == 4, f"Expected 4 steps, got {len(result)}: {[s.text for s in result]}"

@@ -168,15 +168,24 @@ fun frag_type (TacticParse.FAtom _) = "expand"
 
 (* Extract raw text from a fragment (no ef() wrapping).
    FAtom -> tactic text from proofBody substring.
+   Subgoal atoms get "sg " prefix so `Q` becomes `sg `Q`` — a valid tactic.
    FFOpen/FFMid/FFClose -> goalFrag function name (e.g. "open_then1").
    Returns "" for span-less atoms. *)
 fun frag_text proofBody (TacticParse.FAtom a) =
-      (case (TacticParse.topSpan a, altSpan a) of
-         (SOME (start, endPos), _) =>
-           String.substring(proofBody, start, endPos - start)
-       | (NONE, SOME (start, endPos)) =>
-           String.substring(proofBody, start, endPos - start)
-       | (NONE, NONE) => "")
+      let val raw = (case (TacticParse.topSpan a, altSpan a) of
+                       (SOME (start, endPos), _) =>
+                         String.substring(proofBody, start, endPos - start)
+                     | (NONE, SOME (start, endPos)) =>
+                         String.substring(proofBody, start, endPos - start)
+                     | (NONE, NONE) => "")
+      in case a of
+           TacticParse.Subgoal _ =>
+             (* Subgoal from `by`: if text is a term quotation `...`, prefix with sg
+                so it becomes a valid tactic. If already a tactic name, keep as-is. *)
+             if String.size raw > 0 andalso String.sub(raw, 0) = #"`"
+             then "sg " ^ raw else raw
+         | _ => raw
+      end
   | frag_text _ (TacticParse.FFOpen opn) = openFragName opn
   | frag_text _ (TacticParse.FFMid mid) = midFragName mid
   | frag_text _ (TacticParse.FFClose cls) = closeFragName cls
@@ -192,32 +201,17 @@ fun fragEnd (TacticParse.FAtom a) =
 
 (* Re-expand ThenLT atoms that linearize left atomic inside >> chains.
    linearize's `asTac` skips bracketing when `one=true` (inside Then list),
-   collapsing >- into a single FAtom(ThenLT _). We detect these and
+   collapsing >-/by into a single FAtom(ThenLT _). We detect these and
    re-linearize the ThenLT AST directly at the top level so it gets proper
    open/close decomposition.
    The AST already has correct spans from the original parse, no offset shift.
-
-   IMPORTANT: ThenLT(Subgoal _, _) — i.e., `by`/`sg` — is NOT re-expanded.
-   `Subgoal \`Q\`` is a goal specification, not a standalone tactic;
-   `expand(Subgoal \`Q\`)` fails. Only the full `\`Q\` by tac` expression
-   is valid as a single expand step. For `by` inside >> chains, the atomic
-   FAtom is kept and text-based inside_by detection is used instead. *)
+   Subgoal atoms (\`Q\`) get "sg " prefix in frag_text so they become valid tactics
+   (sg \`Q\`) that goalFrag.expand can execute. *)
 fun reexpand_thenlt_frags frags =
   let
-    (* Detect FAtom(ThenLT _) or FAtom(Group(_, _, ThenLT _)) — ThenLT that
-       linearize left atomic inside a >> chain. *)
     fun isThenLTatom (TacticParse.FAtom (TacticParse.ThenLT _)) = true
       | isThenLTatom (TacticParse.FAtom (TacticParse.Group (_, _, TacticParse.ThenLT _))) = true
       | isThenLTatom _ = false
-    (* But skip Subgoal-based ThenLT (by/sg) — the Subgoal base cannot be
-       expanded as a standalone tactic. *)
-    fun isSubgoalThenLT (TacticParse.ThenLT (TacticParse.Subgoal _, _)) = true
-      | isSubgoalThenLT (TacticParse.Group (_, _, TacticParse.ThenLT (TacticParse.Subgoal _, _))) = true
-      | isSubgoalThenLT _ = false
-    fun shouldReexpand (TacticParse.FAtom e) = isThenLTatom (TacticParse.FAtom e)
-                                              andalso not (isSubgoalThenLT e)
-      | shouldReexpand _ = false
-    (* Extract the ThenLT from FAtom, unwrapping Group if present *)
     fun getThenLT (TacticParse.FAtom (TacticParse.ThenLT (base, arms))) =
           TacticParse.ThenLT (base, arms)
       | getThenLT (TacticParse.FAtom (TacticParse.Group (_, _, TacticParse.ThenLT (base, arms)))) =
@@ -232,7 +226,7 @@ fun reexpand_thenlt_frags frags =
       | reexpand frag = [frag]
     fun go [] acc = rev acc
       | go (f :: rest) acc =
-          if shouldReexpand f
+          if isThenLTatom f
           then go rest (rev (reexpand f) @ acc)
           else go rest (f :: acc)
   in go frags [] end
