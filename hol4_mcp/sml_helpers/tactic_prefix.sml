@@ -190,6 +190,53 @@ fun fragEnd (TacticParse.FAtom a) =
        | _ => 0)
   | fragEnd _ = 0  (* structural frag -- caller assigns position *)
 
+(* Re-expand ThenLT atoms that linearize left atomic inside >> chains.
+   linearize's `asTac` skips bracketing when `one=true` (inside Then list),
+   collapsing >- into a single FAtom(ThenLT _). We detect these and
+   re-linearize the ThenLT AST directly at the top level so it gets proper
+   open/close decomposition.
+   The AST already has correct spans from the original parse, no offset shift.
+
+   IMPORTANT: ThenLT(Subgoal _, _) — i.e., `by`/`sg` — is NOT re-expanded.
+   `Subgoal \`Q\`` is a goal specification, not a standalone tactic;
+   `expand(Subgoal \`Q\`)` fails. Only the full `\`Q\` by tac` expression
+   is valid as a single expand step. For `by` inside >> chains, the atomic
+   FAtom is kept and text-based inside_by detection is used instead. *)
+fun reexpand_thenlt_frags frags =
+  let
+    (* Detect FAtom(ThenLT _) or FAtom(Group(_, _, ThenLT _)) — ThenLT that
+       linearize left atomic inside a >> chain. *)
+    fun isThenLTatom (TacticParse.FAtom (TacticParse.ThenLT _)) = true
+      | isThenLTatom (TacticParse.FAtom (TacticParse.Group (_, _, TacticParse.ThenLT _))) = true
+      | isThenLTatom _ = false
+    (* But skip Subgoal-based ThenLT (by/sg) — the Subgoal base cannot be
+       expanded as a standalone tactic. *)
+    fun isSubgoalThenLT (TacticParse.ThenLT (TacticParse.Subgoal _, _)) = true
+      | isSubgoalThenLT (TacticParse.Group (_, _, TacticParse.ThenLT (TacticParse.Subgoal _, _))) = true
+      | isSubgoalThenLT _ = false
+    fun shouldReexpand (TacticParse.FAtom e) = isThenLTatom (TacticParse.FAtom e)
+                                              andalso not (isSubgoalThenLT e)
+      | shouldReexpand _ = false
+    (* Extract the ThenLT from FAtom, unwrapping Group if present *)
+    fun getThenLT (TacticParse.FAtom (TacticParse.ThenLT (base, arms))) =
+          TacticParse.ThenLT (base, arms)
+      | getThenLT (TacticParse.FAtom (TacticParse.Group (_, _, TacticParse.ThenLT (base, arms)))) =
+          TacticParse.ThenLT (base, arms)
+      | getThenLT _ = raise Match
+    fun reexpand f =
+          let
+            val expr = getThenLT f
+            fun isAtom e = Option.isSome (TacticParse.topSpan e)
+            val subFrags = TacticParse.linearize isAtom expr
+          in flatten_frags subFrags end
+      | reexpand frag = [frag]
+    fun go [] acc = rev acc
+      | go (f :: rest) acc =
+          if shouldReexpand f
+          then go rest (rev (reexpand f) @ acc)
+          else go rest (f :: acc)
+  in go frags [] end
+
 (* goalfrag_step_plan: Generate fragment steps from linearize fragments.
    Returns (end_offset, type, text) triples for every navigable position.
    Every fragment boundary is a step boundary -- no heuristics needed. *)
@@ -198,12 +245,15 @@ fun goalfrag_step_plan proofBody =
     val tree = parseTacticBlockFromString proofBody
     fun isAtom e = Option.isSome (TacticParse.topSpan e)
     val rawFrags = TacticParse.linearize isAtom tree
-    val flatFrags = flatten_frags rawFrags
+    val reexpanded = reexpand_thenlt_frags rawFrags
+    val flatFrags = flatten_frags reexpanded
 
     (* Assign end offsets: walk the flat list, tracking the last FAtom end.
        Structural frags (FOpen/FFMid/FFClose) get the end of the PREVIOUS atom.
        This means navigating to a structural frag shows the state after executing
-       it, and the position aligns with the most recent tactic text. *)
+       it, and the position aligns with the most recent tactic text.
+       NOTE: reexpanded frags from ThenLT have spans from the original parse
+       (not offset-shifted), so fragEnd returns correct positions. *)
     fun assignEnds [] _ acc = rev acc
       | assignEnds (f :: rest) lastAtomEnd acc =
           let
@@ -245,7 +295,8 @@ fun goalfrag_prefix_commands proofBody endOffset =
     val defaultSpan = (0, fullEnd)
     fun isAtom e = Option.isSome (TacticParse.topSpan e)
     val rawFrags = TacticParse.linearize isAtom tree
-    val flatFrags = flatten_frags rawFrags
+    val reexpanded = reexpand_thenlt_frags rawFrags
+    val flatFrags = flatten_frags reexpanded
 
     (* Find the FAtom whose span contains endOffset *)
     fun findPartialAtom [] = NONE

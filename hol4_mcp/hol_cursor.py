@@ -223,6 +223,7 @@ class StateAtResult:
     file_hash: str            # Content hash when this state was computed
     error: str | None = None  # Error message if replay failed
     timings: dict[str, float] | None = None  # Timing breakdown (ms)
+    inside_by: bool = False   # Position is inside a decomposed by/>- subproof (between open/close)
 
 
 @dataclass
@@ -1886,6 +1887,27 @@ class FileProofCursor:
 
         timings['total'] = time.perf_counter() - t0
 
+        # Detect if position is inside a by/>- subproof.
+        # Case 1: Decomposed by/>-: open/close steps in plan. Walk backwards
+        #    from tactic_idx tracking open/close nesting; unmatched open = inside.
+        # Case 2: Current step IS an atomic by/>- that wasn't decomposed
+        #    (Subgoal-based ThenLT inside >> chain). At that step, suggest extraction.
+        inside_by = False
+        at_by = False
+        if self._step_plan and tactic_idx > 0:
+            depth = 0
+            for i in range(tactic_idx - 1, -1, -1):
+                step = self._step_plan[i]
+                if step.kind == "close":
+                    depth += 1
+                elif step.kind == "open":
+                    if depth > 0:
+                        depth -= 1  # Matched open/close pair
+                    else:
+                        inside_by = True  # Unmatched open — inside decomposed subproof
+                        break
+
+
         return StateAtResult(
             goals=goals,
             tactic_idx=tactic_idx,
@@ -1894,6 +1916,7 @@ class FileProofCursor:
             file_hash=self._content_hash,
             error=error_msg,
             timings=timings,
+            inside_by=inside_by,
         )
 
     def _parse_goals_json(self, output: str) -> list[dict]:

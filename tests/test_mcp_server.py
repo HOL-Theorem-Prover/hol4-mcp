@@ -1197,6 +1197,11 @@ async def test_state_at_by_intermediate_subgoal(tmp_path):
         assert "Goal" in r_after_by or "Goals" in r_after_by or "No goals" in r_after_by, (
             f"Should show goals after by: {r_after_by}"
         )
+        # After the by resolves, no inside_by hint (we're past close_paren)
+        # Only decomposed >- gets the inside_by hint, atomic by doesn't
+        assert "Inside by" not in r_after_by, (
+            f"Should not say 'inside by' after subproof close: {r_after_by}"
+        )
     finally:
         await hol_stop(session="by_intermediate")
 

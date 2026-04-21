@@ -1108,6 +1108,12 @@ async def hol_state_at(
             lines.append("=== Goals ===")
             lines.append("No goals (proof complete)")
 
+    # Suggest extracting by/>- subproof into a suspend/Resume block
+    if result.inside_by and not result.error:
+        lines.append("")
+        lines.append("[Inside by/>- subproof. Consider extracting into a suspend/Resume block "
+                     "for independent verification and easier editing.]")
+
     # Add timing info if available
     if result.timings:
         t = result.timings

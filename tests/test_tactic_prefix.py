@@ -267,3 +267,100 @@ class TestBackupN:
                 assert len(goals) == 1
                 assert "T ∧ T" in goals[0]['goal']
                 break
+
+
+# =============================================================================
+# Step Plan: ThenLT/By re-expansion inside >> chains
+# =============================================================================
+
+class TestThenLTReexpand:
+    """ThenLT inside >> chains: reexpand to get open/close decomposition.
+
+    linearize's `asTac` skips bracketing when `one=true` (inside Then list),
+    collapsing >- into a single FAtom. reexpand_thenlt_frags detects these
+    and re-linearizes the ThenLT AST at the top level to get proper decomposition.
+
+    Subgoal-based ThenLT (by/sg) is NOT re-expanded because `Subgoal \`Q\``
+    is not a standalone tactic — only the full `\`Q\` by tac` expression is valid.
+    For by inside >> chains, navigation stays at the atomic step level.
+    """
+
+    async def test_thenlt_in_then_chain(self, hol_session):
+        """>- inside >> chain decomposes into expand/open/expand/close steps."""
+        result = await call_step_plan(hol_session, "conj_tac >- simp[] >> fs[]")
+        # conj_tac, open_then1, simp[], close_paren, fs[]
+        assert len(result) == 5, f"Expected 5 steps, got {len(result)}: {[s.text for s in result]}"
+        assert result[0].kind == "expand" and "conj_tac" in result[0].text
+        assert result[1].kind == "open" and result[1].text == "open_then1"
+        assert result[2].kind == "expand" and "simp" in result[2].text
+        assert result[3].kind == "close" and result[3].text == "close_paren"
+        assert result[4].kind == "expand" and result[4].text == "fs[]"
+
+    async def test_by_in_then_chain_NOT_reexpanded(self, hol_session):
+        """`by` inside >> chain is NOT decomposed — Subgoal can't be expanded alone."""
+        result = await call_step_plan(hol_session, r"strip_tac >> `Q` by simp[] >> fs[]")
+        # Stays atomic: strip_tac, `Q` by simp[], fs[]
+        assert len(result) == 3, f"Expected 3 steps (by kept atomic), got {len(result)}: {[s.text for s in result]}"
+        assert all(s.kind == "expand" for s in result)
+        assert "by" in result[1].text
+
+    async def test_sg_in_then_chain_decomposes(self, hol_session):
+        """`sg >-` inside >> chain DOES decompose — base is Then, not bare Subgoal."""
+        result = await call_step_plan(hol_session, r"strip_tac >> sg `Q` >- simp[] >> fs[]")
+        # sg parses as ThenLT(Then[strip_tac, Subgoal(Q)], ...) — base is Then, expandable
+        # strip_tac, sg `Q`, open_then1, simp[], close_paren, fs[]
+        assert len(result) == 6, f"Expected 6 steps, got {len(result)}: {[s.text for s in result]}"
+        assert result[1].kind == "expand" and "sg" in result[1].text.lower()
+        assert result[2].kind == "open"
+
+    async def test_bare_by_decomposes(self, hol_session):
+        """Standalone `by` (top level, not in >> chain) decomposes correctly."""
+        result = await call_step_plan(hol_session, r"`Q` by simp[]")
+        # `Q`, open_then1, simp[], close_paren
+        assert len(result) == 4, f"Expected 4 steps, got {len(result)}: {[s.text for s in result]}"
+        assert result[1].kind == "open"
+
+    async def test_bare_thenlt_decomposes(self, hol_session):
+        """Standalone >- (top level, not in >> chain) decomposes correctly."""
+        result = await call_step_plan(hol_session, "conj_tac >- simp[]")
+        assert len(result) == 4, f"Expected 4 steps, got {len(result)}: {[s.text for s in result]}"
+        assert result[1].kind == "open"
+
+    async def test_thenlt_multi_step_arm_in_chain(self, hol_session):
+        """>- with multi-step arm inside >> chain decomposes."""
+        result = await call_step_plan(
+            hol_session,
+            "conj_tac >- (simp[] >> ACCEPT_TAC) >> fs[]"
+        )
+        # conj_tac, open_then1, (simp[] >> ACCEPT_TAC), close_paren, fs[]
+        assert len(result) == 5, f"Expected 5 steps, got {len(result)}: {[s.text for s in result]}"
+        assert result[1].kind == "open"
+        assert result[3].kind == "close"
+
+    async def test_then_chain_without_thenlt_unchanged(self, hol_session):
+        """Pure >> chain without >-/by is not affected by reexpand."""
+        result = await call_step_plan(hol_session, "conj_tac >> simp[] >> fs[]")
+        assert len(result) == 3
+        assert all(s.kind == "expand" for s in result)
+
+    async def test_thenlt_at_start_of_chain(self, hol_session):
+        """>- as the first element in a >> chain decomposes."""
+        result = await call_step_plan(hol_session, "conj_tac >- simp[] >> fs[]")
+        # conj_tac, open_then1, simp[], close_paren, fs[]
+        assert len(result) == 5
+        assert result[1].kind == "open"
+
+    async def test_multiple_thenlt_in_chain(self, hol_session):
+        """Multiple >- in the same >> chain each decompose."""
+        result = await call_step_plan(hol_session, "conj_tac >- simp[] >> conj_tac >- fs[]")
+        # conj_tac, open, simp[], close, conj_tac, open, fs[], close
+        assert len(result) == 8, f"Expected 8 steps, got {len(result)}: {[s.text for s in result]}"
+        assert result[1].kind == "open"
+        assert result[5].kind == "open"
+
+    async def test_end_offsets_correct_after_reexpand(self, hol_session):
+        """End offsets for reexpanded fragments use original proof body positions."""
+        result = await call_step_plan(hol_session, "conj_tac >- simp[] >> fs[]")
+        ends = [s.end for s in result]
+        for i in range(1, len(ends)):
+            assert ends[i] >= ends[i-1], f"End offsets not monotonic at step {i}: {ends}"
