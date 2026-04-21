@@ -1112,7 +1112,7 @@ async def hol_state_at(
     if result.timings:
         t = result.timings
         lines.append("")
-        method = 'reused' if t.get('reused_state') else ('checkpoint' if t.get('used_checkpoint') else 'replay')
+        method = 'reused' if t.get('reused_state') else ('incremental' if t.get('incremental') else ('checkpoint' if t.get('used_checkpoint') else 'replay'))
         lines.append(f"[Timing: total={t.get('total', 0)*1000:.0f}ms, "
                      f"replay={t.get('replay', 0)*1000:.0f}ms, "
                      f"method={method}]")

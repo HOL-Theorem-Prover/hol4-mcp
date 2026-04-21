@@ -1557,7 +1557,11 @@ class FileProofCursor:
 
         # If file changed, invalidate checkpoint and re-parse step positions
         t2 = time.perf_counter()
+        incremental_update = None  # (first_diff, old_tactic_idx) if incremental path viable
         if changed:
+            # Save old plan for incremental diff before invalidation
+            old_plan = list(self._step_plan)
+            old_tactic_idx = self._current_tactic_idx
             self._invalidate_checkpoint(self._active_theorem)
             if thm.proof_body:
                 escaped_body = escape_sml_string(thm.proof_body)
@@ -1574,6 +1578,26 @@ class FileProofCursor:
                     )
             else:
                 self._step_plan = []
+
+            # Compute command-level diff: find first divergent step between old and new plans.
+            # Commands that match produce identical proof state, so we can backup to the
+            # common prefix and play forward with new commands from that point.
+            # This is the same principle as context checkpoint invalidation: throw out
+            # caches after the changed point, keep the prefix.
+            if (old_plan
+                and self._step_plan
+                and self._proof_initialized
+                and old_tactic_idx > 0):
+                first_diff = 0
+                for i in range(min(len(old_plan), len(self._step_plan))):
+                    if old_plan[i].cmd != self._step_plan[i].cmd:
+                        first_diff = i
+                        break
+                else:
+                    # All shared commands match
+                    first_diff = min(len(old_plan), len(self._step_plan))
+                if first_diff > 0:
+                    incremental_update = (first_diff, old_tactic_idx)
         timings['parse_steps'] = time.perf_counter() - t2
 
         # Check if position is within theorem bounds (include QED line)
@@ -1667,6 +1691,50 @@ class FileProofCursor:
                         reused_state = True
                         actual_replayed = tactic_idx
 
+        # Incremental update on file change: backup to common command prefix,
+        # then play forward with new commands. Cost ∝ |delta|, not |proof|.
+        # Same principle as context checkpoint invalidation: keep prefix, redo suffix.
+        incremental_ok = False
+        if not reused_state and incremental_update is not None and not need_partial:
+            first_diff, old_tactic_idx = incremental_update
+            # Target position in unchanged prefix: just backup directly to it
+            # (all steps up to first_diff are identical, so backup is sound)
+            if tactic_idx <= first_diff:
+                # Target is in the common prefix — backup from current position to target
+                if old_tactic_idx > tactic_idx:
+                    backups_needed = old_tactic_idx - tactic_idx
+                    backup_result = await self.session.send(
+                        f'backup_n {backups_needed};', timeout=30
+                    )
+                    incremental_ok = not _is_hol_error(backup_result)
+                else:
+                    incremental_ok = True  # Already at or before target
+            else:
+                # Target is past first_diff: backup to common prefix, play forward
+                if old_tactic_idx > first_diff:
+                    backups_needed = old_tactic_idx - first_diff
+                    backup_result = await self.session.send(
+                        f'backup_n {backups_needed};', timeout=30
+                    )
+                    if _is_hol_error(backup_result):
+                        incremental_ok = False  # Fall through to full replay
+                    else:
+                        incremental_ok = True
+                else:
+                    incremental_ok = True
+
+                if incremental_ok:
+                    # Play forward from first_diff to target using new plan
+                    delta_cmds = [step.cmd for step in self._step_plan[first_diff:tactic_idx]]
+                    delta_count = len(delta_cmds)
+                    if delta_count > 0:
+                        step_timeout = self._tactic_timeout or 30
+                        batch_timeout = max(30, int(step_timeout * delta_count))
+                        result = await self.session.send("".join(delta_cmds), timeout=batch_timeout)
+                        if _is_hol_error(result):
+                            incremental_ok = False  # Fall through to full replay
+                    # If delta_count == 0, we're already at the right position
+
         # Full replay paths (when session state can't be reused):
         # 1. Checkpoint path: O(1) to step boundaries via checkpoint + backup_n
         # 2. Prefix/targeted replay path for fine-grained positions or broken proofs
@@ -1711,6 +1779,9 @@ class FileProofCursor:
 
         if reused_state:
             pass  # Session already at target position
+        elif incremental_ok:
+            # Incremental update succeeded: backed up to common prefix, played forward
+            actual_replayed = tactic_idx
         elif need_partial and thm.proof_body:
             # Fine-grained position: use prefix replay from theorem start
             # This correctly handles ThenLT semantics via sliceTacticBlock.
@@ -1794,6 +1865,7 @@ class FileProofCursor:
         timings['replay'] = time.perf_counter() - t3
         timings['used_checkpoint'] = 1.0 if used_checkpoint else 0.0
         timings['reused_state'] = 1.0 if reused_state else 0.0
+        timings['incremental'] = 1.0 if incremental_ok else 0.0
 
         # Update session position tracking for future reuse
         if error_msg is None:

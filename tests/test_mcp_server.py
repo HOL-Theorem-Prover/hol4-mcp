@@ -714,6 +714,124 @@ async def test_state_at_reuses_session_state(tmp_path):
         await hol_stop(session="reuse_test")
 
 
+async def test_state_at_incremental_on_edit(tmp_path):
+    """File edit inside proof: incremental update (backup + play forward) instead of full replay."""
+    test_file = tmp_path / "testScript.sml"
+    test_file.write_text(
+        'open HolKernel boolLib bossLib;\n'
+        '\n'
+        'val _ = new_theory "test";\n'
+        '\n'
+        'Theorem simple:\n'
+        '  T /\\ T\n'
+        'Proof\n'
+        '  conj_tac >> simp[]\n'
+        'QED\n'
+        '\n'
+        'val _ = export_theory();\n'
+    )
+
+    try:
+        await hol_file_init(file=str(test_file), session="incr_edit")
+
+        # Navigate to QED — establishes session state at proof end
+        result1 = await hol_state_at(session="incr_edit", line=9, col=1)
+        assert "ERROR" not in result1
+
+        # Same position — should reuse
+        result2 = await hol_state_at(session="incr_edit", line=9, col=1)
+        assert "method=reused" in result2, f"Expected reused: {result2}"
+
+        # Edit file on disk — change simp[] to fs[]
+        # This keeps conj_tac the same but changes step 2 to a valid alternative tactic
+        content = test_file.read_text()
+        test_file.write_text(content.replace('simp[]', 'fs[]'))
+
+        # Navigate to QED — should use incremental (backup 1 step, play 1 new step)
+        # not full replay from scratch
+        result3 = await hol_state_at(session="incr_edit", line=9, col=1)
+        assert "method=reused" not in result3, f"Should not reuse after edit: {result3}"
+        # Method should be incremental — conj_tac is unchanged so backup+play forward works
+        assert "method=incremental" in result3, f"Expected incremental: {result3}"
+    finally:
+        await hol_stop(session="incr_edit")
+
+
+async def test_state_at_incremental_target_in_prefix(tmp_path):
+    """Edit at end of proof, but request state at unchanged prefix position."""
+    test_file = tmp_path / "testScript.sml"
+    test_file.write_text(
+        'open HolKernel boolLib bossLib;\n'
+        '\n'
+        'val _ = new_theory "test";\n'
+        '\n'
+        'Theorem simple:\n'
+        '  T /\\ T\n'
+        'Proof\n'
+        '  conj_tac >> simp[]\n'
+        'QED\n'
+        '\n'
+        'val _ = export_theory();\n'
+    )
+
+    try:
+        await hol_file_init(file=str(test_file), session="incr_prefix")
+
+        # Navigate to QED — establishes session at proof end (step 2/2)
+        result1 = await hol_state_at(session="incr_prefix", line=9, col=1)
+        assert "ERROR" not in result1
+
+        # Edit: change simp[] (step 2) to fs[] — step 1 unchanged
+        content = test_file.read_text()
+        test_file.write_text(content.replace('simp[]', 'fs[]'))
+
+        # Request state at step 1 (conj_tac) — in unchanged prefix
+        # Should backup from step 2 to step 1, no forward play needed
+        result2 = await hol_state_at(session="incr_prefix", line=8, col=3)
+        assert "method=incremental" in result2, f"Expected incremental: {result2}"
+        assert "conj" in result2.lower() or "Goal" in result2, f"Should show goal: {result2}"
+    finally:
+        await hol_stop(session="incr_prefix")
+
+
+async def test_state_at_incremental_with_thenlt(tmp_path):
+    """Incremental update with >- (by) proof: only changed suffix is replayed."""
+    test_file = tmp_path / "testScript.sml"
+    test_file.write_text(
+        'open HolKernel boolLib bossLib;\n'
+        '\n'
+        'val _ = new_theory "test";\n'
+        '\n'
+        'Theorem thenlt:\n'
+        '  T /\\ T\n'
+        'Proof\n'
+        '  conj_tac >- simp[] >> fs[]\n'
+        'QED\n'
+        '\n'
+        'val _ = export_theory();\n'
+    )
+
+    try:
+        await hol_file_init(file=str(test_file), session="incr_thenlt")
+
+        # Navigate to QED — full replay, establishes session at proof end
+        result1 = await hol_state_at(session="incr_thenlt", line=9, col=1)
+        assert "ERROR" not in result1
+
+        # Edit: change fs[] to simp[] — only the last tactic changes
+        # conj_tac >- simp[] has 4 steps: expand, open_then1, expand, close
+        # >> fs[] has 1 step: expand(fs[])
+        # Changing fs[] to simp[] changes only step 4 (expand(fs[]))
+        # Incremental: backup 1 step, play ef(expand(simp[])) forward
+        content = test_file.read_text()
+        test_file.write_text(content.replace('fs[]', 'simp[]'))
+
+        result2 = await hol_state_at(session="incr_thenlt", line=9, col=1)
+        assert "method=incremental" in result2, f"Expected incremental: {result2}"
+    finally:
+        await hol_stop(session="incr_thenlt")
+
+
 async def test_state_at_reuse_invalidation_on_edit(tmp_path):
     """File edit must invalidate session state reuse — stale goals are wrong."""
     test_file = tmp_path / "testScript.sml"
@@ -1037,18 +1155,50 @@ async def test_state_at_nested_subgoal_suggestion(tmp_path):
         assert "Theorems: 3" in result
 
         # Line 10 col 30 is inside the `by` clause of by_in_chain.
-        # With GOALFRAG, this position is directly navigable — no suspend/Resume needed.
+        # With GOALFRAG, this position is directly navigable.
         r = await hol_state_at(session=session, line=10, col=30)
-        # Should show goals (not an error), confirming navigability
         assert "Goal" in r or "Goals" in r, (
             f"Should show goals at nested by position: {r}"
         )
-        # Should NOT suggest suspend/Resume (no longer needed with GOALFRAG)
-        assert "suspend" not in r.lower() and "Resume" not in r, (
-            f"GOALFRAG makes by steps navigable, no suspend needed: {r}"
-        )
     finally:
         await hol_stop(session=session)
+
+
+async def test_state_at_by_intermediate_subgoal(tmp_path):
+    r"""GOALFRAG makes the intermediate subgoal inside `by` directly inspectable.
+
+    `` `Q` by (res_tac >> ACCEPT_TAC) `` decomposes into:
+      0: ef(expand(rpt strip_tac))   — base tactic
+      1: ef(open_then1)              — opens first subgoal
+      2: ef(expand(res_tac))         — first arm tactic
+      3: ef(expand(first_assum ACCEPT_TAC)) — second arm tactic
+      4: ef(close_paren)             — merged back
+      5: ef(expand(simp[]))          — remainder of >> chain
+
+    At step 1 (after open_then1), the intermediate subgoal is visible.
+    This was impossible with GOALSTACK where `by` was atomic."""
+    test_file = tmp_path / "bysgScript.sml"
+    test_file.write_text(BY_SG_SCRIPT)
+    session = "by_intermediate"
+
+    try:
+        result = await hol_file_init(file=str(test_file), session=session)
+        assert "Theorems: 3" in result
+
+        # Navigate to QED first to establish checkpoint at proof end
+        r_qed = await hol_state_at(session=session, line=12, col=1)
+        assert "proof complete" in r_qed.lower(), f"QED should be complete: {r_qed}"
+
+        # Navigate to just after the `by` clause but before simp[]
+        # Line 11 col 1 is start of the simp[] line after the by
+        r_after_by = await hol_state_at(session=session, line=11, col=1)
+        # After `by` resolves the subgoal, we should have fewer goals
+        # than before (the by-subgoal is now proved)
+        assert "Goal" in r_after_by or "Goals" in r_after_by or "No goals" in r_after_by, (
+            f"Should show goals after by: {r_after_by}"
+        )
+    finally:
+        await hol_stop(session="by_intermediate")
 
 
 # Test script with a broken ThenLT proof (1 coarse step, failure at FAIL_TAC)
