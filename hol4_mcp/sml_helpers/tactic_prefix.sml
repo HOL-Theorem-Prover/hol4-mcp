@@ -15,8 +15,31 @@
 
 (* Load dependencies *)
 load "TacticParse";
+load "HOLSourceParser";
 load "smlExecute";
 load "markerLib";
+
+(* Parse a tactic string to a tac_expr.
+   TacticParse.parseTacticBlock now expects HOLSourceAST.exp (not string).
+   We use HOLSourceParser.parseSML to parse the string to a DecExp exp,
+   then pass the exp to parseTacticBlock. When parseSML produces no
+   declaration (empty/comment-only input), we use ExpEmpty which
+   parseTacticBlock maps to RepairEmpty -> Then[] (ALL_TAC). *)
+fun parseTacticBlockFromString s =
+  let
+    val fed = ref false
+    fun read _ = if !fed then "" else (fed := true; s)
+    val result = HOLSourceParser.parseSML "" read
+      (fn _ => fn _ => fn _ => ()) (* ignore parse warnings *)
+      HOLSourceParser.initialScope
+    val dec = #parseDec result ()
+  in
+    case dec of
+      SOME (HOLSourceAST.DecExp e) => TacticParse.parseTacticBlock e
+    | NONE => TacticParse.parseTacticBlock (HOLSourceAST.ExpEmpty 0)
+    | _ => raise Fail ("parseTacticBlockFromString: expected expression in tactic string: " ^
+                       String.substring (s, 0, Int.min (String.size s, 40)))
+  end
 
 (* JSON helpers *)
 fun json_escape_char c =
@@ -166,7 +189,7 @@ fun fragEnd (TacticParse.FAtom a) =
    Every fragment boundary is a step boundary -- no heuristics needed. *)
 fun goalfrag_step_plan proofBody =
   let
-    val tree = TacticParse.parseTacticBlock proofBody
+    val tree = parseTacticBlockFromString proofBody
     fun isAtom e = Option.isSome (TacticParse.topSpan e)
     val rawFrags = TacticParse.linearize isAtom tree
     val flatFrags = flatten_frags rawFrags
@@ -209,7 +232,7 @@ fun goalfrag_step_plan_json proofBody =
    a single ef(expand(<prefix>)) command. *)
 fun goalfrag_prefix_commands proofBody endOffset =
   let
-    val tree = TacticParse.parseTacticBlock proofBody
+    val tree = parseTacticBlockFromString proofBody
     val fullEnd = String.size proofBody
     val defaultSpan = (0, fullEnd)
     fun isAtom e = Option.isSome (TacticParse.topSpan e)

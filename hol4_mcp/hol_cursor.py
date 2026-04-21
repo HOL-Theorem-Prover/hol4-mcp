@@ -54,6 +54,9 @@ def _is_hol_error(output: str) -> bool:
         return True
     if "poly: : error:" in output.lower():
         return True
+    # HOLSourceParser error format: "parse error at <line>:<col>: ..."
+    if any(re.match(r'parse error at \d+:\d+', line) for line in output.split('\n')):
+        return True
     if "raised exception" in output.lower():
         return True
     # Tactic Fail with message
@@ -78,6 +81,9 @@ def _is_fatal_hol_error(output: str) -> bool:
         return True
     # Poly/ML syntax/parse/type errors are fatal
     if "poly: : error:" in output.lower():
+        return True
+    # HOLSourceParser error format: "parse error at <line>:<col>: ..."
+    if any(re.match(r'parse error at \d+:\d+', line) for line in output.split('\n')):
         return True
     # "Static Errors" from Poly/ML parser
     if "Static Errors" in output:
