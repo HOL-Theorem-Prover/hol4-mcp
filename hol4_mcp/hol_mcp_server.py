@@ -1037,17 +1037,15 @@ async def hol_state_at(
         # Compute where the failed tactic starts (next step after last success)
         fail_idx = result.tactics_replayed  # 0-indexed: the step that failed
         fail_loc = tactic_to_loc(fail_idx)
-        fail_str = f"line {fail_loc[0]}" if fail_loc else ""
+        fail_str = f"line {fail_loc[0]} col {fail_loc[1]}" if fail_loc else ""
 
         lines.append(
-            f"PROOF BROKEN at tactic {result.tactics_replayed + 1}/{result.tactics_total} "
-            f"({fail_str})"
+            f"PROOF BROKEN at {fail_str}"
         )
         lines.append(f"ERROR: {result.error}")
         lines.append("")
         lines.append(
-            f"Replay cannot reach the requested position (tactic "
-            f"{result.tactic_idx}/{result.tactics_total}) because an earlier "
+            f"Replay cannot reach the requested position because an earlier "
             f"tactic failed. The proof is sequential — later goals depend on "
             f"earlier tactics succeeding."
         )
@@ -1064,7 +1062,7 @@ async def hol_state_at(
             total = len(result.goals)
             goal_label = f"Goals at failure point" if all_goals else f"Goal at failure point (1 of {total})"
             lines.append("")
-            lines.append(f"=== {goal_label} ({stuck_str}, tactic {result.tactics_replayed}/{result.tactics_total}) ===")
+            lines.append(f"=== {goal_label} ({stuck_str}) ===")
             for i, g in enumerate(display_goals):
                 if i > 0:
                     lines.append("")
@@ -1076,15 +1074,14 @@ async def hol_state_at(
 
         # Error footer for truncation safety
         error_footer = (
-            f"ERROR: PROOF BROKEN at tactic {result.tactics_replayed + 1}/"
-            f"{result.tactics_total} ({fail_str}). "
+            f"ERROR: PROOF BROKEN at {fail_str}. "
             f"Fix the broken tactic before inspecting later positions."
         )
     else:
         # Normal path: replay succeeded (or position is at/before the failure)
         loc = tactic_to_loc(result.tactic_idx)
         loc_str = f"Line {loc[0]} col {loc[1]}, " if loc else ""
-        lines.append(f"{loc_str}Tactic {result.tactic_idx}/{result.tactics_total}")
+        lines.append(f"{loc_str}Proof position")
         if result.error and not is_proof_complete:
             error_footer = f"ERROR: {result.error}"
         lines.append("")

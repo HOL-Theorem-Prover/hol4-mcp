@@ -357,7 +357,7 @@ async def test_state_at_returns_goals(tmp_path):
         result = await hol_state_at(session="state_at_test", line=21, col=1)
 
         # Should show tactic info (even if 0/N since cheat is the only tactic)
-        assert "Tactic" in result
+        assert "Proof position" in result
         # Should show goals (proof is not complete since cheat doesn't prove anything)
         assert "Goal" in result or "goal" in result.lower()
         # Should NOT have error about position outside theorem
@@ -397,7 +397,7 @@ async def test_state_at_qed_line(tmp_path):
         result = await hol_state_at(session="qed_test", line=15, col=1)
 
         # Should show all tactics replayed
-        assert "Tactic" in result
+        assert "Proof position" in result
         # Should show proof complete (no goals)
         assert "proof complete" in result.lower()
         # Should NOT have error about position
@@ -442,7 +442,7 @@ async def test_state_at_auto_init(tmp_path):
         )
 
         # Should work without explicit hol_file_init
-        assert "Tactic" in result
+        assert "Proof position" in result
         assert "ERROR: No cursor" not in result
     finally:
         await hol_stop(session=session_name)
@@ -483,7 +483,7 @@ async def test_state_at_after_file_edit(tmp_path):
 
         # First call to state_at - get state at needs_proof theorem
         result1 = await hol_state_at(session="edit_test", line=21, col=1)
-        assert "Tactic" in result1
+        assert "Proof position" in result1
 
         # Modify the file - add a comment (cursor should detect change and reparse)
         content = test_file.read_text()
@@ -497,7 +497,7 @@ async def test_state_at_after_file_edit(tmp_path):
         result2 = await hol_state_at(session="edit_test", line=21, col=1)
 
         # Should still work (reparse successful)
-        assert "Tactic" in result2
+        assert "Proof position" in result2
         # Should NOT error out
         assert "ERROR" not in result2 or "not within any theorem" not in result2
     finally:
@@ -656,11 +656,11 @@ async def test_state_at_uses_checkpoint_on_repeat(tmp_path):
 
         # First call - builds checkpoint
         result1 = await hol_state_at(session="checkpoint_test", line=15, col=1)
-        assert "Tactic" in result1
+        assert "Proof position" in result1
 
         # Second call to same position - should use checkpoint
         result2 = await hol_state_at(session="checkpoint_test", line=15, col=1)
-        assert "Tactic" in result2
+        assert "Proof position" in result2
 
         # Both should succeed (proof complete for add_zero theorem)
         assert "proof complete" in result1.lower() or "Goals remaining: 0" in result1
@@ -1045,19 +1045,19 @@ async def test_state_at_by_in_chain(tmp_path):
 
         # Line 9: rpt strip_tac (before `by` clause)
         r = await hol_state_at(session=session, line=9, col=3)
-        assert "Tactic" in r
+        assert "Proof position" in r
         assert "ERROR" not in r
 
         # Line 10: `Q` by (...) — at the by clause
         r = await hol_state_at(session=session, line=10, col=3)
-        assert "Tactic" in r
+        assert "Proof position" in r
         assert "ERROR" not in r
         # Should show goals (some remain since simp[] hasn't run yet)
         assert "Goal" in r
 
         # Line 11: simp[] — after by clause
         r = await hol_state_at(session=session, line=11, col=3)
-        assert "Tactic" in r
+        assert "Proof position" in r
         assert "ERROR" not in r
 
         # QED line (line 12): proof complete
@@ -1083,12 +1083,12 @@ async def test_state_at_sg_with_subgoal_tactic(tmp_path):
 
         # Line 18: rpt strip_tac (start of proof body)
         r = await hol_state_at(session=session, line=18, col=3)
-        assert "Tactic" in r
+        assert "Proof position" in r
         assert "ERROR" not in r
 
         # Line 21: simp[] — after the sg block
         r = await hol_state_at(session=session, line=21, col=3)
-        assert "Tactic" in r
+        assert "Proof position" in r
         assert "ERROR" not in r
 
         # QED line (line 22): proof complete
@@ -1113,7 +1113,7 @@ async def test_state_at_by_toplevel(tmp_path):
 
         # Line 28: `T` by simp[] >> simp[] — the entire proof body
         r = await hol_state_at(session=session, line=28, col=1)
-        assert "Tactic" in r
+        assert "Proof position" in r
         assert "ERROR" not in r
 
         # QED line (line 29): proof complete
@@ -1287,7 +1287,7 @@ async def test_state_at_broken_two_step_start_does_not_over_replay(tmp_path):
 
         # Start of proof body (before any tactic)
         r = await hol_state_at(session=session, line=8, col=3)
-        assert "Tactic 0/2" in r
+        assert "Proof position" in r
         assert "ERROR: Tactic replay failed" not in r
         # Should show the original single goal, not post-conj_tac subgoals
         assert "T /\\ T" in r or "T ∧ T" in r
