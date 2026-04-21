@@ -114,39 +114,19 @@ def parse_linearize_with_spans_output(output: str) -> list[tuple[str, int, int, 
         raise HOLParseError(f"Unexpected JSON structure: {result}")
 
 
-def parse_step_positions_output(output: str) -> list[int]:
-    """Parse JSON output from step_positions_json.
-
-    Expects: {"ok":[offset1, offset2, ...]} or {"err":"message"}
-    Returns: list of end offsets for each tactic step.
-    Raises: HOLParseError if HOL4 returned an error or output is malformed.
-    """
-    result = _find_json_line(output, "step_positions_json")
-
-    if 'ok' in result:
-        try:
-            return [int(pos) for pos in result['ok']]
-        except (TypeError, ValueError) as e:
-            raise HOLParseError(f"Malformed step positions in output: {e}") from e
-    elif 'err' in result:
-        raise HOLParseError(f"step_positions_json: {result['err']}")
-    else:
-        raise HOLParseError(f"Unexpected JSON structure: {result}")
-
-
 def parse_prefix_commands_output(output: str) -> str:
-    """Parse JSON output from prefix_commands_json.
+    """Parse JSON output from goalfrag_prefix_commands_json.
 
-    Expects: {"ok":"e(...);\n"} or {"err":"message"}
-    Returns: The e() command string to execute.
+    Expects: {"ok":"ef(...);\n"} or {"err":"message"}
+    Returns: The ef() command string to execute.
     Raises: HOLParseError if HOL4 returned an error or output is malformed.
     """
-    result = _find_json_line(output, "prefix_commands_json")
+    result = _find_json_line(output, "goalfrag_prefix_commands_json")
 
     if 'ok' in result:
         return result['ok']
     elif 'err' in result:
-        raise HOLParseError(f"prefix_commands_json: {result['err']}")
+        raise HOLParseError(f"goalfrag_prefix_commands_json: {result['err']}")
     else:
         raise HOLParseError(f"Unexpected JSON structure: {result}")
 
@@ -155,8 +135,7 @@ def parse_prefix_commands_output(output: str) -> str:
 class StepPlan:
     """A step with its end offset and command."""
     end: int       # End offset in proof body
-    cmd: str       # e() command to execute this step
-    goal_routing: bool = False  # Step contains goal-routing structure (by, >-, >|, etc.)
+    cmd: str       # ef() command to execute this step
 
 
 def parse_step_plan_output(output: str) -> list[StepPlan]:
@@ -166,7 +145,7 @@ def parse_step_plan_output(output: str) -> list[StepPlan]:
     Returns: list of StepPlan objects, one per executable step.
     Raises: HOLParseError if HOL4 returned an error or output is malformed.
     """
-    result = _find_json_line(output, "step_plan_json")
+    result = _find_json_line(output, "goalfrag_step_plan_json")
 
     if 'ok' in result:
         try:
@@ -174,13 +153,12 @@ def parse_step_plan_output(output: str) -> list[StepPlan]:
             for item in result['ok']:
                 end = int(item['end'])
                 cmd = str(item['cmd'])
-                gr = bool(item.get('gr', False))
-                steps.append(StepPlan(end=end, cmd=cmd, goal_routing=gr))
+                steps.append(StepPlan(end=end, cmd=cmd))
             return steps
         except (TypeError, ValueError, KeyError) as e:
             raise HOLParseError(f"Malformed step plan in output: {e}") from e
     elif 'err' in result:
-        raise HOLParseError(f"step_plan_json: {result['err']}")
+        raise HOLParseError(f"goalfrag_step_plan_json: {result['err']}")
     else:
         raise HOLParseError(f"Unexpected JSON structure: {result}")
 

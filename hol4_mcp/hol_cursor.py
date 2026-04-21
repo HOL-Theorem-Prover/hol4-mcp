@@ -12,7 +12,6 @@ from .hol_file_parser import (
     build_line_starts, line_col_to_offset, HOLParseError,
     parse_step_plan_output, StepPlan,
     parse_prefix_commands_output,
-    parse_step_positions_output,
     _find_json_line,
 )
 from .hol_session import HOLSession, HOLDIR, escape_sml_string
@@ -218,7 +217,6 @@ class StateAtResult:
     file_hash: str            # Content hash when this state was computed
     error: str | None = None  # Error message if replay failed
     timings: dict[str, float] | None = None  # Timing breakdown (ms)
-    inside_nested_subgoal: bool = False  # Position is inside a nested by/>- step
 
 
 @dataclass
@@ -277,8 +275,6 @@ class FileProofCursor:
         self.file = source_file
         self.session = session
 
-        # Always use goalstack mode - goaltree doesn't support eall() needed for replay
-        
         # Tactic timeout for build discipline
         self._tactic_timeout = tactic_timeout
         
@@ -615,7 +611,7 @@ class FileProofCursor:
     async def _save_end_of_proof_checkpoint(self, theorem_name: str, tactics_count: int) -> bool:
         """Save checkpoint after all tactics have been replayed.
 
-        Call this when goaltree has all tactics applied. The checkpoint
+        Call this when GOALFRAG has all tactics applied. The checkpoint
         captures this state for fast state_at via loadState + backup_n.
 
         Strategy: Save current state directly - no reload needed.
@@ -1366,7 +1362,7 @@ class FileProofCursor:
         if thm.proof_body:
             escaped_body = escape_sml_string(thm.proof_body)
             step_result = await self.session.send(
-                f'step_plan_json "{escaped_body}";', timeout=30
+                f'goalfrag_step_plan_json "{escaped_body}";', timeout=30
             )
             try:
                 self._step_plan = parse_step_plan_output(step_result)
@@ -1427,18 +1423,18 @@ class FileProofCursor:
                     f'Parse.Term [QUOTE "{escape_sml_string(a)}"]' for a in asms
                 )
                 gt_result = await self.session.send(
-                    f'proofManagerLib.set_goal([{asm_terms}], '
+                    f'proofManagerLib.set_goalfrag([{asm_terms}], '
                     f'Parse.Term [QUOTE "{escape_sml_string(goal_str)}"]);',
                     timeout=30
                 )
             else:
-                gt_result = await self.session.send(f'g `{goal_str}`;', timeout=30)
+                gt_result = await self.session.send(f'gf `{goal_str}`;', timeout=30)
         elif thm.kind == "Definition" and thm.name in self._tc_goals:
             tc_goal = self._tc_goals[thm.name]
-            gt_result = await self.session.send(f'g `{tc_goal}`;', timeout=30)
+            gt_result = await self.session.send(f'gf `{tc_goal}`;', timeout=30)
         else:
             goal = thm.goal.replace('\n', ' ').strip()
-            gt_result = await self.session.send(f'g `{goal}`;', timeout=30)
+            gt_result = await self.session.send(f'gf `{goal}`;', timeout=30)
 
         if _is_hol_error(gt_result):
             self._proof_initialized = False
@@ -1467,7 +1463,7 @@ class FileProofCursor:
 
         escaped_body = escape_sml_string(thm.proof_body)
         prefix_result = await self.session.send(
-            f'prefix_commands_json "{escaped_body}" {offset};',
+            f'goalfrag_prefix_commands_json "{escaped_body}" {offset};',
             timeout=30
         )
         try:
@@ -1484,77 +1480,6 @@ class FileProofCursor:
         if _is_hol_error(result):
             return False, result[:200]
         return True, None
-
-    async def find_failing_substep(
-        self, thm_name: str, failed_step_idx: int
-    ) -> dict | None:
-        """Binary search within a coarse step to pinpoint the failing substep.
-
-        Uses step_positions for fine-grained boundaries within the failing step,
-        then binary searches with prefix replay to find the exact failing substep.
-
-        Args:
-            thm_name: Theorem name (must be the active theorem with step_plan set)
-            failed_step_idx: 0-based index of the failing step in step_plan
-
-        Returns:
-            Dict with {start_offset, end_offset, idx, count} or None if no refinement.
-        """
-        thm = self._get_theorem(thm_name)
-        if not thm or not thm.proof_body:
-            return None
-        if failed_step_idx < 0 or failed_step_idx >= len(self._step_plan):
-            return None
-
-        # Get fine-grained positions within the proof body
-        escaped_body = escape_sml_string(thm.proof_body)
-        try:
-            pos_result = await self.session.send(
-                f'step_positions_json "{escaped_body}";', timeout=10
-            )
-            all_positions = parse_step_positions_output(pos_result)
-        except (HOLParseError, Exception):
-            return None
-
-        # Filter to positions inside the failing step's range
-        step_start = self._step_plan[failed_step_idx - 1].end if failed_step_idx > 0 else 0
-        step_end = self._step_plan[failed_step_idx].end
-        candidates = [p for p in all_positions if step_start < p <= step_end]
-        if len(candidates) <= 1:
-            return None
-
-        # Build (start, end) offset pairs for each substep
-        substeps = []
-        prev = step_start
-        for pos in candidates:
-            substeps.append((prev, pos))
-            prev = pos
-
-        # Binary search on substep end offsets
-        low = -1  # before first substep (nothing replayed)
-        high = len(substeps) - 1  # whole step fails, so some substep fails
-
-        # Quick check: does prefix up to first substep succeed?
-        first_ok, _ = await self._try_prefix_at(thm_name, substeps[0][1])
-        if not first_ok:
-            high = 0
-        else:
-            low = 0
-            while high - low > 1:
-                mid = (low + high) // 2
-                mid_ok, _ = await self._try_prefix_at(thm_name, substeps[mid][1])
-                if mid_ok:
-                    low = mid
-                else:
-                    high = mid
-
-        ss, se = substeps[high]
-        return {
-            'start_offset': ss,
-            'end_offset': se,
-            'idx': high,
-            'count': len(substeps),
-        }
 
     async def state_at(self, line: int, col: int = 1) -> StateAtResult:
         """Get proof state at file position using prefix-based replay.
@@ -1629,7 +1554,7 @@ class FileProofCursor:
             if thm.proof_body:
                 escaped_body = escape_sml_string(thm.proof_body)
                 step_result = await self.session.send(
-                    f'step_plan_json "{escaped_body}";', timeout=30
+                    f'goalfrag_step_plan_json "{escaped_body}";', timeout=30
                 )
                 try:
                     self._step_plan = parse_step_plan_output(step_result)
@@ -1683,18 +1608,8 @@ class FileProofCursor:
         # Current step end (for detecting if we're inside a step)
         current_step_end = self._step_plan[tactic_idx].end if tactic_idx < total_tactics else (len(thm.proof_body) if thm.proof_body else 0)
         # Need partial replay if we're inside a step (not at a boundary)
-        # This enables fine-grained navigation within atomic ThenLT steps
         need_partial = proof_body_offset > step_before_end and proof_body_offset < current_step_end
         actual_replayed = 0
-
-        # Detect if cursor is inside a step with goal-routing structure
-        # (by, >-, >|, >~, suffices_by, etc.). Detected by SML-side AST
-        # analysis (hasGoalRouting) and reported via step_plan's gr flag.
-        inside_nested_subgoal = (
-            need_partial
-            and tactic_idx < total_tactics
-            and self._step_plan[tactic_idx].goal_routing
-        )
 
         # Session state reuse: if proof state is already at the target position
         # (or can reach it by executing a few forward steps), skip full replay.
@@ -1899,7 +1814,6 @@ class FileProofCursor:
             file_hash=self._content_hash,
             error=error_msg,
             timings=timings,
-            inside_nested_subgoal=inside_nested_subgoal,
         )
 
     def _parse_goals_json(self, output: str) -> list[dict]:
@@ -2149,7 +2063,7 @@ class FileProofCursor:
             if thm.proof_body:
                 escaped_body = escape_sml_string(thm.proof_body)
                 step_result = await self.session.send(
-                    f'step_plan_json "{escaped_body}";', timeout=30
+                    f'goalfrag_step_plan_json "{escaped_body}";', timeout=30
                 )
                 try:
                     step_plan = parse_step_plan_output(step_result)

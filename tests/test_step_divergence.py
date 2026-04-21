@@ -1,18 +1,13 @@
-"""Test step_plan_json consistency - single source of truth for O(1) navigation.
+"""Tests for GOALFRAG step plan structure and properties.
 
-Key design:
-- >> chains: return one step per tactic (for fine-grained navigation)
-  - First step uses e(), subsequent use eall() for correct >> semantics
-  - e(a >> b >> c) = e(a); eall(b); eall(c)
-- >- chains: return one step per fragment (linearize splits them)
-  - Navigation inside >- uses HEADGOAL via partial_step_commands
+Verifies monotonicity, command format, and execution correctness.
 """
 
 import pytest
 from pathlib import Path
 
-from hol4_mcp.hol_file_parser import parse_step_plan_output
 from hol4_mcp.hol_session import HOLSession, escape_sml_string
+from hol4_mcp.hol_file_parser import parse_step_plan_output
 
 FIXTURES_DIR = Path(__file__).parent / "fixtures"
 SML_HELPERS_DIR = Path(__file__).parent.parent / "hol4_mcp" / "sml_helpers"
@@ -20,90 +15,56 @@ SML_HELPERS_DIR = Path(__file__).parent.parent / "hol4_mcp" / "sml_helpers"
 
 @pytest.fixture
 async def hol_session():
-    """Fixture that provides a HOL session with tactic_prefix loaded."""
     session = HOLSession(str(FIXTURES_DIR))
     await session.start()
     result = await session.send(f'use "{SML_HELPERS_DIR / "tactic_prefix.sml"}";', timeout=10)
-    assert "error" not in result.lower(), f"Failed to load tactic_prefix.sml: {result}"
+    assert "error" not in result.lower()
     yield session
     await session.stop()
 
 
+async def call_step_plan(session, tactic_str):
+    escaped = escape_sml_string(tactic_str)
+    result = await session.send(f'goalfrag_step_plan_json "{escaped}";', timeout=10)
+    return parse_step_plan_output(result)
+
+
 class TestStepPlan:
-    """Test step_plan_json returns consistent step boundaries with commands."""
-
-    async def test_step_plan_single_tactic(self, hol_session):
-        """Single tactic returns one step."""
-        tactic = "strip_tac"
-        escaped = escape_sml_string(tactic)
-        result = await hol_session.send(f'step_plan_json "{escaped}";', timeout=10)
-        plan = parse_step_plan_output(result)
-        
-        assert len(plan) == 1
-        assert plan[0].end == 9  # len("strip_tac")
-        assert "e(strip_tac)" in plan[0].cmd
-
-    async def test_step_plan_then_chain_multiple_steps(self, hol_session):
-        """THEN chain (>>) returns one step per tactic for fine-grained navigation.
-        
-        First step uses e(), subsequent steps use eall() for correct >> semantics:
-        e(a >> b >> c) = e(a); eall(b); eall(c)
-        """
-        tactic = "strip_tac >> rw[] >> fs[]"
-        escaped = escape_sml_string(tactic)
-        result = await hol_session.send(f'step_plan_json "{escaped}";', timeout=10)
-        plan = parse_step_plan_output(result)
-        
-        # THEN chain gives one step per tactic
-        assert len(plan) == 3
-        # First uses e(), rest use eall()
-        assert plan[0].cmd.strip().startswith("e(")
-        assert plan[1].cmd.strip().startswith("eall(")
-        assert plan[2].cmd.strip().startswith("eall(")
-
-    async def test_step_plan_thenl_multiple_steps(self, hol_session):
-        """THENL (>-) with arms: base decomposed, arms decomposed into e() each."""
-        tactic = "conj_tac >- simp[] >- fs[]"
-        escaped = escape_sml_string(tactic)
-        result = await hol_session.send(f'step_plan_json "{escaped}";', timeout=10)
-        plan = parse_step_plan_output(result)
-        
-        # Base (conj_tac) + 2 arms (simp[], fs[])
-        assert len(plan) == 3
-        # All steps start with e(, eall(, or elt(
-        for step in plan:
-            cmd = step.cmd.strip()
-            assert cmd.startswith("e(") or cmd.startswith("eall(") or cmd.startswith("elt(")
-
-    async def test_step_plan_thenl_bracket(self, hol_session):
-        """THENL with bracket (>|) returns steps."""
-        tactic = "conj_tac >| [simp[], rw[]]"
-        escaped = escape_sml_string(tactic)
-        result = await hol_session.send(f'step_plan_json "{escaped}";', timeout=10)
-        plan = parse_step_plan_output(result)
-        
-        assert len(plan) >= 1
-        # Last step should end at tactic length
-        assert plan[-1].end == len(tactic)
+    """Structural properties of goalfrag_step_plan output."""
 
     async def test_step_plan_ends_are_monotonic(self, hol_session):
-        """Step ends should be monotonically increasing."""
-        tactic = "strip_tac >> rw[]"
-        escaped = escape_sml_string(tactic)
-        result = await hol_session.send(f'step_plan_json "{escaped}";', timeout=10)
-        plan = parse_step_plan_output(result)
-        
-        for i in range(1, len(plan)):
-            assert plan[i].end >= plan[i-1].end
+        """End offsets are non-decreasing."""
+        for tactic in ["a >> b >> c", "conj_tac >- simp[] >- fs[]", "strip_tac >> conj_tac >- simp[]"]:
+            result = await call_step_plan(hol_session, tactic)
+            ends = [step.end for step in result]
+            assert ends == sorted(ends), f"Non-monotonic ends for {tactic}: {ends}"
+
+    async def test_step_plan_commands_use_ef(self, hol_session):
+        """All commands use ef(goalFrag."), not e( or eall(."""
+        result = await call_step_plan(hol_session, "a >> b >> c >- d >- e")
+        for step in result:
+            assert step.cmd.startswith("ef(goalFrag."), f"Expected ef(), got: {step.cmd}"
+
+    async def test_step_plan_then_chain(self, hol_session):
+        """>> chain: one expand step per tactic."""
+        result = await call_step_plan(hol_session, "simp[] >> rpt strip_tac >> gvs[]")
+        assert len(result) == 3
+        assert all("ef(goalFrag.expand(" in s.cmd for s in result)
+
+    async def test_step_plan_then1_structure(self, hol_session):
+        """>- structure: expand, open_then1, expand, close."""
+        result = await call_step_plan(hol_session, "conj_tac >- simp[]")
+        assert len(result) == 4
+        assert "ef(goalFrag.expand(conj_tac));" == result[0].cmd
+        assert "ef(goalFrag.open_then1);" == result[1].cmd
+        assert result[2].cmd.startswith("ef(goalFrag.expand(")
+        assert "ef(goalFrag.close_paren);" == result[3].cmd
 
     async def test_step_plan_commands_are_executable(self, hol_session):
-        """Step commands should be valid e(), eall(), or elt() calls."""
-        tactic = "conj_tac >- simp[] >- fs[]"
-        escaped = escape_sml_string(tactic)
-        result = await hol_session.send(f'step_plan_json "{escaped}";', timeout=10)
-        plan = parse_step_plan_output(result)
-        
-        for step in plan:
-            cmd = step.cmd.strip()
-            assert cmd.startswith("e(") or cmd.startswith("eall(") or cmd.startswith("elt(")
-            assert cmd.endswith(");")
+        """Steps can be executed on GOALFRAG without errors."""
+        result = await call_step_plan(hol_session, "CONJ_TAC >- SIMP_TAC bool_ss [] >- SIMP_TAC bool_ss []")
+        await hol_session.send('drop_all();', timeout=5)
+        await hol_session.send('gf `T /\\ T`;', timeout=10)
+        for step in result:
+            r = await hol_session.send(step.cmd, timeout=10)
+            assert "Exception-" not in r, f"Step failed: {step.cmd}"

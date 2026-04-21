@@ -1108,24 +1108,6 @@ async def hol_state_at(
             lines.append("=== Goals ===")
             lines.append("No goals (proof complete)")
 
-    # Suggest suspend/Resume when inside a nested subgoal step
-    if result.inside_nested_subgoal and not is_broken:
-        lines.append("")
-        lines.append(
-            "NOTE: This position is inside a nested subgoal step (by, >-, etc. "
-            "within a >> chain). Goals shown mix the subgoal with the outer proof "
-            "state. For fine-grained inspection, restructure using suspend/Resume:\n"
-            "  Theorem foo:\n"
-            "    <goal>\n"
-            "  Proof\n"
-            "    strip_tac >> ... >> subgoal_tac `P` >> ...\n"
-            "    ~~ [`P`] by suspend\n"
-            "  QED\n"
-            "  Resume foo[`P`]:\n"
-            "    <prove P here — fully inspectable with hol_state_at>\n"
-            "  QED"
-        )
-
     # Add timing info if available
     if result.timings:
         t = result.timings
@@ -1268,13 +1250,6 @@ async def hol_check_proof(
     else:
         lines.append(f"Status: INCOMPLETE at step {len(trace_data)}/{total_steps} ({total_ms}ms)")
 
-    # Binary search to pinpoint failing substep within coarse steps.
-    # Only when the step has an actual error (not just INCOMPLETE with remaining goals).
-    substep_info = None
-    if (failed_idx is not None and failed_idx < len(trace_data)
-            and trace_data[failed_idx].error):
-        substep_info = await cursor.find_failing_substep(theorem, failed_idx)
-
     # Per-step timing trace (when requested, or always on failure/incomplete)
     if trace:
         lines.append("")
@@ -1287,15 +1262,6 @@ async def hol_check_proof(
             lines.append(f"Step {i} ({loc}): {cmd_text}")
             if entry.error:
                 lines.append(f"  ERROR: {entry.error}")
-                if i - 1 == failed_idx and substep_info:
-                    sl, sc = offset_to_pos(substep_info['start_offset'])
-                    sub_text = thm.proof_body[substep_info['start_offset']:substep_info['end_offset']].strip().replace('\n', ' ')
-                    if len(sub_text) > 60:
-                        sub_text = sub_text[:57] + "..."
-                    lines.append(
-                        f"  Failing substep {substep_info['idx'] + 1}/"
-                        f"{substep_info['count']} (line {sl} col {sc}): {sub_text}"
-                    )
             else:
                 gb = entry.goals_before if entry.goals_before is not None else "?"
                 ga = entry.goals_after if entry.goals_after is not None else "?"
@@ -1311,25 +1277,12 @@ async def hol_check_proof(
         loc = f"line/col {start_line}:{start_col}-{end_line}:{end_col}"
         lines.append(f"Tactic ({loc}): {tactic_text}")
 
-        if substep_info:
-            sl, sc = offset_to_pos(substep_info['start_offset'])
-            sub_text = thm.proof_body[substep_info['start_offset']:substep_info['end_offset']].strip().replace('\n', ' ')
-            if len(sub_text) > 60:
-                sub_text = sub_text[:57] + "..."
-            lines.append(
-                f"  Failing substep {substep_info['idx'] + 1}/"
-                f"{substep_info['count']} (line {sl} col {sc}): {sub_text}"
-            )
-
     # Brief goal summary for failure/incomplete
     if failed_idx is not None:
         lines.append("")
         ga = final.goals_after if final.goals_after is not None else "unknown"
         lines.append(f"Remaining: {ga} goal(s)")
-        if substep_info:
-            fail_line, fail_col = offset_to_pos(substep_info['start_offset'])
-        else:
-            (fail_line, fail_col), _ = tactic_range(failed_idx)
+        (fail_line, fail_col), _ = tactic_range(failed_idx)
         lines.append(f"Use hol_state_at(line={fail_line}, col={fail_col}) for full goals")
 
     _schedule_gc(session)
