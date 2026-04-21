@@ -1696,7 +1696,7 @@ class FileProofCursor:
         # then play forward with new commands. Cost ∝ |delta|, not |proof|.
         # Same principle as context checkpoint invalidation: keep prefix, redo suffix.
         incremental_ok = False
-        if not reused_state and incremental_update is not None and not need_partial:
+        if not reused_state and incremental_update is not None:
             first_diff, old_tactic_idx = incremental_update
             # Target position in unchanged prefix: just backup directly to it
             # (all steps up to first_diff are identical, so backup is sound)
@@ -1792,38 +1792,24 @@ class FileProofCursor:
             else:
                 error_msg = f"Prefix replay failed: {prefix_err}"
 
-                # Best-effort recovery for broken proofs: find nearest earlier
-                # prefix that still executes, then keep that state/goals.
-                low = step_before_end
-                high = proof_body_offset
-                best = step_before_end
-                attempts = 0
-                while high - low > 1 and attempts < 12:
-                    mid = (low + high) // 2
-                    mid_ok, _ = await self._try_prefix_at(thm.name, mid)
-                    if mid_ok:
-                        best = mid
-                        low = mid
+                # Best-effort recovery: replay to nearest valid step boundary
+                # using _replay_with_fallback (step-by-step fallback on batch failure).
+                # This gives accurate tactics_replayed and shows goals at the last
+                # successful position, unlike the old binary search which reported
+                # tactics_replayed=0 on failure.
+                if tactic_idx > 0 and thm.proof_body:
+                    cmds = [step.cmd for step in self._step_plan[:tactic_idx]]
+                    replay_steps = max(1, tactic_idx)
+                    batch_timeout = max(30, int(self._tactic_timeout * replay_steps)) if self._tactic_timeout else 300
+                    replayed, replay_error = await _replay_with_fallback(cmds, batch_timeout)
+                    actual_replayed = replayed
+                    if replay_error:
+                        error_msg = replay_error
                     else:
-                        high = mid
-                    attempts += 1
-
-                if best > step_before_end:
-                    best_ok, best_err = await self._try_prefix_at(thm.name, best)
-                    if best_ok:
-                        actual_replayed = sum(1 for step in self._step_plan if step.end <= best)
                         error_msg = (
                             f"Prefix replay failed at requested position: {prefix_err}; "
-                            f"using nearest valid prefix at offset {best}."
+                            f"showing nearest step boundary (tactic {tactic_idx}/{total_tactics})."
                         )
-                    elif best_err and not error_msg:
-                        error_msg = f"Prefix replay failed: {best_err}"
-                else:
-                    # Binary search didn't find a better offset within this step.
-                    # Fall back to the step boundary so goals reflect completed steps.
-                    boundary_ok, _ = await self._try_prefix_at(thm.name, step_before_end)
-                    if boundary_ok:
-                        actual_replayed = tactic_idx
         else:
             # Step boundary: try O(1) checkpoint path
             if self._is_checkpoint_valid(self._active_theorem) and thm.proof_body:

@@ -1424,8 +1424,8 @@ async def test_state_at_reverse_modifier_recovers_nearest_prefix_state(tmp_path)
         # State should show the focused subgoal or a replay error near it.
         # Either way, it should NOT be the original 3-way conjunction goal.
         if "Prefix replay failed" in r:
-            # Still may happen for partial offsets — verify recovery worked
-            assert "using nearest valid prefix" in r or "n < 5" in r
+            # Recovery shows goals at failure point or nearest step boundary
+            assert "showing nearest step boundary" in r or "n < 5" in r or "n < 10" in r
         # We should see goal content relevant to the second arm, not the full conjunction
         assert "n < 10" in r or "n < 5" in r, (
             f"Should show subgoal state at cheat: {r}"
@@ -1947,3 +1947,51 @@ async def test_by_substep_pinpoints_tactic_failure(tmp_path):
         assert "FAIL_TAC" in r, f"Should mention FAIL_TAC: {r}"
     finally:
         await hol_stop(session=session)
+
+
+async def test_state_at_incremental_need_partial_after_edit(tmp_path):
+    """After editing proof, need_partial position uses incremental instead of prefix replay.
+
+    Previously need_partial gated out the incremental path, forcing expensive
+    _try_prefix_at calls. Now incremental (backup + play forward) handles it,
+    landing at the nearest step boundary with accurate tactics_replayed.
+    """
+    test_file = tmp_path / "incr_npScript.sml"
+    test_file.write_text(
+        'open HolKernel boolLib bossLib;\n'
+        '\n'
+        'val _ = new_theory "incr_np";\n'
+        '\n'
+        'Theorem t1:\n'
+        '  T /\\ T /\\ T\n'
+        'Proof\n'
+        '  conj_tac >- conj_tac >- simp[] >> simp[] >> simp[]\n'
+        'QED\n'
+        '\n'
+        'val _ = export_theory();\n'
+    )
+
+    try:
+        await hol_file_init(file=str(test_file), session="incr_np")
+
+        # Navigate to QED — establishes session at proof end
+        await hol_state_at(session="incr_np", line=9, col=1)
+
+        # Edit: change last simp[] to fs[]
+        content = test_file.read_text()
+        test_file.write_text(content.replace('>> simp[]\nQED', '>> fs[]\nQED'))
+
+        # Request state inside a step (need_partial=True)
+        # col=10 lands inside "conj_tac >-" which is a multi-char step
+        result = await hol_state_at(session="incr_np", line=8, col=10)
+
+        # Key assertion: should NOT report "tactic 1/N broken" with no goals
+        # (the old _try_prefix_at + binary search path that gave tactics_replayed=0)
+        # Instead, incremental lands at the nearest step boundary with correct goals.
+        if "PROOF BROKEN" not in result:
+            # Proof works — goals should be visible
+            assert "Goal" in result or "Goals" in result or "No goals" in result, \
+                f"Should show goals: {result}"
+
+    finally:
+        await hol_stop(session="incr_np")

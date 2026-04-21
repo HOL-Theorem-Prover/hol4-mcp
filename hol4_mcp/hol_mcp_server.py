@@ -1057,7 +1057,9 @@ async def hol_state_at(
                 f"  hol_state_at(line={fail_loc[0]}, col={fail_loc[1]})"
             )
 
-        if show_partial and result.goals:
+        if result.goals:
+            # Always show goals at failure point (useful for debugging)
+            # show_partial controls whether ALL goals or just the first are shown
             display_goals = result.goals if all_goals else result.goals[:1]
             total = len(result.goals)
             goal_label = f"Goals at failure point" if all_goals else f"Goal at failure point (1 of {total})"
