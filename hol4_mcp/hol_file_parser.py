@@ -114,14 +114,25 @@ def parse_linearize_with_spans_output(output: str) -> list[tuple[str, int, int, 
         raise HOLParseError(f"Unexpected JSON structure: {result}")
 
 
+def _needs_infix_parens(text: str) -> bool:
+    """Whether tactic text needs parens to avoid SML infix parsing issues.
+
+    SML infix operators like >-, >>-, >>>- at expression start cause parse errors
+    when used inside ef(goalFrag.expand(...)). Wrapping in parens prevents
+    the SML parser from treating them as infix.
+    """
+    return bool(re.match(r'\s*>{1,3}-', text))
+
+
 def _frag_to_cmd(kind: str, text: str) -> str:
     """Wrap a fragment (type, text) into an SML ef() command string.
 
-    - expand: ef(goalFrag.expand(<text>));
+    - expand: ef(goalFrag.expand(<text>));  (parens added if text starts with >-)
     - open/mid/close: ef(goalFrag.<text>);
     """
     if kind == "expand":
-        return f"ef(goalFrag.expand({text}));"
+        inner = f"({text})" if _needs_infix_parens(text) else text
+        return f"ef(goalFrag.expand({inner}));"
     else:
         return f"ef(goalFrag.{text});"
 
@@ -187,6 +198,25 @@ def _offset_to_line(offset: int, content: str) -> int:
     return content[:offset].count('\n') + 1
 
 
+def _display_text(step: StepPlan) -> str:
+    """Human-readable display text for a step plan entry.
+
+    expand steps show tactic text. open/mid/close steps show structural
+    labels (e.g. "▶ >-" for open_then1) instead of goalFrag function names.
+    """
+    if step.kind == "expand":
+        return step.text
+    _LABELS = {
+        "open_then1": "▶ >-",
+        "open_then2": "▶ >>-",
+        "open_then3": "▶ >>>-",
+        "mid_then2": "┃ >>-",
+        "mid_then3": "┃ >>>-",
+        "close_paren": "◁ /",
+    }
+    return _LABELS.get(step.text, step.text)
+
+
 def format_step_context(
     step_plan: list[StepPlan],
     fail_idx: int,
@@ -210,7 +240,7 @@ def format_step_context(
     if fail_idx < 0 or fail_idx >= len(step_plan):
         return []
 
-    out = ["", "=== Failing tactic ===", step_plan[fail_idx].text]
+    out = ["", "=== Failing tactic ===", _display_text(step_plan[fail_idx])]
 
     if context_before <= 0 and context_after <= 0:
         return out
@@ -247,7 +277,7 @@ def format_step_context(
         k = step_plan[i].kind
         indent = "  " * depth
         marker = "  <-- FAILED" if i == fail_idx else ""
-        out.append(f"{indent}{i}: {step_plan[i].text}{marker}")
+        out.append(f"{indent}{i}: {_display_text(step_plan[i])}{marker}")
         if k == "close":
             depth = max(0, depth - 1)
         elif k in ("expand", "open"):

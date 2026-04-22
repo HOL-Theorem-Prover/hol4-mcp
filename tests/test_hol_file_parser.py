@@ -7,6 +7,7 @@ from hol4_mcp.hol_file_parser import (
     parse_theorems, parse_file, parse_p_output,
     parse_local_blocks,
     StepPlan, step_line_numbers, format_step_context,
+    _needs_infix_parens, _frag_to_cmd,
 )
 
 FIXTURES_DIR = Path(__file__).parent / "fixtures"
@@ -816,12 +817,12 @@ class TestFormatStepContext:
         result = format_step_context(plan, fail_idx=3, step_lines=lines)
         assert result == ["", "=== Failing tactic ===", "simp[]"]
 
-    def test_fail_on_open_shows_function_name(self):
+    def test_fail_on_open_shows_structural_label(self):
         plan = self._make_plan()
         lines = self._make_lines(plan)
-        # fail_idx=2 is an open step (open_then1)
+        # fail_idx=2 is an open step (open_then1) - should show structural label
         result = format_step_context(plan, fail_idx=2, step_lines=lines)
-        assert result == ["", "=== Failing tactic ===", "open_then1"]
+        assert result == ["", "=== Failing tactic ===", "\u25b6 >-"]
 
     def test_no_context_default(self):
         plan = self._make_plan()
@@ -858,7 +859,7 @@ class TestFormatStepContext:
         # Step 4 (cheat) should be indented and marked FAILED
         assert "  4: cheat  <-- FAILED" in text
         # Step 5 (close_paren) still indented before depth decreases
-        assert "  5: close_paren" in text
+        assert "  5: ◁ /" in text
 
     def test_fail_idx_out_of_range(self):
         plan = self._make_plan()
@@ -890,3 +891,38 @@ class TestFormatStepContext:
         assert "tac_delta" in text
         assert "tac_alpha" not in text
         assert "tac_epsilon" not in text
+
+
+class TestNeedsInfixParens:
+    def test_bare_minus(self):
+        assert _needs_infix_parens(">- strip_tac")
+
+    def test_double_minus(self):
+        assert _needs_infix_parens(">>- strip_tac")
+
+    def test_triple_minus(self):
+        assert _needs_infix_parens(">>>- strip_tac")
+
+    def test_leading_space(self):
+        assert _needs_infix_parens("  >- strip_tac")
+
+    def test_normal_tactic(self):
+        assert not _needs_infix_parens("strip_tac")
+
+    def test_simp(self):
+        assert not _needs_infix_parens("simp[]")
+
+    def test_parenthesized(self):
+        assert not _needs_infix_parens("(simp[] >- fs[])")
+
+
+class TestFragToCmdInfix:
+    def test_bare_infix_gets_parens(self):
+        assert _frag_to_cmd("expand", ">- strip_tac") == "ef(goalFrag.expand((>- strip_tac)));"
+
+    def test_normal_tactic_no_extra_parens(self):
+        assert _frag_to_cmd("expand", "strip_tac") == "ef(goalFrag.expand(strip_tac));"
+
+    def test_open_step_unchanged(self):
+        assert _frag_to_cmd("open", "open_then1") == "ef(goalFrag.open_then1);"
+

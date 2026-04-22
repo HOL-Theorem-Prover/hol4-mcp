@@ -931,7 +931,7 @@ class FileProofCursor:
                     return {
                         "theorems": [],
                         "cheats": [],
-                        "error": f"Failed to load dependency {dep}: {result[:200]}",
+                        "error": f"Failed to load dependency {dep}: {result}",
                     }
         except (FileNotFoundError, RuntimeError):
             pass  # holdeptool not available or failed (parse error), skip dep loading
@@ -1025,7 +1025,7 @@ class FileProofCursor:
             if _is_hol_error(result):
                 return (
                     f"Resume '{thm.name}' failed (line {thm.start_line}) "
-                    f"and could not be cheated: {result[:200]}"
+                    f"and could not be cheated: {result}"
                 )
             self._failed_proofs.add(thm.name)
             return None
@@ -1086,7 +1086,7 @@ class FileProofCursor:
     async def _handle_theorem_error(self, thm: TheoremInfo, result: str) -> str | None:
         """Handle HOL error from a theorem send. Returns error string or None."""
         if thm.kind == "Definition":
-            return f"Definition '{thm.name}' failed (line {thm.start_line}): {result[:300]}"
+            return f"Definition '{thm.name}' failed (line {thm.start_line}): {result}"
         return await self._cheat_failed_theorem(thm)
 
     async def _extract_goals_for(self, theorems: list[TheoremInfo]) -> None:
@@ -1447,7 +1447,7 @@ class FileProofCursor:
             self._proof_initialized = False
             self._current_proof_offset = None
             self._state_content_hash = ""
-            return f"Failed to set up goal: {gt_result[:300]}"
+            return f"Failed to set up goal: {gt_result}"
         self._proof_initialized = True
         self._current_tactic_idx = 0
         self._current_proof_offset = None
@@ -1487,7 +1487,7 @@ class FileProofCursor:
             prefix_cmd, timeout=self._tactic_timeout or 30
         )
         if _is_hol_error(result):
-            return False, result[:200]
+            return False, result
         return True, None
 
     async def state_at(self, line: int, col: int = 1) -> StateAtResult:
@@ -1770,11 +1770,11 @@ class FileProofCursor:
                 if _is_hol_error(step_result):
                     if step_result.startswith("TIMEOUT"):
                         return replayed, f"Tactic replay timed out (>{step_timeout}s)"
-                    return replayed, f"Tactic replay failed: {step_result[:200]}"
+                    return replayed, f"Tactic replay failed: {step_result}"
                 replayed += 1
 
             # Shouldn't happen, but keep original batch error if fallback fully succeeds.
-            return replayed, f"Tactic replay failed: {result[:200]}"
+            return replayed, f"Tactic replay failed: {result}"
 
         used_checkpoint = False
 
@@ -2173,7 +2173,7 @@ class FileProofCursor:
                             results[thm.name] = [TraceEntry(
                                 cmd="", real_ms=0, usr_ms=0, sys_ms=0,
                                 goals_before=None, goals_after=None,
-                                error=f"Definition failed: {result[:200]}"
+                                error=f"Definition failed: {result}"
                             )]
                             current_line = thm.proof_end_line - 1
                             continue
@@ -2221,7 +2221,7 @@ class FileProofCursor:
                             results[thm.name] = [TraceEntry(
                                 cmd="", real_ms=0, usr_ms=0, sys_ms=0,
                                 goals_before=None, goals_after=None,
-                                error=f"Definition failed: {def_result[:200]}"
+                                error=f"Definition failed: {def_result}"
                             )]
                         else:
                             results[thm.name] = []
@@ -2316,7 +2316,7 @@ class FileProofCursor:
                         trace.append(TraceEntry(
                             cmd="", real_ms=0, usr_ms=0, sys_ms=0,
                             goals_before=None, goals_after=None,
-                            error=f"Definition failed: {def_result[:200]}"
+                            error=f"Definition failed: {def_result}"
                         ))
             elif stored and thm.attributes:
                 # Re-send to register attributes (e.g. [simp])

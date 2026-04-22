@@ -1063,7 +1063,9 @@ async def hol_state_at(
         lines.append(
             f"PROOF BROKEN at {fail_str}"
         )
-        lines.append(f"ERROR: {result.error}")
+
+        # Step plan context shows which tactic failed — raw Poly/ML error is redundant
+        lines.append(f"ERROR: Tactic failed at step {fail_idx}")
 
         # Show failing tactic and optional step plan context
         step_plan = cursor._step_plan if cursor else []
