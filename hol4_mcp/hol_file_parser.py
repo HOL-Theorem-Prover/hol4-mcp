@@ -198,25 +198,6 @@ def _offset_to_line(offset: int, content: str) -> int:
     return content[:offset].count('\n') + 1
 
 
-def _display_text(step: StepPlan) -> str:
-    """Human-readable display text for a step plan entry.
-
-    expand steps show tactic text. open/mid/close steps show structural
-    labels (e.g. "▶ >-" for open_then1) instead of goalFrag function names.
-    """
-    if step.kind == "expand":
-        return step.text
-    _LABELS = {
-        "open_then1": "▶ >-",
-        "open_then2": "▶ >>-",
-        "open_then3": "▶ >>>-",
-        "mid_then2": "┃ >>-",
-        "mid_then3": "┃ >>>-",
-        "close_paren": "◁ /",
-    }
-    return _LABELS.get(step.text, step.text)
-
-
 def format_step_context(
     step_plan: list[StepPlan],
     fail_idx: int,
@@ -240,7 +221,7 @@ def format_step_context(
     if fail_idx < 0 or fail_idx >= len(step_plan):
         return []
 
-    out = ["", "=== Failing tactic ===", _display_text(step_plan[fail_idx])]
+    out = ["", "=== Failing tactic ===", step_plan[fail_idx].text]
 
     if context_before <= 0 and context_after <= 0:
         return out
@@ -277,7 +258,7 @@ def format_step_context(
         k = step_plan[i].kind
         indent = "  " * depth
         marker = "  <-- FAILED" if i == fail_idx else ""
-        out.append(f"{indent}{i}: {_display_text(step_plan[i])}{marker}")
+        out.append(f"{indent}{i}: {step_plan[i].text}{marker}")
         if k == "close":
             depth = max(0, depth - 1)
         elif k in ("expand", "open"):

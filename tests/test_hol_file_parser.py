@@ -817,12 +817,12 @@ class TestFormatStepContext:
         result = format_step_context(plan, fail_idx=3, step_lines=lines)
         assert result == ["", "=== Failing tactic ===", "simp[]"]
 
-    def test_fail_on_open_shows_structural_label(self):
+    def test_fail_on_open_shows_function_name(self):
         plan = self._make_plan()
         lines = self._make_lines(plan)
-        # fail_idx=2 is an open step (open_then1) - should show structural label
+        # fail_idx=2 is an open step (open_then1)
         result = format_step_context(plan, fail_idx=2, step_lines=lines)
-        assert result == ["", "=== Failing tactic ===", "\u25b6 >-"]
+        assert result == ["", "=== Failing tactic ===", "open_then1"]
 
     def test_no_context_default(self):
         plan = self._make_plan()
@@ -859,7 +859,7 @@ class TestFormatStepContext:
         # Step 4 (cheat) should be indented and marked FAILED
         assert "  4: cheat  <-- FAILED" in text
         # Step 5 (close_paren) still indented before depth decreases
-        assert "  5: ◁ /" in text
+        assert "  5: close_paren" in text
 
     def test_fail_idx_out_of_range(self):
         plan = self._make_plan()
