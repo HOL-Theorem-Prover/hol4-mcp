@@ -968,10 +968,12 @@ async def hol_state_at(
                       before reaching the requested position (default: False)
         all_goals: If True, show all goals; otherwise only the top goal (default: False)
         context_before: On PROOF BROKEN, number of steps before the failing step
-                        to show in the step plan context (default: 0, off)
+                        to show in the step plan context (default: 0, off).
+                        The failing tactic is always shown; this adds surrounding steps.
         context_after: On PROOF BROKEN, number of steps after the failing step
                        to show in the step plan context (default: 0, off).
-                       Both default to 0 (suppressed); pass e.g. 3 to see context.
+                       Both default to 0 (only failing tactic shown); pass e.g. 3
+                       for surrounding context.
 
     When a proof is broken, the response includes an "=== Steps around failure ==="
     section showing the parsed step plan around the failed step. Steps are
@@ -1062,31 +1064,34 @@ async def hol_state_at(
         )
         lines.append(f"ERROR: {result.error}")
 
-        # Show step plan context around the failure
+        # Show failing tactic and optional step plan context
         step_plan = cursor._step_plan if cursor else []
-        if fail_idx < len(step_plan) and (context_before > 0 or context_after > 0):
-            start = max(0, fail_idx - context_before)
-            end = min(len(step_plan), fail_idx + 1 + context_after)
-            depth = 0
-            # Compute depth at `start` by walking from step 0
-            for i in range(start):
-                k = step_plan[i].kind
-                if k == "close":
-                    depth = max(0, depth - 1)
-                elif k in ("expand", "open"):
-                    depth += 1
+        if fail_idx < len(step_plan):
             lines.append("")
-            lines.append("=== Steps around failure ===")
-            for i in range(start, end):
-                k = step_plan[i].kind
-                t = step_plan[i].text
-                indent = "  " * depth
-                marker = "  <-- FAILED" if i == fail_idx else ""
-                lines.append(f"{indent}{i}: {t}{marker}")
-                if k == "close":
-                    depth = max(0, depth - 1)
-                elif k in ("expand", "open"):
-                    depth += 1
+            lines.append("=== Failing tactic ===")
+            lines.append(step_plan[fail_idx].text)
+            if context_before > 0 or context_after > 0:
+                start = max(0, fail_idx - context_before)
+                end = min(len(step_plan), fail_idx + 1 + context_after)
+                depth = 0
+                for i in range(start):
+                    k = step_plan[i].kind
+                    if k == "close":
+                        depth = max(0, depth - 1)
+                    elif k in ("expand", "open"):
+                        depth += 1
+                lines.append("")
+                lines.append("=== Steps around failure ===")
+                for i in range(start, end):
+                    k = step_plan[i].kind
+                    t = step_plan[i].text
+                    indent = "  " * depth
+                    marker = "  <-- FAILED" if i == fail_idx else ""
+                    lines.append(f"{indent}{i}: {t}{marker}")
+                    if k == "close":
+                        depth = max(0, depth - 1)
+                    elif k in ("expand", "open"):
+                        depth += 1
 
         lines.append("")
         lines.append(
