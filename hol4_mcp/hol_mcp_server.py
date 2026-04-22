@@ -975,16 +975,15 @@ async def hol_state_at(
                        Both default to 0 (only failing tactic shown); pass e.g. 3
                        for surrounding context.
 
-    When a proof is broken, the response includes an "=== Steps around failure ==="
-    section showing the parsed step plan around the failed step. Steps are
-    indented to show nesting structure (from >- / by decomposition):
-      - "expand" steps show the tactic text (e.g. strip_tac, simp[])
-      - "open" steps mark the start of a >- / by branch (shown as open_then1 etc.)
-      - "close" steps mark the end of a branch (shown as close_paren)
-      - "mid" steps mark additional branches in >- (shown as then2, then3 etc.)
-    The failing step is marked with "<-- FAILED".
-    Use context_before/context_after to control how many steps are shown.
-    Set both to 0 to suppress the step plan section entirely.
+    When a proof is broken, the failing step's text is always shown.
+    With context_before/context_after > 0, a "=== Steps around failure ===" section
+    shows the parsed step plan around the failed step, indented by nesting depth.
+    Each step's text depends on its kind:
+      - expand: the tactic text itself (e.g. strip_tac, simp[], Induct_on `x`)
+      - open: the goalFrag function name (open_then1, open_by) — marks start of >- / by
+      - mid: the goalFrag function name (then2, then3) — marks additional >- branches
+      - close: close_paren — marks end of a >- / by group
+    The failing step is marked with "<-- FAILED" in the steps section.
 
     Returns: Proof position, goals at that position, errors if any
     """
