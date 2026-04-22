@@ -1043,6 +1043,18 @@ async def hol_state_at(
             f"PROOF BROKEN at {fail_str}"
         )
         lines.append(f"ERROR: {result.error}")
+
+        # Show failing tactic and preceding context
+        step_plan = cursor._step_plan if cursor else []
+        if fail_idx < len(step_plan):
+            lines.append("")
+            lines.append("=== Failing tactic ===")
+            lines.append(step_plan[fail_idx].text)
+            for i in range(max(0, fail_idx - 2), fail_idx):
+                lines.append("")
+                lines.append(f"--- Preceding tactic {i} ---")
+                lines.append(step_plan[i].text)
+
         lines.append("")
         lines.append(
             f"Replay cannot reach the requested position because an earlier "
