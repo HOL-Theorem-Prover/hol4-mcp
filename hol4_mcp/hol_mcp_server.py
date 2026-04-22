@@ -23,7 +23,7 @@ from fastmcp import FastMCP, Context
 
 from .hol_session import HOLSession, HOLDIR
 from .hol_cursor import FileProofCursor
-from .hol_file_parser import HOLParseError
+from .hol_file_parser import HOLParseError, step_line_numbers, format_step_context
 
 
 DEFAULT_MAX_OUTPUT = 4096
@@ -942,8 +942,8 @@ async def hol_state_at(
     session: str = "default",
     show_partial: bool = False,
     all_goals: bool = False,
-    steps_before: int = 0,
-    steps_after: int = 0,
+    context_before: int = 0,
+    context_after: int = 0,
 ) -> str:
     """Get proof state at a file position.
 
@@ -967,16 +967,19 @@ async def hol_state_at(
         show_partial: If True, show best-effort goals even when replay fails
                       before reaching the requested position (default: False)
         all_goals: If True, show all goals; otherwise only the top goal (default: False)
-        steps_before: On PROOF BROKEN, number of step plan entries before the
-                      failing step to show (default: 0, off). Counts are in step
-                      plan fragments, not lines. The failing step is always shown.
-        steps_after: On PROOF BROKEN, number of step plan entries after the failing
-                     step to show (default: 0, off). Both default to 0 (only
-                     failing step shown); pass e.g. 3 for surrounding context.
+        context_before: On PROOF BROKEN, number of source lines before the failure
+                       to include in the step plan context (default: 0, off).
+                       The failing step is always shown; this adds steps whose
+                       source positions fall within the line range.
+        context_after: On PROOF BROKEN, number of source lines after the failure
+                      to include in the step plan context (default: 0, off).
+                      Both default to 0 (only failing step shown); pass e.g. 3
+                      for surrounding context.
 
     When a proof is broken, the failing step's text is always shown.
-    With steps_before/steps_after > 0, a "=== Steps around failure ===" section
-    shows the parsed step plan around the failed step, indented by nesting depth.
+    With context_before/context_after > 0, a "=== Steps around failure ===" section
+    shows step plan entries whose source lines fall within the requested range,
+    indented by nesting depth.
     Each step's text depends on its kind:
       - expand: the tactic text itself (e.g. strip_tac, simp[], Induct_on `x`)
       - open: the goalFrag function name (open_then1, open_by) — marks start of >- / by
@@ -1064,32 +1067,12 @@ async def hol_state_at(
 
         # Show failing tactic and optional step plan context
         step_plan = cursor._step_plan if cursor else []
-        if fail_idx < len(step_plan):
-            lines.append("")
-            lines.append("=== Failing tactic ===")
-            lines.append(step_plan[fail_idx].text)
-            if steps_before > 0 or steps_after > 0:
-                start = max(0, fail_idx - steps_before)
-                end = min(len(step_plan), fail_idx + 1 + steps_after)
-                depth = 0
-                for i in range(start):
-                    k = step_plan[i].kind
-                    if k == "close":
-                        depth = max(0, depth - 1)
-                    elif k in ("expand", "open"):
-                        depth += 1
-                lines.append("")
-                lines.append("=== Steps around failure ===")
-                for i in range(start, end):
-                    k = step_plan[i].kind
-                    t = step_plan[i].text
-                    indent = "  " * depth
-                    marker = "  <-- FAILED" if i == fail_idx else ""
-                    lines.append(f"{indent}{i}: {t}{marker}")
-                    if k == "close":
-                        depth = max(0, depth - 1)
-                    elif k in ("expand", "open"):
-                        depth += 1
+        if fail_idx < len(step_plan) and thm:
+            s_lines = step_line_numbers(step_plan, thm.proof_body_offset, cursor._content)
+            lines.extend(format_step_context(
+                step_plan, fail_idx, s_lines,
+                context_before=context_before, context_after=context_after,
+            ))
 
         lines.append("")
         lines.append(

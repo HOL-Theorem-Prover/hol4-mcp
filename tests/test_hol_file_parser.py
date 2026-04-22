@@ -6,6 +6,7 @@ from pathlib import Path
 from hol4_mcp.hol_file_parser import (
     parse_theorems, parse_file, parse_p_output,
     parse_local_blocks,
+    StepPlan, step_line_numbers, format_step_context,
 )
 
 FIXTURES_DIR = Path(__file__).parent / "fixtures"
@@ -756,3 +757,136 @@ end
     assert lb.local_line == 1
     assert lb.in_line == 3
     assert lb.end_line == 7
+
+
+class TestStepLineNumbers:
+    """Tests for step_line_numbers."""
+
+    def test_basic(self):
+        # "line 0\n" = 7 chars, lines start at 0,7,14,21,28,35
+        content = "line 0\nline 1\nline 2\nline 3\nline 4\nline 5\n"
+        offset = 7  # proof starts at "line 1" (line 2)
+        plan = [
+            StepPlan(end=7, kind="expand", text="strip_tac"),   # proof body 0..7 -> abs 7..14
+            StepPlan(end=14, kind="open", text="open_then1"),   # proof body 7..14 -> abs 14..21
+            StepPlan(end=21, kind="expand", text="simp[]"),      # proof body 14..21 -> abs 21..28
+        ]
+        lines = step_line_numbers(plan, offset, content)
+        assert len(lines) == 3
+        # Step 0 starts at abs 7 (line 2)
+        assert lines[0] == 2
+        # Step 1 starts at abs 7+7=14 (line 3)
+        assert lines[1] == 3
+        # Step 2 starts at abs 7+14=21 (line 4)
+        assert lines[2] == 4
+
+    def test_empty(self):
+        assert step_line_numbers([], 0, "") == []
+
+
+class TestFormatStepContext:
+    """Tests for format_step_context."""
+
+    def _make_plan(self):
+        return [
+            StepPlan(end=10, kind="expand", text="rpt strip_tac"),
+            StepPlan(end=20, kind="expand", text="Induct_on `x`"),
+            StepPlan(end=30, kind="open", text="open_then1"),
+            StepPlan(end=40, kind="expand", text="simp[]"),
+            StepPlan(end=50, kind="expand", text="cheat"),      # fail_idx=4
+            StepPlan(end=60, kind="close", text="close_paren"),
+            StepPlan(end=70, kind="expand", text="fs[APPEND]"),
+        ]
+
+    def _make_lines(self, plan):
+        # Pretend all on line 10 for simple tests (line-based filtering
+        # only matters for context_before/after bounds)
+        return [10] * len(plan)
+
+    def test_failing_tactic_always_shown(self):
+        plan = self._make_plan()
+        lines = self._make_lines(plan)
+        result = format_step_context(plan, fail_idx=4, step_lines=lines)
+        assert result == ["", "=== Failing tactic ===", "cheat"]
+
+    def test_fail_on_expand_shows_tactic_text(self):
+        plan = self._make_plan()
+        lines = self._make_lines(plan)
+        # fail_idx=3 is an expand step (simp[])
+        result = format_step_context(plan, fail_idx=3, step_lines=lines)
+        assert result == ["", "=== Failing tactic ===", "simp[]"]
+
+    def test_fail_on_open_shows_function_name(self):
+        plan = self._make_plan()
+        lines = self._make_lines(plan)
+        # fail_idx=2 is an open step (open_then1)
+        result = format_step_context(plan, fail_idx=2, step_lines=lines)
+        assert result == ["", "=== Failing tactic ===", "open_then1"]
+
+    def test_no_context_default(self):
+        plan = self._make_plan()
+        lines = self._make_lines(plan)
+        result = format_step_context(plan, fail_idx=4, step_lines=lines)
+        # Only failing tactic, no steps section
+        assert "=== Steps around failure ===" not in result
+
+    def test_context_shows_steps(self):
+        plan = self._make_plan()
+        lines = self._make_lines(plan)
+        result = format_step_context(
+            plan, fail_idx=4, step_lines=lines,
+            context_before=1, context_after=1,
+        )
+        text = "\n".join(result)
+        # Should include steps section
+        assert "=== Steps around failure ===" in text
+        # Failing step marked
+        assert "<-- FAILED" in text
+
+    def test_nesting_indentation(self):
+        plan = self._make_plan()
+        # Give distinct lines so context_before/after filters correctly
+        lines = [5, 6, 7, 8, 9, 10, 11]
+        result = format_step_context(
+            plan, fail_idx=4, step_lines=lines,
+            context_before=1, context_after=1,
+        )
+        # cheat (idx 4) is inside open/close, should be indented
+        text = "\n".join(result)
+        # Step 3 (simp[]) is after open, should be indented
+        assert "  3: simp[]" in text
+        # Step 4 (cheat) should be indented and marked FAILED
+        assert "  4: cheat  <-- FAILED" in text
+        # Step 5 (close_paren) still indented before depth decreases
+        assert "  5: close_paren" in text
+
+    def test_fail_idx_out_of_range(self):
+        plan = self._make_plan()
+        lines = self._make_lines(plan)
+        assert format_step_context(plan, fail_idx=99, step_lines=lines) == []
+        assert format_step_context(plan, fail_idx=-1, step_lines=lines) == []
+
+    def test_empty_plan(self):
+        assert format_step_context([], fail_idx=0, step_lines=[]) == []
+
+    def test_line_based_filtering(self):
+        """context_before/after use source lines, not step indices."""
+        plan = [
+            StepPlan(end=5, kind="expand", text="tac_alpha"),
+            StepPlan(end=10, kind="expand", text="tac_beta"),
+            StepPlan(end=15, kind="expand", text="tac_gamma"),  # fail_idx=2, line 30
+            StepPlan(end=20, kind="expand", text="tac_delta"),
+            StepPlan(end=25, kind="expand", text="tac_epsilon"),
+        ]
+        step_lines = [10, 20, 30, 40, 50]
+        result = format_step_context(
+            plan, fail_idx=2, step_lines=step_lines,
+            context_before=15, context_after=15,
+        )
+        text = "\n".join(result)
+        # Line range [15, 45]: steps at line 10 and 50 excluded
+        assert "tac_beta" in text
+        assert "tac_gamma" in text  # failing
+        assert "tac_delta" in text
+        assert "tac_alpha" not in text
+        assert "tac_epsilon" not in text

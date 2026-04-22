@@ -164,6 +164,98 @@ class StepPlan:
         return _frag_to_cmd(self.kind, self.text)
 
 
+def step_line_numbers(
+    step_plan: list[StepPlan], proof_body_offset: int, content: str
+) -> list[int]:
+    """Compute 1-indexed source line number for each step in step_plan.
+
+    A step starts at the end of the previous step (or proof_body_offset for step 0).
+    """
+    lines = []
+    for i, step in enumerate(step_plan):
+        if i == 0:
+            start_offset = proof_body_offset
+        else:
+            start_offset = proof_body_offset + step_plan[i - 1].end
+        line = _offset_to_line(start_offset, content)
+        lines.append(line)
+    return lines
+
+
+def _offset_to_line(offset: int, content: str) -> int:
+    """Convert byte offset in content to 1-indexed line number."""
+    return content[:offset].count('\n') + 1
+
+
+def format_step_context(
+    step_plan: list[StepPlan],
+    fail_idx: int,
+    step_lines: list[int],
+    context_before: int = 0,
+    context_after: int = 0,
+) -> list[str]:
+    """Format step plan context around a failing step.
+
+    Args:
+        step_plan: List of StepPlan entries.
+        fail_idx: Index of the failing step.
+        step_lines: 1-indexed line numbers for each step (from step_line_numbers).
+        context_before: Number of source lines before the failure to include.
+        context_after: Number of source lines after the failure to include.
+
+    Returns:
+        Lines of formatted output (empty list if fail_idx out of range or
+        no context requested).
+    """
+    if fail_idx < 0 or fail_idx >= len(step_plan):
+        return []
+
+    out = ["", "=== Failing tactic ===", step_plan[fail_idx].text]
+
+    if context_before <= 0 and context_after <= 0:
+        return out
+
+    fail_line = step_lines[fail_idx]
+    lo = fail_line - context_before
+    hi = fail_line + context_after
+
+    # Find step range whose source lines fall within [lo, hi]
+    start = fail_idx
+    for i in range(fail_idx - 1, -1, -1):
+        if step_lines[i] < lo:
+            break
+        start = i
+
+    end = fail_idx + 1
+    for i in range(fail_idx + 1, len(step_plan)):
+        if step_lines[i] > hi:
+            break
+        end = i + 1
+
+    # Compute nesting depth at `start`
+    depth = 0
+    for i in range(start):
+        k = step_plan[i].kind
+        if k == "close":
+            depth = max(0, depth - 1)
+        elif k in ("expand", "open"):
+            depth += 1
+
+    out.append("")
+    out.append("=== Steps around failure ===")
+    for i in range(start, end):
+        k = step_plan[i].kind
+        indent = "  " * depth
+        marker = "  <-- FAILED" if i == fail_idx else ""
+        out.append(f"{indent}{i}: {step_plan[i].text}{marker}")
+        if k == "close":
+            depth = max(0, depth - 1)
+        elif k in ("expand", "open"):
+            depth += 1
+
+    return out
+
+
 def parse_step_plan_output(output: str) -> list[StepPlan]:
     """Parse JSON output from step_plan_json.
 
