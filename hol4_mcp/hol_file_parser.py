@@ -198,6 +198,107 @@ def _offset_to_line(offset: int, content: str) -> int:
     return content[:offset].count('\n') + 1
 
 
+# Display names for structural step kinds (hide SML plumbing)
+_STEP_DISPLAY = {
+    "open": ">-",
+    "mid": ">>-",
+}
+
+
+def format_steps(
+    step_plan: list[StepPlan],
+    fail_idx: int | None = None,
+    trace_data: list | None = None,
+    step_lines: list[int] | None = None,
+    context_before: int = 0,
+    context_after: int = 0,
+) -> list[str]:
+    """Format step plan with indentation for >- arm nesting.
+
+    - expand steps show raw tactic text at current depth
+    - open steps show ">-" and increase nesting depth (arm start)
+    - mid steps show ">>-" and increase nesting depth (ThenL arm start)
+    - close steps are hidden (indent decrease is the visual)
+    - >> chain tactics stay at same depth (sequential, not nested)
+
+    With trace_data: appends "Nms  X→Y" timing/goals per step.
+    With step_lines + context_before/after: shows only steps near fail_idx.
+
+    Args:
+        step_plan: List of StepPlan entries.
+        fail_idx: Index of the failing step, or None if proof succeeded.
+        trace_data: List of TraceEntry objects (index-aligned with step_plan).
+                    If provided, adds timing and goal annotations.
+        step_lines: 1-indexed line numbers for each step (from step_line_numbers).
+                    Required for context_before/after filtering.
+        context_before: Number of source lines before the failure to include.
+        context_after: Number of source lines after the failure to include.
+
+    Returns:
+        Lines of formatted output.
+    """
+    # When context filtering is requested, determine step range
+    if (context_before > 0 or context_after > 0) and fail_idx is not None and step_lines:
+        if fail_idx < 0 or fail_idx >= len(step_plan):
+            return []
+        fail_line = step_lines[fail_idx]
+        lo = fail_line - context_before
+        hi = fail_line + context_after
+        start = fail_idx
+        for i in range(fail_idx - 1, -1, -1):
+            if step_lines[i] < lo:
+                break
+            start = i
+        end = fail_idx + 1
+        for i in range(fail_idx + 1, len(step_plan)):
+            if step_lines[i] > hi:
+                break
+            end = i + 1
+    else:
+        start = 0
+        end = len(step_plan)
+
+    # Precompute depth at `start`
+    depth = 0
+    for i in range(start):
+        k = step_plan[i].kind
+        if k == "close":
+            depth = max(0, depth - 1)
+        elif k in ("open", "mid"):
+            depth += 1
+
+    out = []
+    for i in range(start, end):
+        step = step_plan[i]
+        k = step.kind
+
+        if k == "close":
+            # Hidden — indent decrease is the visual
+            depth = max(0, depth - 1)
+            continue
+
+        indent = "  " * depth
+        marker = "  <-- FAILED" if i == fail_idx else ""
+        display = _STEP_DISPLAY.get(k, step.text)  # >-/>>- for structural, raw text for expand
+
+        # Timing/goals annotation
+        annotation = ""
+        if trace_data is not None and i < len(trace_data):
+            entry = trace_data[i]
+            ms = entry.real_ms
+            gb = entry.goals_before if entry.goals_before is not None else "?"
+            ga = entry.goals_after if entry.goals_after is not None else "?"
+            annotation = f"  {ms}ms  {gb}→{ga}"
+
+        out.append(f"{indent}{i}: {display}{annotation}{marker}")
+
+        # Increase depth AFTER open/mid (their children go deeper)
+        if k in ("open", "mid"):
+            depth += 1
+
+    return out
+
+
 def format_step_context(
     step_plan: list[StepPlan],
     fail_idx: int,
@@ -207,63 +308,28 @@ def format_step_context(
 ) -> list[str]:
     """Format step plan context around a failing step.
 
-    Args:
-        step_plan: List of StepPlan entries.
-        fail_idx: Index of the failing step.
-        step_lines: 1-indexed line numbers for each step (from step_line_numbers).
-        context_before: Number of source lines before the failure to include.
-        context_after: Number of source lines after the failure to include.
-
-    Returns:
-        Lines of formatted output (empty list if fail_idx out of range or
-        no context requested).
+    Thin wrapper around format_steps for backward compatibility.
     """
     if fail_idx < 0 or fail_idx >= len(step_plan):
         return []
 
-    out = ["", "=== Failing tactic ===", step_plan[fail_idx].text]
+    failing_text = step_plan[fail_idx].text
+    # Use structural display name if it's an open/mid step
+    failing_display = _STEP_DISPLAY.get(step_plan[fail_idx].kind, failing_text)
+    out = ["", "=== Failing tactic ===", failing_display]
 
     if context_before <= 0 and context_after <= 0:
         return out
 
-    fail_line = step_lines[fail_idx]
-    lo = fail_line - context_before
-    hi = fail_line + context_after
-
-    # Find step range whose source lines fall within [lo, hi]
-    start = fail_idx
-    for i in range(fail_idx - 1, -1, -1):
-        if step_lines[i] < lo:
-            break
-        start = i
-
-    end = fail_idx + 1
-    for i in range(fail_idx + 1, len(step_plan)):
-        if step_lines[i] > hi:
-            break
-        end = i + 1
-
-    # Compute nesting depth at `start`
-    depth = 0
-    for i in range(start):
-        k = step_plan[i].kind
-        if k == "close":
-            depth = max(0, depth - 1)
-        elif k in ("expand", "open"):
-            depth += 1
-
-    out.append("")
-    out.append("=== Steps around failure ===")
-    for i in range(start, end):
-        k = step_plan[i].kind
-        indent = "  " * depth
-        marker = "  <-- FAILED" if i == fail_idx else ""
-        out.append(f"{indent}{i}: {step_plan[i].text}{marker}")
-        if k == "close":
-            depth = max(0, depth - 1)
-        elif k in ("expand", "open"):
-            depth += 1
-
+    steps = format_steps(
+        step_plan, fail_idx=fail_idx,
+        step_lines=step_lines,
+        context_before=context_before, context_after=context_after,
+    )
+    if steps:
+        out.append("")
+        out.append("=== Steps around failure ===")
+        out.extend(steps)
     return out
 
 

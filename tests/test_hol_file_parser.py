@@ -6,7 +6,7 @@ from pathlib import Path
 from hol4_mcp.hol_file_parser import (
     parse_theorems, parse_file, parse_p_output,
     parse_local_blocks,
-    StepPlan, step_line_numbers, format_step_context,
+    StepPlan, step_line_numbers, format_step_context, format_steps,
     _needs_infix_parens, _frag_to_cmd,
     parse_step_plan_output,
 )
@@ -811,6 +811,65 @@ class TestFormatStepContext:
         result = format_step_context(plan, fail_idx=4, step_lines=lines)
         assert result == ["", "=== Failing tactic ===", "cheat"]
 
+    def test_then_chain_no_nesting(self):
+        """>> chain tactics should be at the same depth (sequential, not nested)."""
+        plan = [
+            StepPlan(end=10, kind="expand", text="strip_tac"),
+            StepPlan(end=20, kind="expand", text="conj_tac"),
+            StepPlan(end=30, kind="expand", text="simp[]"),
+        ]
+        lines = [10, 10, 10]
+        result = format_step_context(
+            plan, fail_idx=2, step_lines=lines,
+            context_before=1, context_after=0,
+        )
+        text = "\n".join(result)
+        # All three at depth 0 — no extra indentation
+        assert "0: strip_tac" in text
+        assert "1: conj_tac" in text
+        assert "2: simp[]  <-- FAILED" in text
+        # Should NOT have nested indentation for >> chain
+        assert "  0:" not in text
+        assert "  1:" not in text
+
+    def test_thenlt_arm_indented(self):
+        ">- arms should be indented one level deeper than the base."""
+        plan = [
+            StepPlan(end=10, kind="expand", text="Cases_on `x`"),
+            StepPlan(end=20, kind="open", text="open_then1"),
+            StepPlan(end=30, kind="expand", text="simp[]"),
+            StepPlan(end=40, kind="close", text="close_paren"),
+            StepPlan(end=50, kind="open", text="open_then1"),
+            StepPlan(end=60, kind="expand", text="fs[]"),
+            StepPlan(end=70, kind="close", text="close_paren"),
+        ]
+        lines = [10, 10, 10, 10, 10, 10, 10]
+        result = format_step_context(
+            plan, fail_idx=5, step_lines=lines,
+            context_before=0, context_after=0,
+        )
+        # Just the failing tactic header (no context_before/after for steps section)
+        assert result == ["", "=== Failing tactic ===", "fs[]"]
+
+        # With context, see indentation
+        result = format_step_context(
+            plan, fail_idx=5, step_lines=lines,
+            context_before=1, context_after=1,
+        )
+        text = "\n".join(result)
+        # Base at depth 0
+        assert "0: Cases_on `x`" in text
+        # First arm: open shows >-, contents indented, close hidden
+        assert "1: >-" in text
+        assert "  2: simp[]" in text
+        # idx 3 (close_paren) hidden
+        # Second arm: open at idx 4, contents at idx 5
+        assert "4: >-" in text
+        assert "  5: fs[]  <-- FAILED" in text
+        # No SML plumbing names visible
+        assert "open_then1" not in text
+        assert "close_paren" not in text
+
     def test_fail_on_expand_shows_tactic_text(self):
         plan = self._make_plan()
         lines = self._make_lines(plan)
@@ -818,12 +877,12 @@ class TestFormatStepContext:
         result = format_step_context(plan, fail_idx=3, step_lines=lines)
         assert result == ["", "=== Failing tactic ===", "simp[]"]
 
-    def test_fail_on_open_shows_function_name(self):
+    def test_fail_on_open_shows_arrow(self):
         plan = self._make_plan()
         lines = self._make_lines(plan)
-        # fail_idx=2 is an open step (open_then1)
+        # fail_idx=2 is an open step — should display as >-
         result = format_step_context(plan, fail_idx=2, step_lines=lines)
-        assert result == ["", "=== Failing tactic ===", "open_then1"]
+        assert result == ["", "=== Failing tactic ===", ">-"]
 
     def test_no_context_default(self):
         plan = self._make_plan()
@@ -853,14 +912,14 @@ class TestFormatStepContext:
             plan, fail_idx=4, step_lines=lines,
             context_before=1, context_after=1,
         )
-        # cheat (idx 4) is inside open/close, should be indented
         text = "\n".join(result)
-        # Step 3 (simp[]) is after open, should be indented
+        # Context window (lines 8-10) includes steps 3, 4, 5
+        # Step 2 (open, line 7) is outside context window
+        # Steps 3 & 4 inside >- arm, indented (depth 1 = 2 spaces)
         assert "  3: simp[]" in text
-        # Step 4 (cheat) should be indented and marked FAILED
         assert "  4: cheat  <-- FAILED" in text
-        # Step 5 (close_paren) still indented before depth decreases
-        assert "  5: close_paren" in text
+        # Step 5 (close_paren) is hidden
+        assert "close_paren" not in text
 
     def test_fail_idx_out_of_range(self):
         plan = self._make_plan()
@@ -1028,6 +1087,148 @@ class TestParseStepPlan:
         assert plan[3] == StepPlan(end=29, kind="close", text="close_paren")
 
 
+class TestFormatSteps:
+    """Tests for format_steps (and indirectly format_step_context)."""
+
+    @staticmethod
+    def _entry(ms, gb, ga, error=None):
+        """Minimal mock TraceEntry."""
+        return type('E', (), {'real_ms': ms, 'goals_before': gb, 'goals_after': ga, 'error': error})()
+
+    def test_simple_then_chain(self):
+        ">> chain: all at depth 0, with timing."""
+        plan = [
+            StepPlan(end=10, kind="expand", text="strip_tac"),
+            StepPlan(end=20, kind="expand", text="conj_tac"),
+            StepPlan(end=30, kind="expand", text="simp[]"),
+        ]
+        trace = [self._entry(5, 1, 2), self._entry(10, 2, 2), self._entry(3, 2, 0)]
+        result = format_steps(plan, trace_data=trace)
+        assert result == [
+            "0: strip_tac  5ms  1→2",
+            "1: conj_tac  10ms  2→2",
+            "2: simp[]  3ms  2→0",
+        ]
+
+    def test_thenlt_nesting(self):
+        ">- open shows >-, close hidden, expand indented inside arm."""
+        plan = [
+            StepPlan(end=10, kind="expand", text="Cases_on `x`"),
+            StepPlan(end=20, kind="open", text="open_then1"),
+            StepPlan(end=30, kind="expand", text="simp[]"),
+            StepPlan(end=40, kind="close", text="close_paren"),
+            StepPlan(end=50, kind="open", text="open_then1"),
+            StepPlan(end=60, kind="expand", text="fs[]"),
+            StepPlan(end=70, kind="close", text="close_paren"),
+        ]
+        trace = [
+            self._entry(8, 1, 2),
+            self._entry(1, 2, 2),  # open_then1
+            self._entry(5, 2, 1),
+            self._entry(1, 1, 1),  # close_paren
+            self._entry(1, 2, 2),  # open_then1
+            self._entry(4, 2, 0),
+            self._entry(1, 0, 0),  # close_paren
+        ]
+        result = format_steps(plan, trace_data=trace)
+        assert result == [
+            "0: Cases_on `x`  8ms  1→2",
+            "1: >-  1ms  2→2",
+            "  2: simp[]  5ms  2→1",
+            # close_paren (idx 3) hidden
+            "4: >-  1ms  2→2",
+            "  5: fs[]  4ms  2→0",
+            # close_paren (idx 6) hidden — wait, idx 7 is close but plan has 7 items
+        ]
+
+    def test_no_trace_data(self):
+        """Without trace_data: no timing/goals annotations."""
+        plan = [
+            StepPlan(end=10, kind="expand", text="strip_tac"),
+            StepPlan(end=20, kind="expand", text="simp[]"),
+        ]
+        result = format_steps(plan)
+        assert result == ["0: strip_tac", "1: simp[]"]
+
+    def test_failed_step_marker(self):
+        plan = [
+            StepPlan(end=10, kind="expand", text="strip_tac"),
+            StepPlan(end=20, kind="expand", text='FAIL_TAC "boom"'),
+        ]
+        trace = [self._entry(5, 1, 1), self._entry(2, 1, None, error='Fail "boom"')]
+        result = format_steps(plan, fail_idx=1, trace_data=trace)
+        assert result == [
+            '0: strip_tac  5ms  1→1',
+            '1: FAIL_TAC "boom"  2ms  1→?  <-- FAILED',
+        ]
+
+    def test_missing_trace_entries(self):
+        """Shorter trace_data than step_plan: missing entries show no annotation."""
+        plan = [
+            StepPlan(end=10, kind="expand", text="strip_tac"),
+            StepPlan(end=20, kind="expand", text="simp[]"),
+        ]
+        trace = [self._entry(5, 1, 1)]
+        result = format_steps(plan, trace_data=trace)
+        assert result == [
+            "0: strip_tac  5ms  1→1",
+            "1: simp[]",
+        ]
+
+    def test_then_chain_no_nesting(self):
+        ">> chain should NOT create nesting."""
+        plan = [
+            StepPlan(end=10, kind="expand", text="rpt strip_tac"),
+            StepPlan(end=20, kind="expand", text="Induct_on `x`"),
+            StepPlan(end=30, kind="expand", text="fs[]"),
+        ]
+        trace = [self._entry(20, 1, 2), self._entry(50, 2, 2), self._entry(10, 2, 0)]
+        result = format_steps(plan, trace_data=trace)
+        # All at depth 0, no indentation
+        for line in result:
+            assert not line.startswith(" ")
+
+    def test_none_goals_shown_as_question_mark(self):
+        plan = [StepPlan(end=10, kind="expand", text="tac")]
+        trace = [self._entry(5, None, None)]
+        result = format_steps(plan, trace_data=trace)
+        assert result == ["0: tac  5ms  ?→?"]
+
+    def test_close_hidden(self):
+        """close steps hidden — indent decrease is the visual."""
+        plan = [
+            StepPlan(end=10, kind="expand", text="Cases_on `x`"),
+            StepPlan(end=20, kind="open", text="open_then1"),
+            StepPlan(end=30, kind="expand", text="simp[]"),
+            StepPlan(end=40, kind="close", text="close_paren"),
+            StepPlan(end=50, kind="expand", text="fs[]"),
+        ]
+        result = format_steps(plan)
+        assert result == [
+            "0: Cases_on `x`",
+            "1: >-",
+            "  2: simp[]",
+            # idx 3 (close_paren) hidden
+            "4: fs[]",
+        ]
+
+    def test_mid_shows_double_arrow(self):
+        ">>- (ThenL mid) steps show >>-."""
+        plan = [
+            StepPlan(end=10, kind="expand", text="strip_tac"),
+            StepPlan(end=20, kind="mid", text="mid_then"),
+            StepPlan(end=30, kind="expand", text="simp[]"),
+            StepPlan(end=40, kind="close", text="close_paren"),
+        ]
+        result = format_steps(plan)
+        assert result == [
+            "0: strip_tac",
+            "1: >>-",
+            "  2: simp[]",
+            # close hidden
+        ]
+
+
 class TestFormatStepContextReal:
     """Test format_step_context with real parsed step plans."""
 
@@ -1042,9 +1243,9 @@ class TestFormatStepContextReal:
         text = "\n".join(result)
         assert "=== Failing tactic ===" in text
         assert "cheat  <-- FAILED" in text
-        # Should show open/expand/close structure around the failing arm
-        assert "open_then1" in text
-        assert "close_paren" in text
+        # open shows as >-, close is hidden
+        assert ">-" in text
+        assert "close_paren" not in text
 
     def test_bare_infix_failure(self):
         plan = parse_step_plan_output(_REAL_JSON["bare_infix"])

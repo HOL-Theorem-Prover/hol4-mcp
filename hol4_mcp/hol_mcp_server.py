@@ -23,7 +23,7 @@ from fastmcp import FastMCP, Context
 
 from .hol_session import HOLSession, HOLDIR
 from .hol_cursor import FileProofCursor
-from .hol_file_parser import HOLParseError, step_line_numbers, format_step_context
+from .hol_file_parser import HOLParseError, step_line_numbers, format_steps, format_step_context
 
 
 DEFAULT_MAX_OUTPUT = 4096
@@ -1256,19 +1256,7 @@ async def hol_check_proof(
             failed_idx = i
             break
 
-    # Compute absolute line:col from proof_body offset using file content
-    def offset_to_pos(offset):
-        if not thm.proof_body or offset < 0:
-            return _file_offset_to_line_col(thm.proof_body_offset, cursor._content)
-        return _file_offset_to_line_col(thm.proof_body_offset + offset, cursor._content)
-
-    # Get tactic start/end range
-    def tactic_range(idx):
-        if idx is None or idx >= len(cursor._step_plan):
-            return (thm.proof_start_line, 1), (thm.proof_start_line, 1)
-        start_offset = cursor._step_plan[idx - 1].end if idx > 0 else 0
-        end_offset = cursor._step_plan[idx].end
-        return offset_to_pos(start_offset), offset_to_pos(end_offset)
+    step_plan = cursor._step_plan
 
     final = trace_data[-1]
     total_ms = sum(e.real_ms for e in trace_data)
@@ -1288,40 +1276,24 @@ async def hol_check_proof(
     else:
         lines.append(f"Status: INCOMPLETE at step {len(trace_data)}/{total_steps} ({total_ms}ms)")
 
-    # Per-step timing trace (when requested, or always on failure/incomplete)
+    # Per-step trace: step plan with timing and goal annotations
     if trace:
         lines.append("")
-        for i, entry in enumerate(trace_data, 1):
-            (sp, sc), (ep, ec) = tactic_range(i - 1)
-            loc = f"line/col {sp}:{sc}-{ep}:{ec}"
-            cmd_text = entry.cmd.strip().replace('\n', ' ')
-            if len(cmd_text) > 60:
-                cmd_text = cmd_text[:57] + "..."
-            lines.append(f"Step {i} ({loc}): {cmd_text}")
-            if entry.error:
-                lines.append(f"  ERROR: {entry.error}")
-            else:
-                gb = entry.goals_before if entry.goals_before is not None else "?"
-                ga = entry.goals_after if entry.goals_after is not None else "?"
-                lines.append(f"  {entry.real_ms}ms | Goals: {gb} -> {ga}")
-        lines.append("")
+        lines.extend(format_steps(step_plan, fail_idx=failed_idx, trace_data=trace_data))
 
-    # Show failing tactic with location (when not in trace mode, which already shows all steps)
+    # Show failing tactic with location (when not in trace mode)
     if not trace and failed_idx is not None and failed_idx < len(trace_data):
-        (start_line, start_col), (end_line, end_col) = tactic_range(failed_idx)
-        tactic_text = trace_data[failed_idx].cmd.strip().replace('\n', ' ')
-        if len(tactic_text) > 80:
-            tactic_text = tactic_text[:77] + "..."
-        loc = f"line/col {start_line}:{start_col}-{end_line}:{end_col}"
-        lines.append(f"Tactic ({loc}): {tactic_text}")
+        s_lines = step_line_numbers(step_plan, thm.proof_body_offset, cursor._content)
+        lines.extend(format_step_context(step_plan, failed_idx, s_lines))
 
     # Brief goal summary for failure/incomplete
     if failed_idx is not None:
         lines.append("")
         ga = final.goals_after if final.goals_after is not None else "unknown"
         lines.append(f"Remaining: {ga} goal(s)")
-        (fail_line, fail_col), _ = tactic_range(failed_idx)
-        lines.append(f"Use hol_state_at(line={fail_line}, col={fail_col}) for full goals")
+        s_lines = step_line_numbers(step_plan, thm.proof_body_offset, cursor._content)
+        fail_line = s_lines[failed_idx] if failed_idx < len(s_lines) else thm.proof_start_line
+        lines.append(f"Use hol_state_at(line={fail_line}) for full goals")
 
     _schedule_gc(session)
     return "\n".join(lines)

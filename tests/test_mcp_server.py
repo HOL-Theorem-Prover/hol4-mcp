@@ -1614,9 +1614,8 @@ async def test_check_proof_trace_ok(tmp_path):
             theorem="add_zero", file=str(test_file), session=session, trace=True
         )
         assert "Status: OK" in r
-        assert "Step 1" in r
         assert "ms" in r
-        assert "Goals:" in r
+        assert "→" in r  # goal transition in trace (e.g. "1→0")
     finally:
         await hol_stop(session=session)
 
@@ -1632,7 +1631,8 @@ async def test_check_proof_trace_false_omits_steps(tmp_path):
             theorem="add_zero", file=str(test_file), session=session, trace=False
         )
         assert "Status: OK" in r
-        assert "Step 1" not in r
+        # trace=False on passing proof: only status line, no per-step output
+        assert "→" not in r  # no goal transitions in output
     finally:
         await hol_stop(session=session)
 
@@ -1648,8 +1648,8 @@ async def test_check_proof_trace_failure(tmp_path):
             theorem="broken_two_step", file=str(test_file), session=session, trace=True
         )
         assert "FAILED" in r or "INCOMPLETE" in r
-        assert "Step 1" in r
-        assert "Goals:" in r
+        assert "ms" in r  # timing in trace
+        assert "→" in r  # goal transition in trace
     finally:
         await hol_stop(session=session)
 
@@ -1680,9 +1680,7 @@ val _ = export_theory();
             theorem="conj_swap", file=str(test_file), session=session, trace=True
         )
         assert "Status: OK" in r
-        assert "Step 1" in r
-        # Should show goal count transitions
-        assert "-> 0" in r  # final step resolves all goals
+        assert "→0" in r  # final step resolves all goals
     finally:
         await hol_stop(session=session)
 
@@ -1782,9 +1780,7 @@ async def test_check_proof_absolute_lines_with_blank_line(tmp_path):
             theorem="second_thm", file=str(test_file), session=session, trace=True
         )
         assert "FAILED" in r
-        # First tactic is at line 15 (after blank line 14), NOT line 14
-        assert "line/col 15:" in r, f"Expected line 15 (first tactic), got: {r}"
-        # The suggested hol_state_at line must also be absolute
+        # The suggested hol_state_at line must be absolute (line 15, after blank line 14)
         assert "hol_state_at(line=15" in r, f"Suggested line should be 15: {r}"
     finally:
         await hol_stop(session=session)
@@ -1808,8 +1804,7 @@ async def test_check_proof_absolute_lines_normal(tmp_path):
             theorem="second_thm", file=str(test_file), session=session, trace=True
         )
         assert "FAILED" in r
-        # First tactic at line 14 (right after Proof on line 13)
-        assert "line/col 14:" in r, f"Expected line 14, got: {r}"
+        # hol_state_at hint should point to absolute line 14
         assert "hol_state_at(line=14" in r, f"Suggested line should be 14: {r}"
     finally:
         await hol_stop(session=session)
@@ -1817,8 +1812,9 @@ async def test_check_proof_absolute_lines_normal(tmp_path):
 
 @pytest.mark.asyncio
 async def test_check_proof_absolute_columns(tmp_path):
-    """hol_check_proof columns are absolute in the file, not relative to proof body.
+    """hol_check_proof no longer embeds line:col in trace, but hol_state_at does.
 
+    Verify that hol_state_at reports absolute columns for indented tactics.
     "  rpt strip_tac" is indented 2 spaces -> col 3 (1-indexed).
     """
     test_file = tmp_path / "normalproofScript.sml"
@@ -1826,12 +1822,12 @@ async def test_check_proof_absolute_columns(tmp_path):
     session = "abs_col_test"
 
     try:
-        r = await hol_check_proof(
-            theorem="second_thm", file=str(test_file), session=session, trace=True
+        r = await hol_state_at(
+            line=14, file=str(test_file), session=session
         )
         # "  rpt strip_tac" starts at col 3 (2 spaces + 'r')
         # Must NOT be col 1 (which would mean relative to stripped proof_body)
-        assert "14:3" in r, f"Expected col 3 for indented tactic, got: {r}"
+        assert "col 3" in r, f"Expected col 3 for indented tactic, got: {r}"
     finally:
         await hol_stop(session=session)
 
