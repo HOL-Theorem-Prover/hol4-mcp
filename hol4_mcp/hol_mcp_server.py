@@ -942,6 +942,8 @@ async def hol_state_at(
     session: str = "default",
     show_partial: bool = False,
     all_goals: bool = False,
+    context_before: int = 0,
+    context_after: int = 0,
 ) -> str:
     """Get proof state at a file position.
 
@@ -965,8 +967,10 @@ async def hol_state_at(
         show_partial: If True, show best-effort goals even when replay fails
                       before reaching the requested position (default: False)
         all_goals: If True, show all goals; otherwise only the top goal (default: False)
+        context_before: Number of preceding tactics to show on PROOF BROKEN (default: 0)
+        context_after: Number of following tactics to show on PROOF BROKEN (default: 0)
 
-    Returns: Tactic position (N/M), goals at that position, errors if any
+    Returns: Proof position, goals at that position, errors if any
     """
     cursor = await _get_cursor(session)
 
@@ -1044,15 +1048,19 @@ async def hol_state_at(
         )
         lines.append(f"ERROR: {result.error}")
 
-        # Show failing tactic and preceding context
+        # Show failing tactic and surrounding context when requested
         step_plan = cursor._step_plan if cursor else []
-        if fail_idx < len(step_plan):
+        if fail_idx < len(step_plan) and (context_before or context_after):
             lines.append("")
             lines.append("=== Failing tactic ===")
             lines.append(step_plan[fail_idx].text)
-            for i in range(max(0, fail_idx - 2), fail_idx):
+            for i in range(max(0, fail_idx - context_before), fail_idx):
                 lines.append("")
                 lines.append("--- Preceding tactic ---")
+                lines.append(step_plan[i].text)
+            for i in range(fail_idx + 1, min(len(step_plan), fail_idx + 1 + context_after)):
+                lines.append("")
+                lines.append("--- Following tactic ---")
                 lines.append(step_plan[i].text)
 
         lines.append("")
