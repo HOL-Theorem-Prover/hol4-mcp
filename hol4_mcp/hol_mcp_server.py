@@ -1052,7 +1052,7 @@ async def hol_state_at(
             lines.append(step_plan[fail_idx].text)
             for i in range(max(0, fail_idx - 2), fail_idx):
                 lines.append("")
-                lines.append(f"--- Preceding tactic {i} ---")
+                lines.append("--- Preceding tactic ---")
                 lines.append(step_plan[i].text)
 
         lines.append("")
