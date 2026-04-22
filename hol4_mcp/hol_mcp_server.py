@@ -942,8 +942,8 @@ async def hol_state_at(
     session: str = "default",
     show_partial: bool = False,
     all_goals: bool = False,
-    context_before: int = 3,
-    context_after: int = 3,
+    context_before: int = 0,
+    context_after: int = 0,
 ) -> str:
     """Get proof state at a file position.
 
@@ -968,9 +968,10 @@ async def hol_state_at(
                       before reaching the requested position (default: False)
         all_goals: If True, show all goals; otherwise only the top goal (default: False)
         context_before: On PROOF BROKEN, number of steps before the failing step
-                        to show in the step plan context (default: 3)
+                        to show in the step plan context (default: 0, off)
         context_after: On PROOF BROKEN, number of steps after the failing step
-                       to show in the step plan context (default: 3)
+                       to show in the step plan context (default: 0, off).
+                       Both default to 0 (suppressed); pass e.g. 3 to see context.
 
     When a proof is broken, the response includes an "=== Steps around failure ==="
     section showing the parsed step plan around the failed step. Steps are
