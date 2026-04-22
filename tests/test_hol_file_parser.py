@@ -8,6 +8,7 @@ from hol4_mcp.hol_file_parser import (
     parse_local_blocks,
     StepPlan, step_line_numbers, format_step_context,
     _needs_infix_parens, _frag_to_cmd,
+    parse_step_plan_output,
 )
 
 FIXTURES_DIR = Path(__file__).parent / "fixtures"
@@ -925,4 +926,140 @@ class TestFragToCmdInfix:
 
     def test_open_step_unchanged(self):
         assert _frag_to_cmd("open", "open_then1") == "ef(goalFrag.open_then1);"
+
+
+# Real goalfrag_step_plan_json outputs captured from HOL4, used to test
+# parse_step_plan_output + format_step_context with real parsed data.
+
+_REAL_JSON = {
+    # rpt strip_tac >> Induct_on `x` >- simp[] >- cheat >> fs[]
+    "then_chain_with_thenlt": (
+        '{"ok":[{"end":13,"type":"expand","text":"rpt strip_tac"},'
+        '{"end":30,"type":"expand","text":"Induct_on `x`"},'
+        '{"end":30,"type":"open","text":"open_then1"},'
+        '{"end":40,"type":"expand","text":"simp[]"},'
+        '{"end":40,"type":"close","text":"close_paren"},'
+        '{"end":40,"type":"open","text":"open_then1"},'
+        '{"end":49,"type":"expand","text":"cheat"},'
+        '{"end":49,"type":"close","text":"close_paren"},'
+        '{"end":57,"type":"expand","text":"fs[]"}]}'
+    ),
+    # >- strip_tac (no left operand — parsed as single Opaque)
+    "bare_infix": (
+        '{"ok":[{"end":12,"type":"expand","text":">- strip_tac"}]}'
+    ),
+    # simp[Once evaluate_def] >- strip_tac (properly decomposed)
+    "thenlt_decomposed": (
+        '{"ok":[{"end":23,"type":"expand","text":"simp[Once evaluate_def]"},'
+        '{"end":23,"type":"open","text":"open_then1"},'
+        '{"end":36,"type":"expand","text":"strip_tac"},'
+        '{"end":36,"type":"close","text":"close_paren"}]}'
+    ),
+    # rpt strip_tac >> Cases_on `x` >- simp[] >- fs[]
+    "two_arm_thenlt": (
+        '{"ok":[{"end":13,"type":"expand","text":"rpt strip_tac"},'
+        '{"end":29,"type":"expand","text":"Cases_on `x`"},'
+        '{"end":29,"type":"open","text":"open_then1"},'
+        '{"end":39,"type":"expand","text":"simp[]"},'
+        '{"end":39,"type":"close","text":"close_paren"},'
+        '{"end":39,"type":"open","text":"open_then1"},'
+        '{"end":47,"type":"expand","text":"fs[]"},'
+        '{"end":47,"type":"close","text":"close_paren"}]}'
+    ),
+    # strip_tac >- (simp[] >- fs[]) — inner >- not decomposed (parens make it atomic)
+    "nested_in_parens": (
+        '{"ok":[{"end":9,"type":"expand","text":"strip_tac"},'
+        '{"end":9,"type":"open","text":"open_then1"},'
+        '{"end":29,"type":"expand","text":"(simp[] >- fs[])"},'
+        '{"end":29,"type":"close","text":"close_paren"}]}'
+    ),
+}
+
+
+class TestParseStepPlan:
+    """Test parse_step_plan_output with real HOL4 JSON output."""
+
+    def test_then_chain_with_thenlt(self):
+        plan = parse_step_plan_output(_REAL_JSON["then_chain_with_thenlt"])
+        # 9 steps: 2 expands, open, expand, close, open, expand, close, expand
+        assert len(plan) == 9
+        assert plan[0] == StepPlan(end=13, kind="expand", text="rpt strip_tac")
+        assert plan[1] == StepPlan(end=30, kind="expand", text="Induct_on `x`")
+        assert plan[2] == StepPlan(end=30, kind="open", text="open_then1")
+        assert plan[3] == StepPlan(end=40, kind="expand", text="simp[]")
+        assert plan[4] == StepPlan(end=40, kind="close", text="close_paren")
+        assert plan[5] == StepPlan(end=40, kind="open", text="open_then1")
+        assert plan[6] == StepPlan(end=49, kind="expand", text="cheat")
+        assert plan[7] == StepPlan(end=49, kind="close", text="close_paren")
+        assert plan[8] == StepPlan(end=57, kind="expand", text="fs[]")
+
+    def test_bare_infix(self):
+        plan = parse_step_plan_output(_REAL_JSON["bare_infix"])
+        assert len(plan) == 1
+        assert plan[0] == StepPlan(end=12, kind="expand", text=">- strip_tac")
+
+    def test_thenlt_decomposed(self):
+        plan = parse_step_plan_output(_REAL_JSON["thenlt_decomposed"])
+        assert len(plan) == 4
+        assert plan[0] == StepPlan(end=23, kind="expand", text="simp[Once evaluate_def]")
+        assert plan[1] == StepPlan(end=23, kind="open", text="open_then1")
+        assert plan[2] == StepPlan(end=36, kind="expand", text="strip_tac")
+        assert plan[3] == StepPlan(end=36, kind="close", text="close_paren")
+
+    def test_two_arm_thenlt(self):
+        plan = parse_step_plan_output(_REAL_JSON["two_arm_thenlt"])
+        assert len(plan) == 8
+        # First arm: open_then1, simp[], close
+        assert plan[2] == StepPlan(end=29, kind="open", text="open_then1")
+        assert plan[3] == StepPlan(end=39, kind="expand", text="simp[]")
+        assert plan[4] == StepPlan(end=39, kind="close", text="close_paren")
+        # Second arm: open_then1, fs[], close
+        assert plan[5] == StepPlan(end=39, kind="open", text="open_then1")
+        assert plan[6] == StepPlan(end=47, kind="expand", text="fs[]")
+        assert plan[7] == StepPlan(end=47, kind="close", text="close_paren")
+
+    def test_nested_in_parens(self):
+        """Inner >- inside parens is not decomposed — stays as expand text."""
+        plan = parse_step_plan_output(_REAL_JSON["nested_in_parens"])
+        assert len(plan) == 4
+        assert plan[0] == StepPlan(end=9, kind="expand", text="strip_tac")
+        assert plan[1] == StepPlan(end=9, kind="open", text="open_then1")
+        assert plan[2] == StepPlan(end=29, kind="expand", text="(simp[] >- fs[])")
+        assert plan[3] == StepPlan(end=29, kind="close", text="close_paren")
+
+
+class TestFormatStepContextReal:
+    """Test format_step_context with real parsed step plans."""
+
+    def test_thenlt_cheat_failure(self):
+        plan = parse_step_plan_output(_REAL_JSON["then_chain_with_thenlt"])
+        # cheat at idx 6; all on line 1 for simplicity
+        lines = [1] * len(plan)
+        result = format_step_context(
+            plan, fail_idx=6, step_lines=lines,
+            context_before=1, context_after=1,
+        )
+        text = "\n".join(result)
+        assert "=== Failing tactic ===" in text
+        assert "cheat  <-- FAILED" in text
+        # Should show open/expand/close structure around the failing arm
+        assert "open_then1" in text
+        assert "close_paren" in text
+
+    def test_bare_infix_failure(self):
+        plan = parse_step_plan_output(_REAL_JSON["bare_infix"])
+        lines = [1]
+        result = format_step_context(plan, fail_idx=0, step_lines=lines)
+        assert result == ["", "=== Failing tactic ===", ">- strip_tac"]
+
+    def test_nested_parens_shows_atomic_text(self):
+        plan = parse_step_plan_output(_REAL_JSON["nested_in_parens"])
+        lines = [1] * len(plan)
+        result = format_step_context(
+            plan, fail_idx=2, step_lines=lines,
+            context_before=1, context_after=1,
+        )
+        text = "\n".join(result)
+        # The inner >- is not decomposed, shows as (simp[] >- fs[])
+        assert "(simp[] >- fs[])" in text
 
