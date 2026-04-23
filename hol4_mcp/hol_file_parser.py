@@ -128,11 +128,14 @@ def _frag_to_cmd(kind: str, text: str) -> str:
     """Wrap a fragment (type, text) into an SML ef() command string.
 
     - expand: ef(goalFrag.expand(<text>));  (parens added if text starts with >-)
+    - expand_list: ef(goalFrag.expand_list(<text>));  (for >~ pattern selectors)
     - open/mid/close: ef(goalFrag.<text>);
     """
     if kind == "expand":
         inner = f"({text})" if _needs_infix_parens(text) else text
         return f"ef(goalFrag.expand({inner}));"
+    elif kind == "expand_list":
+        return f"ef(goalFrag.expand_list({text}));"
     else:
         return f"ef(goalFrag.{text});"
 
@@ -166,7 +169,7 @@ def parse_prefix_commands_output(output: str) -> list[tuple[str, str]]:
 class StepPlan:
     """A step with its end offset and fragment data."""
     end: int       # End offset in proof body
-    kind: str      # Fragment type: "expand", "open", "mid", "close"
+    kind: str      # Fragment type: "expand", "expand_list", "open", "mid", "close"
     text: str      # Raw tactic text or goalFrag function name
 
     @property
@@ -202,6 +205,7 @@ def _offset_to_line(offset: int, content: str) -> int:
 _STEP_DISPLAY = {
     "open": ">-",
     "mid": ">>-",
+    "expand_list": ">~",  # >~[pat] >- tac shown as single step
 }
 
 
@@ -279,7 +283,13 @@ def format_steps(
 
         indent = "  " * depth
         marker = "  <-- FAILED" if i == fail_idx else ""
-        display = _STEP_DISPLAY.get(k, step.text)  # >-/>>- for structural, raw text for expand
+        if k == "expand_list":
+            # >~[pat] >- tac shown as single indented step
+            display = step.text
+        elif k in _STEP_DISPLAY:
+            display = _STEP_DISPLAY[k]  # >-/>>- for structural
+        else:
+            display = step.text  # raw tactic text for expand
 
         # Timing/goals annotation
         annotation = ""

@@ -375,3 +375,61 @@ class TestThenLTReexpand:
         ends = [s.end for s in result]
         for i in range(1, len(ends)):
             assert ends[i] >= ends[i-1], f"End offsets not monotonic at step {i}: {ends}"
+
+
+# =============================================================================
+# Step Plan: >~ (SELECT_GOAL_LT) decomposition
+# =============================================================================
+
+class TestGoalfragSelectGoalDecomposition:
+    """>~[pat] >- tac decomposes into expand_list steps (not bare expand)."""
+
+    async def test_select_goal_produces_expand_list(self, hol_session):
+        """>~[`Foo`] >- simp[] becomes a single expand_list step."""
+        result = await call_step_plan(hol_session, "Cases_on `x` >~ [`Foo`] >- simp[]")
+        # Should produce: expand(Cases_on), expand_list(Q.SELECT_GOAL_LT >- simp[])
+        assert len(result) == 2
+        assert result[0].kind == "expand"
+        assert result[0].text == "Cases_on `x`"
+        assert result[1].kind == "expand_list"
+        assert "Q.SELECT_GOAL_LT" in result[1].text
+        assert ">-" in result[1].text
+        assert "simp[]" in result[1].text
+
+    async def test_select_goal_cmd_uses_expand_list(self, hol_session):
+        """expand_list step generates goalFrag.expand_list command."""
+        result = await call_step_plan(hol_session, "Cases_on `x` >~ [`Foo`] >- simp[]")
+        assert "goalFrag.expand_list" in result[1].cmd
+        assert "goalFrag.expand_list" in result[1].cmd
+
+    async def test_multiple_select_goals(self, hol_session):
+        """Multiple >~ arms each become separate expand_list steps."""
+        result = await call_step_plan(
+            hol_session,
+            "Cases_on `x` >~ [`Foo`] >- simp[] >~ [`Bar`] >- simp[]"
+        )
+        # expand(Cases_on), expand_list(>~Foo>-simp), expand_list(>~Bar>-simp)
+        assert len(result) == 3
+        assert result[0].kind == "expand"
+        assert result[1].kind == "expand_list"
+        assert result[2].kind == "expand_list"
+        assert "`Foo`" in result[1].text
+        assert "`Bar`" in result[2].text
+
+    async def test_select_goal_end_offsets(self, hol_session):
+        """expand_list end offset covers the full >~ >- pattern."""
+        result = await call_step_plan(
+            hol_session,
+            "Cases_on `x` >~ [`Foo`] >- simp[]"
+        )
+        # expand_list end should be at end of "simp[]", which is after the pattern
+        assert result[1].end > result[0].end
+
+    async def test_select_goal_no_bare_pattern_expand(self, hol_session):
+        """>~ pattern does NOT produce a bare expand step with just the pattern text."""
+        result = await call_step_plan(hol_session, "Cases_on `x` >~ [`Foo`] >- simp[]")
+        # No step should have kind="expand" and text that is just a pattern list
+        for step in result:
+            if step.kind == "expand":
+                assert not step.text.startswith("[`"), \
+                    f"Bare pattern expand step found: {step.text}"

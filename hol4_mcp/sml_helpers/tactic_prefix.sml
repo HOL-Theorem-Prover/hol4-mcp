@@ -22,6 +22,7 @@ load "TacticParse";
 load "HOLSourceParser";
 load "smlExecute";
 load "markerLib";
+load "Q";
 
 (* Parse a tactic string to a tac_expr.
    TacticParse.parseTacticBlock now expects HOLSourceAST.exp (not string).
@@ -159,8 +160,10 @@ fun altSpan (TacticParse.Subgoal (s, e)) = SOME (s, e)
   | altSpan (TacticParse.LSelectGoals p) = SOME p
   | altSpan _ = NONE
 
-(* Extract fragment type: "expand", "open", "mid", or "close" *)
-fun frag_type (TacticParse.FAtom _) = "expand"
+(* Extract fragment type: "expand", "open", "mid", "close", or "select" *)
+fun frag_type (TacticParse.FAtom (TacticParse.LSelectGoal _)) = "select"
+  | frag_type (TacticParse.FAtom (TacticParse.LSelectGoals _)) = "selects"
+  | frag_type (TacticParse.FAtom _) = "expand"
   | frag_type (TacticParse.FFOpen _) = "open"
   | frag_type (TacticParse.FFMid _) = "mid"
   | frag_type (TacticParse.FFClose _) = "close"
@@ -231,9 +234,62 @@ fun reexpand_thenlt_frags frags =
           else go rest (f :: acc)
   in go frags [] end
 
+(* merge_select_steps: Post-process step list to merge LSelectGoal/LSelectGroups
+   "select"/"selects" steps with their following bracket into a single "expand_list"
+   step. >~[`Foo`] >- simp[] is NOT decomposable into individual ef() steps
+   because SELECT_GOAL_LT is a list_tactic, not a tactic. It must be executed
+   via goalFrag.expand_list as a single combined step.
+   Pattern: select/selects, [open_then1|open_first] expand close -> expand_list
+   For the combined text: Q.SELECT_GOAL_LT pat >- tac  (or Q.SELECT_GOALS_LT) *)
+fun isSelectKind "select" = true
+  | isSelectKind "selects" = true
+  | isSelectKind _ = false
+
+fun merge_select_steps [] acc = rev acc
+  | merge_select_steps ((endP, kind, patText) :: rest) acc =
+      if isSelectKind kind then
+        let
+          (* Collect consecutive select steps (for >~ >>~ patterns) *)
+          fun collectSelects ([]: (int * string * string) list) sels =
+                (rev sels, [])
+            | collectSelects ((ep, k, t) :: rest') sels =
+                if isSelectKind k then collectSelects rest' (t :: sels)
+                else (rev sels, (ep, k, t) :: rest')
+          val (sels, afterSels) = collectSelects rest [patText]
+          (* Build the SELECT_GOAL_LT/SELECT_GOALS_LT prefix *)
+          fun mkSelectPrefix [] = ""  (* shouldn't happen *)
+            | mkSelectPrefix [p] = "Q.SELECT_GOAL_LT " ^ p
+            | mkSelectPrefix (p :: ps) = "Q.SELECT_GOAL_LT " ^ p ^ " >>~ Q.SELECT_GOALS_LT " ^
+                String.concatWith " >>~ Q.SELECT_GOALS_LT " ps
+          val selectPrefix = mkSelectPrefix sels
+          (* Try to consume the following bracket: open expand close *)
+          fun tryConsumeBracket [] = NONE
+            | tryConsumeBracket ((_, "open", "open_then1") ::
+                                (tacEnd, "expand", tacText) ::
+                                (_, "close", _) :: rest') =
+                SOME (selectPrefix ^ " >- " ^ tacText, tacEnd, rest')
+            | tryConsumeBracket ((_, "open", "open_first") ::
+                                (tacEnd, "expand", tacText) ::
+                                (_, "close", _) :: rest') =
+                SOME (selectPrefix ^ " >- " ^ tacText, tacEnd, rest')
+            | tryConsumeBracket _ = NONE
+        in
+          case tryConsumeBracket afterSels of
+            SOME (combinedText, tacEnd, rest') =>
+              merge_select_steps rest' ((tacEnd, "expand_list", combinedText) :: acc)
+          | NONE =>
+              (* No following bracket — skip the invalid select step entirely *)
+              merge_select_steps afterSels acc
+        end
+      else
+        merge_select_steps rest ((endP, kind, patText) :: acc)
+
 (* goalfrag_step_plan: Generate fragment steps from linearize fragments.
    Returns (end_offset, type, text) triples for every navigable position.
-   Every fragment boundary is a step boundary -- no heuristics needed. *)
+   Every fragment boundary is a step boundary -- no heuristics needed.
+   LSelectGoal/LSelectGroups fragments are merged with their following
+   bracket into a single expand_list step (SELECT_GOAL_LT requires
+   goalFrag.expand_list, not goalFrag.expand). *)
 fun goalfrag_step_plan proofBody =
   let
     val tree = parseTacticBlockFromString proofBody
@@ -262,8 +318,9 @@ fun goalfrag_step_plan proofBody =
             then assignEnds rest newLast ((endPos, t, x) :: acc)
             else assignEnds rest lastAtomEnd acc
           end
+    val rawSteps = assignEnds flatFrags 0 []
   in
-    assignEnds flatFrags 0 []
+    merge_select_steps rawSteps []
   end
 
 fun goalfrag_step_plan_json proofBody =
@@ -350,8 +407,23 @@ fun goalfrag_prefix_commands proofBody endOffset =
           extractFrags sliceFrags []
         end
     | NONE =>
-      (* At a fragment boundary: collect all complete frags up to endOffset *)
-      collectFrags flatFrags 0 []
+      (* At a fragment boundary: collect all complete frags up to endOffset,
+         then merge select steps into expand_list steps *)
+      let val rawFrags = collectFrags flatFrags 0 []
+          fun isSelKind ("select", _) = true
+            | isSelKind ("selects", _) = true
+            | isSelKind _ = false
+          fun mergePrefixSelects [] acc = rev acc
+            | mergePrefixSelects ((kind, pat) :: rest) acc =
+                if isSelKind (kind, pat) then
+                  (case rest of
+                     ("open", _) :: ("expand", tac) :: ("close", _) :: rest' =>
+                       mergePrefixSelects rest'
+                         (("expand_list", "Q.SELECT_GOAL_LT " ^ pat ^ " >- " ^ tac) :: acc)
+                   | _ => (* no bracket - skip invalid select step *)
+                       mergePrefixSelects rest acc)
+                else mergePrefixSelects rest ((kind, pat) :: acc)
+      in mergePrefixSelects rawFrags [] end
   end
 
 fun goalfrag_prefix_commands_json proofBody endOffset =
