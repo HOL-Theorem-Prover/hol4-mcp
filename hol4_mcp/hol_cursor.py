@@ -349,6 +349,12 @@ class FileProofCursor:
         # Active theorem state
         self._active_theorem: str | None = None
         self._step_plan: list[StepPlan] = []  # Step boundaries aligned with e() commands
+        # Hash of self._content at which _step_plan was computed. If it diverges
+        # from self._content_hash, _step_plan is stale — _compute_target must
+        # reparse. Prevents stale-plan drift when _reparse_if_changed runs via
+        # a non-state_at caller (e.g. cursor.status for hol_sessions) and
+        # updates _content_hash without re-running goalfrag_step_plan_json.
+        self._step_plan_hash: str = ""
         self._pos = SessionPosition()  # Where HOL session is (updated atomically by state_at)
 
         # What's been loaded into HOL
@@ -528,6 +534,7 @@ class FileProofCursor:
         self._pos = SessionPosition()
         self._active_theorem = None
         self._step_plan = []
+        self._step_plan_hash = ""
         self._needs_session_reinit = False
 
         # Re-run full initialization to rebuild deps/context/checkpoints
@@ -1411,6 +1418,7 @@ class FileProofCursor:
                 return {"error": f"Failed to parse step plan: {e}"}
         else:
             self._step_plan = []
+        self._step_plan_hash = self._content_hash
 
         self._active_theorem = name
         self._pos = SessionPosition()  # Reset position for new theorem
@@ -1785,8 +1793,13 @@ class FileProofCursor:
         On file change, invalidates checkpoints, reparses step plan, and computes
         incremental diff for optimization. Returns _TargetInfo or error StateAtResult.
         """
+        # Reparse step plan if content changed since state_at last ran (changed=True)
+        # OR if the step plan is stale relative to current content (drift — can happen
+        # when a non-state_at caller like cursor.status ran _reparse_if_changed and
+        # advanced _content_hash without updating _step_plan).
+        needs_reparse = changed or self._step_plan_hash != self._content_hash
         incremental_update = None
-        if changed:
+        if needs_reparse:
             incremental_update = await self._reparse_steps_on_edit(thm)
             if isinstance(incremental_update, StateAtResult):
                 return incremental_update
@@ -1873,6 +1886,7 @@ class FileProofCursor:
                 )
         else:
             self._step_plan = []
+        self._step_plan_hash = self._content_hash
 
         # Commands that match produce identical proof state.
         # Keep the common prefix, redo from first divergence.
