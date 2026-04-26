@@ -19,7 +19,7 @@ from datetime import datetime
 from pathlib import Path
 from typing import Optional
 
-from fastmcp import FastMCP, Context
+from fastmcp import FastMCP
 
 from .hol_session import HOLSession, HOLDIR
 from .hol_cursor import FileProofCursor
@@ -625,7 +625,7 @@ _PROGRESS_INTERVAL = 10  # seconds
 
 
 @mcp.tool()
-async def holmake(workdir: str, target: str = None, env: dict = None, log_limit: int = 1024, timeout: int = 90, heap_size: int = 12288, jobs: int = None, ctx: Context = None) -> str:
+async def holmake(workdir: str, target: str = None, env: dict = None, log_limit: int = 1024, timeout: int = 90, heap_size: int = 12288, jobs: int = None) -> str:
     """Run Holmake --qof in directory.
 
     Args:
@@ -638,9 +638,6 @@ async def holmake(workdir: str, target: str = None, env: dict = None, log_limit:
         jobs: Max parallel jobs (-j flag). Default from HOL4_MCP_HOLMAKE_JOBS env var, or 1.
 
     Returns: Holmake output (stdout + stderr). On failure, includes recent build logs.
-
-    Note: For builds > 60s, progress notifications are sent every 10s to prevent
-    MCP client timeout. Configure tool_timeout_sec in ~/.codex/config.toml if needed.
     """
     # Validate limits
     timeout = max(1, min(timeout, 1800))
@@ -691,7 +688,9 @@ async def holmake(workdir: str, target: str = None, env: dict = None, log_limit:
             start_new_session=True,
         )
 
-        # Poll with progress reporting to prevent MCP client timeout
+        # Poll stdout. Progress notifications were removed: a notification
+        # in flight when the response is emitted races on the wire and the
+        # client tears down the stdio transport on the late progressToken.
         start_time = time.time()
         stdout_chunks = []
         timed_out = False
@@ -702,18 +701,6 @@ async def holmake(workdir: str, target: str = None, env: dict = None, log_limit:
                 timed_out = True
                 break
 
-            # Report progress to reset client timeout (MCP resetTimeoutOnProgress)
-            if ctx:
-                try:
-                    await ctx.report_progress(
-                        progress=elapsed,
-                        total=float(timeout),
-                        message=f"Building... {int(elapsed)}s / {timeout}s"
-                    )
-                except Exception:
-                    pass  # Don't fail build if progress reporting fails
-
-            # Wait for output or timeout after interval
             try:
                 chunk = await asyncio.wait_for(
                     proc.stdout.read(4096),
