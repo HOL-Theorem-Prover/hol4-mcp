@@ -241,7 +241,7 @@ class TestThenLTReexpand:
     """ThenLT inside >> chains: reexpand to get open/close decomposition.
 
     linearize's `asTac` skips bracketing when `one=true` (inside Then list),
-    collapsing >- into a single FAtom. reexpand_thenlt_frags detects these
+    collapsing >- into a single FAtom. reexpand_group_atoms detects these
     and re-linearizes the ThenLT AST at the top level to get proper decomposition.
 
     Subgoal-based ThenLT (by/sg) is NOT re-expanded because `Subgoal \`Q\``
@@ -302,21 +302,43 @@ class TestThenLTReexpand:
         assert result[1].kind == "open"
 
     async def test_thenlt_multi_step_arm_in_chain(self, hol_session):
-        """>- with multi-step arm inside >> chain decomposes."""
+        """>- with multi-step arm inside >> chain decomposes fully."""
         result = await call_step_plan(
             hol_session,
             "conj_tac >- (simp[] >> ACCEPT_TAC) >> fs[]"
         )
-        # conj_tac, open_then1, (simp[] >> ACCEPT_TAC), close_paren, fs[]
-        assert len(result) == 5, f"Expected 5 steps, got {len(result)}: {[s.text for s in result]}"
+        # conj_tac, open_then1, simp[], ACCEPT_TAC, close_paren, fs[]
+        assert len(result) == 6, f"Expected 6 steps, got {len(result)}: {[s.text for s in result]}"
+        assert result[0].kind == "expand" and "conj_tac" in result[0].text
         assert result[1].kind == "open"
-        assert result[3].kind == "close"
+        assert result[2].kind == "expand" and "simp" in result[2].text
+        assert result[3].kind == "expand" and "ACCEPT" in result[3].text
+        assert result[4].kind == "close"
+        assert result[5].kind == "expand" and result[5].text == "fs[]"
 
     async def test_then_chain_without_thenlt_unchanged(self, hol_session):
         """Pure >> chain without >-/by is not affected by reexpand."""
         result = await call_step_plan(hol_session, "conj_tac >> simp[] >> fs[]")
         assert len(result) == 3
         assert all(s.kind == "expand" for s in result)
+
+    async def test_nested_thenlt_with_then_chain(self, hol_session):
+        """>- inside >- with >> chain decomposes recursively."""
+        result = await call_step_plan(
+            hol_session,
+            "conj_tac >- (strip_tac >> simp[] >> strip_tac >- conj_tac)"
+        )
+        # conj_tac, open, strip_tac, simp[], strip_tac, open, conj_tac, close, close
+        assert len(result) == 9, f"Expected 9 steps, got {len(result)}: {[s.text for s in result]}"
+        assert result[0].kind == "expand" and "conj_tac" in result[0].text
+        assert result[1].kind == "open"
+        assert result[2].text == "strip_tac"
+        assert result[3].text == "simp[]"
+        assert result[4].text == "strip_tac"
+        assert result[5].kind == "open"  # inner >- open
+        assert result[6].text == "conj_tac"
+        assert result[7].kind == "close"  # inner >- close
+        assert result[8].kind == "close"  # outer >- close
 
     async def test_thenlt_at_start_of_chain(self, hol_session):
         """>- as the first element in a >> chain decomposes."""

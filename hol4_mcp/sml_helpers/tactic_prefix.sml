@@ -199,34 +199,47 @@ fun fragEnd (TacticParse.FAtom a) =
        | _ => 0)
   | fragEnd _ = 0  (* structural frag -- caller assigns position *)
 
-(* Re-expand ThenLT atoms that linearize left atomic inside >> chains.
-   linearize's `asTac` skips bracketing when `one=true` (inside Then list),
-   collapsing >-/by into a single FAtom(ThenLT _). We detect these and
-   re-linearize the ThenLT AST directly at the top level so it gets proper
-   open/close decomposition.
+(* Re-expand Group atoms that linearize left atomic inside brackets.
+   linearize's `asTac` skips bracketing when `one=true` (inside ThenLT/First/etc
+   bracket), collapsing compound expressions (Then, ThenLT, First, etc.) into
+   single FAtom(Group(_, _, _)). After flatten_frags unwraps the outer bracket,
+   these Group atoms appear as flat FAtom steps with undecomposed content.
+   We detect them and re-linearize the Group's inner AST so it gets proper
+   step decomposition.
    The AST already has correct spans from the original parse, no offset shift.
-   Subgoal atoms (\`Q\`) get "sg " prefix in frag_text so they become valid tactics
-   (sg \`Q\`) that goalFrag.expand can execute. *)
-fun reexpand_thenlt_frags frags =
+   Must run AFTER flatten_frags so Group atoms are at the top level (not inside
+   FGroup/FBracket containers where they're invisible to the scan).
+   Recursively re-expands: subFrags from re-linearization may themselves contain
+   Group atoms (e.g., nested >- inside >> inside >-).
+   Subgoal atoms (\`Q`) get "sg " prefix in frag_text so they become valid tactics
+   (sg \`Q`) that goalFrag.expand can execute. *)
+fun reexpand_group_atoms frags =
   let
-    fun isThenLTatom (TacticParse.FAtom (TacticParse.ThenLT _)) = true
-      | isThenLTatom (TacticParse.FAtom (TacticParse.Group (_, _, TacticParse.ThenLT _))) = true
-      | isThenLTatom _ = false
-    fun getThenLT (TacticParse.FAtom (TacticParse.ThenLT (base, arms))) =
-          TacticParse.ThenLT (base, arms)
-      | getThenLT (TacticParse.FAtom (TacticParse.Group (_, _, TacticParse.ThenLT (base, arms)))) =
-          TacticParse.ThenLT (base, arms)
-      | getThenLT _ = raise Match
+    (* Only re-expand Group atoms containing compound expressions (Then, ThenLT, etc.)
+       that produce useful navigable sub-steps. Single-step wrappers like Repeat,
+       Try, LNullOk etc. should stay atomic — their open/close structure adds
+       navigation overhead without useful intermediate goal states. *)
+    fun isComposable (TacticParse.Then _) = true
+      | isComposable (TacticParse.ThenLT _) = true
+      | isComposable (TacticParse.LThen1 _) = true
+      | isComposable (TacticParse.LThenLT _) = true
+      | isComposable (TacticParse.Group _) = true  (* peels outer wrapper; inner expr is checked by recursion *)
+      | isComposable _ = false
+    fun isGroupAtom (TacticParse.FAtom (TacticParse.Group (_, _, e))) =
+          isComposable e
+      | isGroupAtom _ = false
+    fun getGroupExpr (TacticParse.FAtom (TacticParse.Group (_, _, e))) = e
+      | getGroupExpr _ = raise Match
     fun reexpand f =
           let
-            val expr = getThenLT f
+            val expr = getGroupExpr f
             fun isAtom e = Option.isSome (TacticParse.topSpan e)
             val subFrags = TacticParse.linearize isAtom expr
-          in flatten_frags subFrags end
+          in reexpand_group_atoms (flatten_frags subFrags) end
       | reexpand frag = [frag]
     fun go [] acc = rev acc
       | go (f :: rest) acc =
-          if isThenLTatom f
+          if isGroupAtom f
           then go rest (rev (reexpand f) @ acc)
           else go rest (f :: acc)
   in go frags [] end
@@ -292,8 +305,8 @@ fun goalfrag_step_plan proofBody =
     val tree = parseTacticBlockFromString proofBody
     fun isAtom e = Option.isSome (TacticParse.topSpan e)
     val rawFrags = TacticParse.linearize isAtom tree
-    val reexpanded = reexpand_thenlt_frags rawFrags
-    val flatFrags = flatten_frags reexpanded
+    val flatFrags = flatten_frags rawFrags
+    val reexpanded = reexpand_group_atoms flatFrags
 
     (* Assign end offsets: walk the flat list, tracking the last FAtom end.
        Structural frags (FOpen/FFMid/FFClose) get the end of the PREVIOUS atom.
@@ -315,7 +328,7 @@ fun goalfrag_step_plan proofBody =
             then assignEnds rest newLast ((endPos, t, x) :: acc)
             else assignEnds rest lastAtomEnd acc
           end
-    val rawSteps = assignEnds flatFrags 0 []
+    val rawSteps = assignEnds reexpanded 0 []
   in
     merge_select_steps rawSteps []
   end
