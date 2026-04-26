@@ -809,7 +809,7 @@ class TestFormatStepContext:
         plan = self._make_plan()
         lines = self._make_lines(plan)
         result = format_step_context(plan, fail_idx=4, step_lines=lines)
-        assert result == ["", "=== Failing tactic ===", "cheat"]
+        assert result == ["", "=== Failing tactic ===", "cheat", "Opaque tactic — cannot inspect inside of cheat. Use Suspend/Resume or extract as a lemma."]
 
     def test_then_chain_no_nesting(self):
         """>> chain tactics should be at the same depth (sequential, not nested)."""
@@ -849,7 +849,7 @@ class TestFormatStepContext:
             context_before=0, context_after=0,
         )
         # Just the failing tactic header (no context_before/after for steps section)
-        assert result == ["", "=== Failing tactic ===", "fs[]"]
+        assert result == ["", "=== Failing tactic ===", "fs[]", "Opaque tactic — cannot inspect inside of fs[]. Use Suspend/Resume or extract as a lemma."]
 
         # With context, see indentation
         result = format_step_context(
@@ -875,7 +875,7 @@ class TestFormatStepContext:
         lines = self._make_lines(plan)
         # fail_idx=3 is an expand step (simp[])
         result = format_step_context(plan, fail_idx=3, step_lines=lines)
-        assert result == ["", "=== Failing tactic ===", "simp[]"]
+        assert result == ["", "=== Failing tactic ===", "simp[]", "Opaque tactic — cannot inspect inside of simp[]. Use Suspend/Resume or extract as a lemma."]
 
     def test_fail_on_open_shows_arrow(self):
         plan = self._make_plan()
@@ -1251,7 +1251,7 @@ class TestFormatStepContextReal:
         plan = parse_step_plan_output(_REAL_JSON["bare_infix"])
         lines = [1]
         result = format_step_context(plan, fail_idx=0, step_lines=lines)
-        assert result == ["", "=== Failing tactic ===", ">- strip_tac"]
+        assert result == ["", "=== Failing tactic ===", ">- strip_tac", "Opaque tactic — cannot inspect inside of >- strip_tac. Use Suspend/Resume or extract as a lemma."]
 
     def test_nested_parens_shows_atomic_text(self):
         plan = parse_step_plan_output(_REAL_JSON["nested_in_parens"])

@@ -299,9 +299,12 @@ def format_step_context(
         return []
 
     failing_text = step_plan[fail_idx].text
+    failing_kind = step_plan[fail_idx].kind
     # Use structural display name if it's an open/mid step
-    failing_display = _STEP_DISPLAY.get(step_plan[fail_idx].kind, failing_text)
+    failing_display = _STEP_DISPLAY.get(failing_kind, failing_text)
     out = ["", "=== Failing tactic ===", failing_display]
+    if failing_kind in ("expand", "expand_list"):
+        out.append(f"Opaque tactic — cannot inspect inside of {failing_display}. Use Suspend/Resume or extract as a lemma.")
 
     if context_before <= 0 and context_after <= 0:
         return out
