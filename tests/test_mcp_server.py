@@ -1945,12 +1945,12 @@ async def test_by_substep_pinpoints_tactic_failure(tmp_path):
         await hol_stop(session=session)
 
 
-async def test_state_at_incremental_need_partial_after_edit(tmp_path):
-    """After editing proof, need_partial position uses incremental instead of prefix replay.
+async def test_state_at_incrementalmid_step_after_edit(tmp_path):
+    """After editing proof, mid-step position uses incremental to nearest boundary.
 
-    Previously need_partial gated out the incremental path, forcing expensive
-    _try_prefix_at calls. Now incremental (backup + play forward) handles it,
-    landing at the nearest step boundary with accurate tactics_replayed.
+    GOALFRAG makes step boundaries granular (every fragment), so mid-step
+    positions just land at the nearest step boundary via incremental
+    (backup + play forward) with accurate tactics_replayed.
     """
     test_file = tmp_path / "incr_npScript.sml"
     test_file.write_text(
@@ -1977,13 +1977,11 @@ async def test_state_at_incremental_need_partial_after_edit(tmp_path):
         content = test_file.read_text()
         test_file.write_text(content.replace('>> simp[]\nQED', '>> fs[]\nQED'))
 
-        # Request state inside a step (need_partial=True)
+        # Request state inside a step
         # col=10 lands inside "conj_tac >-" which is a multi-char step
         result = await hol_state_at(session="incr_np", line=8, col=10)
 
-        # Key assertion: should NOT report "tactic 1/N broken" with no goals
-        # (the old _try_prefix_at + binary search path that gave tactics_replayed=0)
-        # Instead, incremental lands at the nearest step boundary with correct goals.
+        # Incremental lands at the nearest step boundary with correct goals.
         if "PROOF BROKEN" not in result:
             # Proof works — goals should be visible
             assert "Goal" in result or "Goals" in result or "No goals" in result, \

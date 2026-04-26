@@ -12,9 +12,6 @@
    Usage:
      goalfrag_step_plan_json "rpt strip_tac >> simp[] >> fs[]";
      => {"ok":[{"end":9,"type":"expand","text":"rpt strip_tac"}, ...]}
-
-     goalfrag_prefix_commands_json "strip_tac >- (simp[])" 15;
-     => {"ok":[{"type":"expand","text":"strip_tac"},{"type":"open","text":"open_then1"}]}
 *)
 
 (* Load dependencies *)
@@ -331,109 +328,6 @@ fun goalfrag_step_plan_json proofBody =
     val stepsJson = "[" ^ String.concatWith "," (map stepToJson steps) ^ "]"
   in
     print (json_ok stepsJson ^ "\n")
-  end
-  handle e => print (json_err (exnMessage e) ^ "\n");
-
-(* goalfrag_prefix_commands: Generate fragment list to replay up to an offset.
-   Returns (type, text) pairs. Python wraps with ef(goalFrag.*()).
-   For positions at fragment boundaries, collect complete fragments.
-   For positions inside an FAtom span, use sliceTacticBlock to extract
-   the sliced tactic text directly from spans. *)
-fun goalfrag_prefix_commands proofBody endOffset =
-  let
-    val tree = parseTacticBlockFromString proofBody
-    val fullEnd = String.size proofBody
-    val defaultSpan = (0, fullEnd)
-    fun isAtom e = Option.isSome (TacticParse.topSpan e)
-    val rawFrags = TacticParse.linearize isAtom tree
-    val reexpanded = reexpand_thenlt_frags rawFrags
-    val flatFrags = flatten_frags reexpanded
-
-    (* Find the FAtom whose span contains endOffset *)
-    fun findPartialAtom [] = NONE
-      | findPartialAtom (TacticParse.FAtom a :: rest) =
-          (case TacticParse.topSpan a of
-             SOME (start, endP) =>
-               if endOffset > start andalso endOffset < endP
-               then SOME (start, endP)  (* inside this atom *)
-               else findPartialAtom rest
-           | NONE => findPartialAtom rest)
-      | findPartialAtom (_ :: rest) = findPartialAtom rest
-
-    (* Collect (type, text) for all complete fragments up to endOffset *)
-    fun collectFrags [] _ acc = rev acc
-      | collectFrags (TacticParse.FAtom a :: rest) lastEnd acc =
-          (case TacticParse.topSpan a of
-             SOME (_, endP) =>
-               if endP <= endOffset
-               then
-                 let val t = frag_type (TacticParse.FAtom a)
-                     val x = frag_text proofBody (TacticParse.FAtom a)
-                 in collectFrags rest endP
-                    (if String.size x > 0 then (t, x) :: acc else acc) end
-               else rev acc  (* past the target -- done *)
-           | NONE => collectFrags rest lastEnd acc)
-      | collectFrags (f :: rest) lastEnd acc =
-          if lastEnd <= endOffset
-          then
-            let val t = frag_type f
-                val x = frag_text proofBody f
-            in collectFrags rest lastEnd
-               (if String.size x > 0 then (t, x) :: acc else acc) end
-          else rev acc
-
-    val partialAtom = findPartialAtom flatFrags
-  in
-    case partialAtom of
-      SOME (start, endP) =>
-        (* Inside an FAtom: use sliceTacticBlock to get valid fragments up to
-           endOffset. Walk the slice fragments and emit (type, text) pairs.
-           Uses frag_type/frag_text to emit (type, text) pairs. *)
-        let
-          val sliceFrags = TacticParse.sliceTacticBlock 0 endOffset false defaultSpan tree
-          (* Flatten the list-of-groups into individual fragments *)
-          fun extractFrags [] acc = rev acc
-            | extractFrags (group :: rest) acc =
-                let fun walk [] acc = acc
-                      | walk (f :: fs) acc =
-                          let val t = frag_type f
-                              val x = frag_text proofBody f
-                          in if String.size x > 0
-                             then walk fs ((t, x) :: acc)
-                             else walk fs acc
-                          end
-                in extractFrags rest (walk group acc) end
-        in
-          extractFrags sliceFrags []
-        end
-    | NONE =>
-      (* At a fragment boundary: collect all complete frags up to endOffset,
-         then merge select steps into expand_list steps *)
-      let val rawFrags = collectFrags flatFrags 0 []
-          fun isSelKind ("select", _) = true
-            | isSelKind ("selects", _) = true
-            | isSelKind _ = false
-          fun mergePrefixSelects [] acc = rev acc
-            | mergePrefixSelects ((kind, pat) :: rest) acc =
-                if isSelKind (kind, pat) then
-                  (case rest of
-                     ("open", _) :: ("expand", tac) :: ("close", _) :: rest' =>
-                       mergePrefixSelects rest'
-                         (("expand_list", "Q.SELECT_GOAL_LT " ^ pat ^ " >- " ^ tac) :: acc)
-                   | _ => (* no bracket - skip invalid select step *)
-                       mergePrefixSelects rest acc)
-                else mergePrefixSelects rest ((kind, pat) :: acc)
-      in mergePrefixSelects rawFrags [] end
-  end
-
-fun goalfrag_prefix_commands_json proofBody endOffset =
-  let
-    val frags = goalfrag_prefix_commands proofBody endOffset
-    fun fragToJson (t, x) =
-      "{\"type\":" ^ json_string t ^ ",\"text\":" ^ json_string x ^ "}"
-    val fragsJson = "[" ^ String.concatWith "," (map fragToJson frags) ^ "]"
-  in
-    print (json_ok fragsJson ^ "\n")
   end
   handle e => print (json_err (exnMessage e) ^ "\n");
 

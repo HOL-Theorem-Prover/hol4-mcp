@@ -140,31 +140,6 @@ def _frag_to_cmd(kind: str, text: str) -> str:
         return f"ef(goalFrag.{text});"
 
 
-def parse_prefix_commands_output(output: str) -> list[tuple[str, str]]:
-    """Parse JSON output from goalfrag_prefix_commands_json.
-
-    Expects: {"ok":[{"type":"expand","text":"strip_tac"},...]} or {"err":"message"}
-    Returns: list of (type, text) fragment pairs.
-    Raises: HOLParseError if HOL4 returned an error or output is malformed.
-    """
-    result = _find_json_line(output, "goalfrag_prefix_commands_json")
-
-    if 'ok' in result:
-        try:
-            frags = []
-            for item in result['ok']:
-                t = str(item['type'])
-                x = str(item['text'])
-                frags.append((t, x))
-            return frags
-        except (TypeError, ValueError, KeyError) as e:
-            raise HOLParseError(f"Malformed prefix commands in output: {e}") from e
-    elif 'err' in result:
-        raise HOLParseError(f"goalfrag_prefix_commands_json: {result['err']}")
-    else:
-        raise HOLParseError(f"Unexpected JSON structure: {result}")
-
-
 @dataclass
 class StepPlan:
     """A step with its end offset and fragment data."""

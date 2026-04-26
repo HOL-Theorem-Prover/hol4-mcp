@@ -1,4 +1,4 @@
-"""Tests for tactic_prefix.sml functions (goalfrag_step_plan, goalfrag_prefix_commands).
+"""Tests for tactic_prefix.sml functions (goalfrag_step_plan).
 
 Tests the GOALFRAG-based proof navigation: every TacticParse.linearize fragment
 is a step, FOpen/FFMid/FFClose are natively steppable via ef().
@@ -9,7 +9,7 @@ import json
 from pathlib import Path
 
 from hol4_mcp.hol_session import HOLSession, escape_sml_string
-from hol4_mcp.hol_file_parser import parse_prefix_commands_output, parse_step_plan_output
+from hol4_mcp.hol_file_parser import parse_step_plan_output
 
 FIXTURES_DIR = Path(__file__).parent / "fixtures"
 SML_HELPERS_DIR = Path(__file__).parent.parent / "hol4_mcp" / "sml_helpers"
@@ -33,11 +33,6 @@ async def call_step_plan(session: HOLSession, tactic_str: str):
     return parse_step_plan_output(result)
 
 
-async def call_prefix_commands(session: HOLSession, tactic_str: str, offset: int) -> str:
-    """Call goalfrag_prefix_commands_json and parse the result."""
-    escaped = escape_sml_string(tactic_str)
-    result = await session.send(f'goalfrag_prefix_commands_json "{escaped}" {offset};', timeout=10)
-    return parse_prefix_commands_output(result)
 
 
 # =============================================================================
@@ -170,37 +165,6 @@ class TestGoalfragExecutionCorrectness:
         # Verify proof completed
         r = await hol_session.send('top_thm();', timeout=10)
         assert "T ∧ T" in r
-
-
-# =============================================================================
-# Prefix commands
-# =============================================================================
-
-class TestGoalfragPrefixCommands:
-    """Tests for goalfrag_prefix_commands_json — generating ef() prefix for partial offsets."""
-
-    async def test_full_prefix(self, hol_session):
-        """Prefix at end returns all fragment pairs."""
-        tactic = "a >> b >> c"
-        result = await call_prefix_commands(hol_session, tactic, 100)
-        # Result is list of (type, text) tuples
-        assert len(result) == 3
-        assert result[0] == ("expand", "a")
-        assert result[1] == ("expand", "b")
-        assert result[2] == ("expand", "c")
-
-    async def test_partial_prefix(self, hol_session):
-        """Prefix at a mid-point returns fragments up to that offset."""
-        tactic = "simp[] >> rpt strip_tac >> gvs[]"
-        result = await call_prefix_commands(hol_session, tactic, 6)
-        # offset 6 is inside "rpt strip_tac" (partial atom)
-        # Should get: (expand, "simp[]"), (expand, "rpt ") — sliced prefix
-        assert len(result) >= 1
-        assert result[0] == ("expand", "simp[]")
-        # Second entry is the partial atom (sliced text)
-        if len(result) > 1:
-            assert result[1][0] == "expand"
-            assert "rpt" in result[1][1]
 
 
 # =============================================================================

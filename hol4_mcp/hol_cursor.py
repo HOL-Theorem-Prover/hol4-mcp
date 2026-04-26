@@ -11,8 +11,7 @@ from .hol_file_parser import (
     TheoremInfo, parse_theorems, LocalBlock, parse_local_blocks,
     build_line_starts, line_col_to_offset, HOLParseError,
     parse_step_plan_output, StepPlan,
-    parse_prefix_commands_output,
-    _find_json_line, _frag_to_cmd,
+    _find_json_line,
 )
 from .hol_session import HOLSession, HOLDIR, escape_sml_string
 
@@ -26,7 +25,6 @@ class SessionPosition:
     from getting out of sync (which silently killed incremental/reuse paths).
     """
     tactic_idx: int = 0          # Step index (0 = before any tactic)
-    proof_offset: int | None = None  # None = at step boundary; int = partial offset
     content_hash: str = ""       # File hash when this position was established
     initialized: bool = False     # True after goal setup + successful replay
 
@@ -36,13 +34,10 @@ class SessionPosition:
 
     def at_step(self, idx: int, hash_: str) -> 'SessionPosition':
         """New position at a step boundary."""
-        return SessionPosition(tactic_idx=idx, proof_offset=None,
+        return SessionPosition(tactic_idx=idx,
                                content_hash=hash_, initialized=True)
 
-    def at_partial(self, idx: int, offset: int, hash_: str) -> 'SessionPosition':
-        """New position inside a step (partial offset)."""
-        return SessionPosition(tactic_idx=idx, proof_offset=offset,
-                               content_hash=hash_, initialized=True)
+
 
 
 def _try_find_json_line(output: str, context: str = "") -> dict:
@@ -260,8 +255,6 @@ class _TargetInfo:
     thm: TheoremInfo
     tactic_idx: int           # Step boundary at/before cursor
     total_tactics: int        # Total steps in step_plan
-    need_partial: bool        # True when cursor is inside a step (not at boundary)
-    proof_body_offset: int    # Offset into proof body
     incremental_update: tuple[int, int] | None  # (first_diff, old_tactic_idx) or None
     changed: bool             # Whether file content changed
 
@@ -271,7 +264,7 @@ class _NavResult:
     """Result of navigation strategy dispatch."""
     actual_replayed: int
     error_msg: str | None
-    strategy: str             # "reused" | "incremental" | "prefix" | "checkpoint" | "replay"
+    strategy: str             # "reused" | "incremental" | "checkpoint" | "replay"
 
 
 @dataclass
@@ -1480,41 +1473,7 @@ class FileProofCursor:
         self._pos = self._pos.at_step(0, self._content_hash)
         return None
 
-    async def _try_prefix_at(self, thm_name: str, offset: int) -> tuple[bool, str | None]:
-        """Reset goal and try prefix replay up to offset in proof body.
 
-        Sets up a fresh goal, generates prefix commands via sliceTacticBlock,
-        and executes them. Returns (success, error_message).
-        """
-        thm = self._get_theorem(thm_name)
-        if not thm or not thm.proof_body:
-            return False, "No proof body"
-
-        setup_err = await self._setup_proof_goal(thm_name)
-        if setup_err:
-            return False, setup_err
-
-        escaped_body = escape_sml_string(thm.proof_body)
-        prefix_result = await self.session.send(
-            f'goalfrag_prefix_commands_json "{escaped_body}" {offset};',
-            timeout=30
-        )
-        try:
-            prefix_frags = parse_prefix_commands_output(prefix_result)
-        except HOLParseError as e:
-            return False, f"Failed to get prefix commands: {e}"
-
-        if not prefix_frags:
-            return True, None
-
-        # Wrap each fragment with ef(goalFrag.*()) and send as one batch
-        prefix_cmd = '\n'.join(_frag_to_cmd(t, x) for t, x in prefix_frags)
-        result = await self.session.send(
-            prefix_cmd, timeout=self._tactic_timeout or 30
-        )
-        if _is_hol_error(result):
-            return False, result
-        return True, None
 
     # =========================================================================
     # Proof Navigation Helpers
@@ -1566,12 +1525,12 @@ class FileProofCursor:
         return await self._send_step_batch(cmds)
 
     async def _try_reuse_state(
-        self, tactic_idx: int, need_partial: bool, proof_body_offset: int
+        self, tactic_idx: int
     ) -> bool:
         """Try to reuse current session state for target position.
 
         Handles:
-        - Exact match: same step boundary or partial offset → no replay
+        - Exact match: same step boundary → no replay
         - Forward: advance through delta steps → partial replay
 
         Returns True if session is now at target position.
@@ -1579,16 +1538,6 @@ class FileProofCursor:
         if not self._pos.can_reuse(self._content_hash):
             return False
 
-        at_step_boundary = self._pos.proof_offset is None
-
-        if need_partial:
-            # Partial position: only exact offset match works
-            return (self._pos.proof_offset == proof_body_offset
-                    and self._pos.tactic_idx == tactic_idx)
-
-        # Step boundary reuse
-        if not at_step_boundary:
-            return False
         if self._pos.tactic_idx == tactic_idx:
             return True  # Exact match
         if self._pos.tactic_idx < tactic_idx:
@@ -1806,13 +1755,9 @@ class FileProofCursor:
         proof_body_offset = self._line_col_to_proof_offset(thm, line, col)
         tactic_idx = self._offset_to_tactic_idx(proof_body_offset)
         total_tactics = len(self._step_plan)
-        need_partial = self._is_partial_position(
-            proof_body_offset, tactic_idx, total_tactics, thm.proof_body or ""
-        )
 
         return _TargetInfo(
             thm=thm, tactic_idx=tactic_idx, total_tactics=total_tactics,
-            need_partial=need_partial, proof_body_offset=proof_body_offset,
             incremental_update=incremental_update, changed=changed,
         )
 
@@ -1834,17 +1779,7 @@ class FileProofCursor:
                 break
         return tactic_idx
 
-    def _is_partial_position(
-        self, proof_body_offset: int, tactic_idx: int, total_tactics: int,
-        proof_body: str
-    ) -> bool:
-        """Is the offset inside a step (not at a step boundary)?"""
-        step_before_end = self._step_plan[tactic_idx - 1].end if tactic_idx > 0 else 0
-        current_step_end = (
-            self._step_plan[tactic_idx].end if tactic_idx < total_tactics
-            else len(proof_body)
-        )
-        return step_before_end < proof_body_offset < current_step_end
+
 
     async def _reparse_steps_on_edit(
         self, thm: TheoremInfo
@@ -1886,11 +1821,13 @@ class FileProofCursor:
     async def _navigate_to_target(self, target: _TargetInfo) -> _NavResult:
         """Dispatch navigation strategy to reach target position.
 
-        Priority chain: reuse → incremental → prefix → checkpoint → full replay.
+        Priority chain: reuse → incremental → checkpoint → full replay.
+        Partial positions (inside a step) always land at the nearest step boundary,
+        same as incremental update behavior.
         """
         # Strategy 1: Reuse current session state (file unchanged)
         if not target.changed and await self._try_reuse_state(
-            target.tactic_idx, target.need_partial, target.proof_body_offset
+            target.tactic_idx
         ):
             return _NavResult(actual_replayed=target.tactic_idx, error_msg=None, strategy="reused")
 
@@ -1900,39 +1837,10 @@ class FileProofCursor:
         ):
             return _NavResult(actual_replayed=target.tactic_idx, error_msg=None, strategy="incremental")
 
-        # Strategy 3: Partial position via prefix replay
-        if target.need_partial and target.thm.proof_body:
-            return await self._navigate_partial_target(target)
-
-        # Strategy 4: Checkpoint or full replay (step boundary)
+        # Strategy 3: Checkpoint or full replay (step boundary)
         return await self._navigate_step_boundary(target)
 
-    async def _navigate_partial_target(self, target: _TargetInfo) -> _NavResult:
-        """Navigate to a partial position inside a step via prefix replay."""
-        ok, prefix_err = await self._try_prefix_at(
-            target.thm.name, target.proof_body_offset
-        )
-        if ok:
-            return _NavResult(
-                actual_replayed=target.tactic_idx, error_msg=None, strategy="prefix"
-            )
 
-        # Best-effort: replay to nearest step boundary
-        if target.tactic_idx > 0 and target.thm.proof_body:
-            cmds = [step.cmd for step in self._step_plan[:target.tactic_idx]]
-            batch_timeout = self._batch_timeout_for(target.tactic_idx)
-            replayed, replay_error = await self._replay_steps_with_fallback(
-                target.thm.name, cmds, batch_timeout
-            )
-            error_msg = replay_error or (
-                f"Prefix replay failed at requested position: {prefix_err}; "
-                f"showing nearest step boundary (tactic {target.tactic_idx}/{target.total_tactics})."
-            )
-            return _NavResult(actual_replayed=replayed, error_msg=error_msg, strategy="prefix")
-
-        return _NavResult(
-            actual_replayed=0, error_msg=f"Prefix replay failed: {prefix_err}", strategy="prefix"
-        )
 
     async def _navigate_step_boundary(self, target: _TargetInfo) -> _NavResult:
         """Navigate to a step boundary via checkpoint or full replay."""
@@ -1948,12 +1856,7 @@ class FileProofCursor:
         """Update session position tracking after successful navigation."""
         if nav.error_msg is not None:
             return
-        if target.need_partial:
-            self._pos = self._pos.at_partial(
-                target.tactic_idx, target.proof_body_offset, self._content_hash
-            )
-        else:
-            self._pos = self._pos.at_step(target.tactic_idx, self._content_hash)
+        self._pos = self._pos.at_step(target.tactic_idx, self._content_hash)
 
     async def _build_result(
         self, target: _TargetInfo, nav: _NavResult, timings: dict[str, float],
