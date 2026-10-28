@@ -13,7 +13,7 @@ An [MCP](https://modelcontextprotocol.io/) server that gives LLM agents interact
 
 ## Requirements
 
-- [HOL4](https://hol-theorem-prover.org/) installed, with `HOLDIR` environment variable set (defaults to `~/HOL`)
+- [HOL4](https://hol-theorem-prover.org/) `master`, built, with `HOLDIR` environment variable set (defaults to `~/HOL`). The server needs TacticParse's positioned combinators (`FOpenThen1`, `FOpenBy` and `FOpenSufficesBy` carrying spans); against an older HOL, session start fails with "the HOL at … is too old for hol4-mcp".
 - Python ≥ 3.11
 - [uv](https://github.com/astral-sh/uv) (recommended) or pip
 

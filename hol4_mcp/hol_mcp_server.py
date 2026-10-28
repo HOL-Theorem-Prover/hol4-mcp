@@ -2603,12 +2603,9 @@ async def _init_file_cursor(
                     await hol_stop(session)
                     s = None
             else:
-                # Another script in the same workdir. Its new_theory would
-                # make HOL export the current, partially replayed theory
-                # segment into the workdir (Theory.new_theory exports a
-                # non-empty current segment before creating the next one),
-                # and Holmake would then take that truncated export for an
-                # up-to-date build. A fresh process has no segment to export.
+                # Another script in the same workdir. A fresh process, so
+                # nothing the previous file loaded or defined (theorems, SML
+                # bindings, open suspensions) is visible to this one.
                 notices.append(
                     f"[Session restarted: file {old_file.name} → {file_path.name}; "
                     f"the previous file's loaded context and open suspensions "
@@ -2802,9 +2799,8 @@ async def hol_state_at(
         artifact changed since the session loaded it; the session was rebuilt
         and the prefix replayed from the new artifacts. Nothing to do.
       - "[Session restarted: workdir A → B ...]" / "[Session restarted:
-        file A → B ...]" — file= names another script; HOL restarted for it
-        (a reused process would export the previous, partially replayed
-        theory when the new script's new_theory runs). A's loaded context
+        file A → B ...]" — file= names another script; HOL restarted for it,
+        so nothing A loaded or defined is visible to B. A's loaded context
         and open suspensions are gone.
       - "[Session reinit: <why>; HOL restarts, dependencies reload ...]" —
         a full rebuild was owed (an edit before the first theorem; no

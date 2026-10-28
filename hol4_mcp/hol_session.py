@@ -46,6 +46,13 @@ _FAILURE_RE = re.compile(
     r'^(?:Exception[- ]|Fail |TIMEOUT|poly: : error:|parse error at )|'
     r'"error"\s*:\s*"[^"\s]', re.M)
 
+# Compiles only against a TacticParse whose combinator fragments carry spans,
+# the shapes sml_helpers/tactic_prefix.sml matches.
+_TACTICPARSE_PROBE = (
+    "val _ = (TacticParse.FOpenThen1 (0, 0), "
+    "TacticParse.FOpenBy ((0, 0), (0, 0)), "
+    "TacticParse.FOpenSufficesBy ((0, 0), (0, 0)));")
+
 
 class HOLSession:
     """Direct HOL subprocess management with clean interrupt support."""
@@ -112,6 +119,14 @@ class HOLSession:
             output = await self.send('Meta.fakeload "CompilerSpecific";', timeout=5)
             if _FAILURE_RE.search(output) or output.startswith("ERROR:"):
                 raise RuntimeError(f"Failed to register CompilerSpecific: {output}")
+
+            output = await self.send(_TACTICPARSE_PROBE, timeout=10)
+            if _FAILURE_RE.search(output) or output.startswith("ERROR:"):
+                raise RuntimeError(
+                    f"the HOL at {HOLDIR} is too old for hol4-mcp: its "
+                    f"TacticParse lacks the positioned combinators (FOpenThen1, "
+                    f"FOpenBy and FOpenSufficesBy carrying spans). Update HOL to "
+                    f"current master and rebuild it.")
 
             # etq supports manual goaltree workflows; tactic_prefix supplies
             # goalstack replay. A failed helper/init load is a failed startup.

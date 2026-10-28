@@ -111,6 +111,23 @@ async def test_startup_reports_init_errors_and_reaps_process(tmp_path):
         await session.stop()
 
 
+async def test_too_old_hol_is_reported_plainly(monkeypatch, tmp_path):
+    from hol4_mcp import hol_mcp_server as srv
+    # The probe as an older TacticParse, with span-less combinators, would
+    # accept it; against the current one it fails like the real probe there.
+    monkeypatch.setattr("hol4_mcp.hol_session._TACTICPARSE_PROBE",
+                        "val _ = TacticParse.FOpenBy (0, 0);")
+    name = "too_old_hol"
+    try:
+        result = await srv.hol_start(str(tmp_path), name=name)
+        assert result.startswith("ERROR starting HOL: the HOL at "), result
+        assert "too old for hol4-mcp" in result and "current master" in result, result
+        assert "tactic_prefix" not in result and "Type error" not in result, result
+        assert name not in srv._sessions
+    finally:
+        await srv.hol_stop(session=name)
+
+
 async def test_stop_handles_process_group_lookup_failure(monkeypatch, tmp_path):
     session = HOLSession(str(tmp_path))
     process = SimpleNamespace(pid=123, returncode=None,

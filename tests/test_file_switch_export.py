@@ -1,18 +1,14 @@
-"""Pointing the session at another script in the same workdir must not make HOL
-export the partially replayed previous theory.
-
-`Theory.new_theory` exports the current theory segment to disk before creating
-the next one whenever the current segment is non-empty. A cursor that has
-replayed part of `aaScript.sml` therefore leaves a truncated
-`aaTheory.{dat,sig,sml}` in the workdir the moment `bbScript.sml`'s
-`new_theory` runs in the same HOL process, and Holmake then treats that export
-as an up-to-date build of `aaTheory`.
+"""Pointing the session at another script in the same workdir must not leave an
+export of the partially replayed previous theory in the workdir: Holmake would
+treat a truncated `aaTheory.{dat,sig,sml}` as an up-to-date build of
+`aaTheory`.
 """
 
 from pathlib import Path
 
 from hol4_mcp.hol_mcp_server import (
     _init_file_cursor,
+    hol_send,
     hol_state_at as _hol_state_at,
     hol_stop as _hol_stop,
 )
@@ -66,5 +62,7 @@ async def test_file_switch_does_not_export_partial_theory(tmp_path: Path):
         assert exported == [], (
             f"switching files exported the partially replayed theory: {exported}"
         )
+        leftover = await hol_send("first_thm;", session=session)
+        assert "has not been declared" in leftover, leftover
     finally:
         await hol_stop(session=session)

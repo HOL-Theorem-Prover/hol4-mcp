@@ -1,6 +1,6 @@
 ---
 name: reference_hol4_mcp
-description: The running hol4-mcp server — install location (editable, so edits are live) and the local-only `localfixes` branch (don't upstream).
+description: The running hol4-mcp server — install location (editable, so edits are live), the local-only `localfixes` branch (don't upstream), the minimum HOL, and the complaint inbox.
 metadata:
   type: reference
 ---
@@ -10,6 +10,9 @@ metadata:
 
 # `localfixes` branch — don't upstream
 `~/hol4-mcp` runs the `localfixes` branch, carrying user-curated commits intentionally NOT in `origin/master` (navigation/timeout fixes, diagnostics, guidance text, SDK monkey-patch). It is pushed to `origin/localfixes` as a backup; that is not a step towards merging. Don't propose cherry-picking them or opening a PR unless the user explicitly asks. When behaviour depends on a local-only commit, rely on `~/hol4-mcp` being live — that (not GitHub) is the source of truth for the running MCP.
+
+# HOL requirement
+The server needs HOL `master` with TacticParse's positioned combinators (`FOpenThen1`, `FOpenBy` and `FOpenSufficesBy` carrying spans), which `sml_helpers/tactic_prefix.sml` matches. Against an older HOL every session start fails with "the HOL at … is too old for hol4-mcp": update HOL and rebuild it; no tool call can work around it.
 
 # Complaint inbox
 

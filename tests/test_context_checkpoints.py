@@ -392,3 +392,33 @@ async def test_load_context_checkpoint_handles_missing_file(cursor: FileProofCur
     result = await cursor._load_context_checkpoint("add_zero")
     assert result is False
     assert ckpt.context_path is None  # Should be cleared
+
+
+# --- unreadable SaveState hierarchy depth ---
+
+
+class _UnreadableDepthSession:
+    """Answers every command with an empty reply and records what was sent."""
+
+    def __init__(self):
+        self.sent = []
+
+    async def send(self, command, timeout=None):
+        self.sent.append(command)
+        return ""
+
+
+async def test_unreadable_depth_saves_no_checkpoint(tmp_path: Path):
+    session = _UnreadableDepthSession()
+    c = FileProofCursor(FIXTURE, session, checkpoint_dir=tmp_path / "ckpt")
+    assert await c._save_deps_checkpoint() is False
+    assert await c._save_base_checkpoint() is False
+    c._base_checkpoint_saved = True
+    assert await c._save_end_of_proof_checkpoint("add_zero", 1) is False
+    await c._save_context_checkpoint("zero_add")
+
+    assert not any("saveChild" in cmd for cmd in session.sent), session.sent
+    assert c._checkpoints == {}
+    notices = [n for n in c._session_notices if n.startswith("[Checkpoint not saved")]
+    assert len(notices) == 2, c._session_notices
+    assert all("hierarchy depth unreadable" in n for n in notices), notices

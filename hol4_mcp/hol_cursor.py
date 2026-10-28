@@ -977,18 +977,22 @@ class FileProofCursor:
             f"{checkpoint_type}.save"
         )
 
-    async def _get_hierarchy_depth(self) -> int:
-        """Get current PolyML SaveState hierarchy length.
-        
+    _DEPTH_UNREADABLE = "SaveState hierarchy depth unreadable"
+
+    async def _get_hierarchy_depth(self) -> int | None:
+        """Get current PolyML SaveState hierarchy length, or None if the reply
+        does not state it.
+
         The hierarchy is a list of parent states. saveChild(path, N) saves as
         child of entry at index N-1. To save as child of the current state,
-        use N = hierarchy length.
+        use N = hierarchy length. The length grows as checkpoints are saved,
+        so no fixed value can stand in for an unreadable one.
         """
         depth_result = await self.session.send(
             'length (PolyML.SaveState.showHierarchy());', timeout=5
         )
         depth_match = re.search(r'val it = (\d+)', depth_result)
-        return int(depth_match.group(1)) if depth_match else 3  # Default for HOL4
+        return int(depth_match.group(1)) if depth_match else None
 
     async def _save_base_checkpoint(self) -> bool:
         """Save base checkpoint after dependencies loaded.
@@ -1006,6 +1010,8 @@ class FileProofCursor:
         ckpt_path_str = escape_sml_string(str(self._base_checkpoint_path))
 
         depth = await self._get_hierarchy_depth()
+        if depth is None:
+            return False
         # Save child checkpoint at current depth
         result = await self.session.send(
             f'PolyML.SaveState.saveChild ("{ckpt_path_str}", {depth});', timeout=60
@@ -1032,6 +1038,8 @@ class FileProofCursor:
         ckpt_path_str = escape_sml_string(str(self._deps_checkpoint_path))
 
         depth = await self._get_hierarchy_depth()
+        if depth is None:
+            return False
         result = await self.session.send(
             f'PolyML.SaveState.saveChild ("{ckpt_path_str}", {depth});', timeout=60
         )
@@ -1154,6 +1162,9 @@ class FileProofCursor:
         ckpt_path_str = escape_sml_string(str(ckpt_path))
 
         depth = await self._get_hierarchy_depth()
+        if depth is None:
+            self._note_checkpoint_save_failure(ckpt_path, self._DEPTH_UNREADABLE)
+            return False
         # Save checkpoint directly from current state
         result = await self.session.send(
             f'PolyML.SaveState.saveChild ("{ckpt_path_str}", {depth});', timeout=30
@@ -1208,6 +1219,9 @@ class FileProofCursor:
         ckpt_path_str = escape_sml_string(str(ckpt_path))
 
         depth = await self._get_hierarchy_depth()
+        if depth is None:
+            self._note_checkpoint_save_failure(ckpt_path, self._DEPTH_UNREADABLE)
+            return
         result = await self.session.send(
             f'PolyML.SaveState.saveChild ("{ckpt_path_str}", {depth});', timeout=60
         )
