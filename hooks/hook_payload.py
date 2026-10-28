@@ -13,10 +13,11 @@ Two things every hook needs and none should reimplement:
   would hide the goal-display markers hooks match on (H16's `⅋ᵣ`), and
   re-encoding a dict as JSON would turn its newlines into `\\n`, breaking
   line-anchored patterns.
-- `latest_user_message(payload)` — the text of the newest real user turn in
-  the session transcript, for the consent-gated PreToolUse hooks. Tool
-  results ride the transcript as `role=user`; those are plumbing, not
-  prompts, and are skipped.
+- `latest_user_message(payload)` — the text of the newest turn the user typed
+  in the session transcript, for the consent-gated PreToolUse hooks. Tool
+  results and harness-written lines (the compaction summary, request copies,
+  hook and goal echoes, task notifications) ride the transcript as
+  `role=user` too; those are plumbing, not prompts, and are skipped.
 - `visible_command(command)` — a Bash command with its quoted strings and
   heredoc bodies blanked, so a hook that matches command names sees only
   text the shell would execute. What the shell WOULD run inside a string is
@@ -252,11 +253,25 @@ def _text_of(content):
     return str(content)
 
 
+# Claude Code writes these as `role=user` lines too, but the user typed none of
+# them: the compaction summary, skill bodies, hook and goal echoes, task
+# notifications, subagent hand-backs and slash-command output. Their text
+# quotes earlier turns verbatim, consent phrases included.
+_HARNESS_FLAGS = ("isMeta", "isCompactSummary", "isVisibleInTranscriptOnly")
+
+
 def _user_turn_text(line):
-    """Text of a transcript line that is a real user turn, else None."""
+    """Text of a transcript line that is a turn the user typed, else None."""
     try:
         event = json.loads(line)
     except Exception:
+        return None
+    if event.get("type") not in (None, "user"):           # e.g. api-request-blob
+        return None
+    if any(event.get(flag) for flag in _HARNESS_FLAGS):
+        return None
+    origin = event.get("origin")
+    if isinstance(origin, dict) and origin.get("kind") not in (None, "human"):
         return None
     content = None
     if event.get("role") == "user":                       # flat
@@ -268,7 +283,15 @@ def _user_turn_text(line):
         content = event.get("content", "") or event.get("text", "")
     if content is None or _is_tool_result_only(content):
         return None
-    return _text_of(content)
+    text = _text_of(content)
+    head = text.lstrip()
+    if head.startswith("<local-command-stdout>"):    # a slash command's output
+        return None
+    if head.startswith("<command-name>"):
+        # A slash command is a turn, so it ends an earlier message's one-shot
+        # consent, but its arguments are command input that grants nothing.
+        return ""
+    return text
 
 
 def user_messages(payload):

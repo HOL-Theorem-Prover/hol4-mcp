@@ -355,6 +355,14 @@ populates this with the path to the session transcript JSONL). It scans the
 **latest user message** for `\bgit\s+ok\b` (case-insensitive). Present →
 permit. Absent → block.
 
+A user message is a turn the user typed. Claude Code also writes `role=user`
+lines the user never typed — the compaction summary, request copies, skill
+bodies, hook and goal echoes, task notifications, subagent hand-backs, slash-
+command output — and these often quote consent phrases verbatim, so they are
+skipped (`hook_payload._user_turn_text`). A slash command counts as a turn,
+so it ends an earlier message's grant, but its arguments grant nothing. The
+soft hooks' pre-grants read the same turns.
+
 `git ok` is a one-shot grant tied to that specific message — it does not
 persist across subsequent user messages. If you say `git ok` and I push;
 your next message without `git ok` does NOT consent to another push. This is
@@ -767,7 +775,7 @@ Two files here are **not** hooks — `install_hooks.py` discovers only
 
 - `hook_payload.py` — `output_text(payload)` (a PostToolUse result flattened to
   searchable text, strings kept raw), `latest_user_message(payload)` (newest
-  real user turn, for the consent-gated hooks) and `visible_command(command)`
+  turn the user typed, for the consent-gated hooks) and `visible_command(command)`
   (a Bash command with quoted strings and heredoc bodies blanked, keeping the
   substitutions and `-c`/`eval` arguments the shell would still run — what
   H14 and H28 match against), plus the soft-hook protocol: `granted` /

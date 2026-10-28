@@ -92,15 +92,29 @@ def check_normaliser_runs(lines, base):
     return out
 
 
+# A normaliser's arguments: up to one level of parentheses, and no `>>` or `\\`
+# that would start the next step.
+_NORM_ARGS = r"(?:\([^()]*\)|(?!>>|\\\\)[^()])*"
+RE_IMPL_NORMS = re.compile(
+    r"(?:impl_tac|impl_keep_tac)\s*(?:>-|THEN1)\s*"
+    r"(?:(?:" + NORM + r")\b" + _NORM_ARGS +
+    r"|\(\s*(?:" + NORM + r")\b" + _NORM_ARGS + r"\))"
+    r"\s*(?:>>|\\\\)\s*(?:" + NORM + r")\b")
+
+
 def check_impl(lines, base):
-    """B3: impl_tac >- <normaliser> >> <normaliser>."""
+    """B3: impl_tac >- <normaliser> >> <normaliser>.
+
+    The arm is one normaliser, bare or alone in parentheses. An arm whose
+    parentheses hold a chain is not a hit: its steps all run on the
+    antecedent's goal, and only the normaliser after the `)` reaches the
+    remaining one."""
     out = []
     for k in range(len(lines) - 1):
         if not RE_IMPL.search(lines[k]):
             continue
         window = " ".join(x.strip() for x in lines[k:k + 3])
-        if re.search(r"(impl_tac|impl_keep_tac)\s*(?:>-|THEN1)\s*\(?\s*(" + NORM +
-                     r")\b[^)]*\)?\s*(?:>>|\\\\)\s*(" + NORM + r")\b", window):
+        if RE_IMPL_NORMS.search(window):
             out.append((base + k, "`impl_tac >- <normaliser> >> <normaliser>` -- one "
                                   "assumption-using normaliser does both, if the arm "
                                   "actually closes the antecedent"))

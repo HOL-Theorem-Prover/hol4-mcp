@@ -29,7 +29,9 @@ def run_hook(tmp_path):
 
     Returns ``(exit_code, stderr, stdout)``. ``user_msg`` becomes the newest
     user turn in the transcript, after the earlier user turns in ``history``
-    (each followed by an assistant turn); ``tool_response`` (PostToolUse) is attached
+    (each followed by an assistant turn); ``after`` holds raw transcript
+    events (dicts) written after the newest user turn, for harness-written
+    lines; ``tool_response`` (PostToolUse) is attached
     as ``tool_response``; ``extra`` merges into the payload; ``env`` merges
     into the subprocess environment. The private ``HOME`` is
     ``tmp_path/home``, so a test that needs to pre-seed hook state writes
@@ -40,7 +42,7 @@ def run_hook(tmp_path):
 
     def _run(script, tool_name, tool_input, user_msg="", *, event="PreToolUse",
              tool_response=None, extra=None, env=None, session_id="test-session",
-             cwd=None, history=()):
+             cwd=None, history=(), after=()):
         transcript = tmp_path / "transcript.jsonl"
         turns = []
         for earlier in history:
@@ -48,6 +50,7 @@ def run_hook(tmp_path):
             turns.append(_transcript_line("assistant", [{"type": "text", "text": "ok"}]))
         turns.append(_transcript_line("user", user_msg))
         turns.append(_transcript_line("assistant", [{"type": "text", "text": "ok"}]))
+        turns.extend(json.dumps(event) for event in after)
         transcript.write_text("\n".join(turns) + "\n")
         payload = {
             "hook_event_name": event,
