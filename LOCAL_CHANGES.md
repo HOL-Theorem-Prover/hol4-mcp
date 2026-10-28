@@ -8,17 +8,18 @@ pointers for the running server: `skills/hol4-proving/notes/reference_hol4_mcp.m
 ## Notes files
 
 - `LOCAL_CHANGES.md` — this file.
-- `MCP_BUGS.md` — defect register of the navigation/caching review (all
-  fixed, each backed by a `tests/test_repro_*.py` test); `MCP_BUGS_review.md`
-  and `MCP_TACTIC_COST_review.md` are its companions.
-- `HOL_STATE_AT_RESUME_BUG_NOTES.md` — investigation notes for the Resume
-  goal-setup fix; historical reference.
+- Resolved-history notes (the navigation/caching defect register
+  `MCP_BUGS.md` with its companions `MCP_BUGS_review.md` and
+  `MCP_TACTIC_COST_review.md`; `HOL_STATE_AT_RESUME_BUG_NOTES.md`;
+  `PARENS_NAVIGATION_NOTES.md`) were removed after `62481d6`; read them with
+  `git show 62481d6:<file>`. Test docstrings citing finding numbers refer to
+  those files.
 - `HOL_STATE_AT_DEF_EDIT_STALENESS_NOTES.md` — the `Unknown identifier`
   symptom after editing a `Definition` above the checkpoint; the two defects
-  actually found are fixed (2026-08-28).
-- `PARENS_NAVIGATION_NOTES.md` — navigation inside parens-grouped LT chains:
-  the single-goal case is implemented, the multi-goal case stays off (the
-  b43c34c trade-off).
+  actually found are fixed (2026-08-28). The unreproduced original report is in
+  `complaints/`.
+- `complaints/` — the open-issue inbox (workflow:
+  `skills/hol4-proving/notes/reference_hol4_mcp.md`, Complaint inbox).
 
 ## Upstreaming notes
 
