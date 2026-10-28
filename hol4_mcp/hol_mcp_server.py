@@ -39,24 +39,25 @@ from .hol_file_parser import (
 from .quote_check import quote_diagnosis_lines
 from .build_evidence import traced_build, build_failure_heading
 from . import build_coordination as coordination
+from . import budgets
 
 
 DEFAULT_MAX_OUTPUT = 4096
 
-# Server-level tactic timeout (set via --tactic-timeout CLI flag or HOL_TACTIC_TIMEOUT env)
-TACTIC_TIMEOUT = float(os.environ.get("HOL_TACTIC_TIMEOUT", "60.0"))
+# main() may override the first two from the CLI.
+TACTIC_TIMEOUT = budgets.TACTIC_TIMEOUT
+STATE_AT_TIMEOUT = budgets.STATE_AT_TIMEOUT
+MAX_STATE_AT_TIMEOUT = budgets.MAX_STATE_AT_TIMEOUT
 
-# Overall wall-clock budget for a single state_at navigation (set via
-# --state-at-timeout CLI flag or HOL_STATE_AT_TIMEOUT env). The per-tactic
-# timeout bounds each tactic, but a large prefix replay or a long \\-chain can
-# still sum to many minutes; this caps the TOTAL so state_at can never hang
-# unbounded. Generous by default so a legitimate large-prefix replay completes;
-# raise per-call with the tool's timeout= argument when a prefix is genuinely huge.
-STATE_AT_TIMEOUT = float(os.environ.get("HOL_STATE_AT_TIMEOUT", "300.0"))
 
-# Largest per-call timeout= accepted, in seconds. Anything above it is a unit
-# mistake (milliseconds passed as seconds), not a budget.
-MAX_STATE_AT_TIMEOUT = 3600.0
+def _budget_doc(function):
+    """Fill the `{NAME}` budget placeholders of a tool docstring."""
+    doc = function.__doc__
+    for name in ("STATE_AT_TIMEOUT", "HOLMAKE_TIMEOUT", "MAX_HOLMAKE_TIMEOUT",
+                 "DETACHED_DISCOVERY_TIMEOUT"):
+        doc = doc.replace("{" + name + "}", f"{getattr(budgets, name):g}")
+    function.__doc__ = doc
+    return function
 
 
 class _SessionOperation:
@@ -147,7 +148,8 @@ def _timeout_arg_error(timeout: float | None) -> str | None:
     return (
         f"ERROR: timeout={timeout:g} exceeds the maximum {MAX_STATE_AT_TIMEOUT:.0f}s. "
         f"The unit is seconds ({timeout / 3600:.1f} h requested). Pass e.g. "
-        f"timeout=600 for a heavy prefix, or timeout=0 to disable the bound."
+        f"timeout={2 * budgets.STATE_AT_TIMEOUT:g} for a heavy prefix, or timeout=0 "
+        f"to disable the bound."
     )
 
 
@@ -1519,6 +1521,7 @@ async def hol_search(
 
 @mcp.tool()
 @_serialized_session()
+@_budget_doc
 async def hol_goals(
     n: int = None,
     asm: int = None,
@@ -1555,8 +1558,9 @@ async def hol_goals(
               first use per file and a repeat is your logged decision.
               (default: False)
         timeout: With line, overall wall-clock budget (seconds) for the
-              navigation; None uses the server default (HOL_STATE_AT_TIMEOUT /
-              300s). On expiry HOL is interrupted and a TIMEOUT is returned
+              navigation; None uses the server default ({STATE_AT_TIMEOUT}s,
+              set by HOL4_MCP_STATE_AT_TIMEOUT). On expiry HOL is interrupted
+              and a TIMEOUT is returned
               instead of hanging. See hol_state_at. (default: None)
 
     Returns: Goal count + headlines, one goal, or one assumption.
@@ -2000,7 +2004,8 @@ def _read_log_tail(path: Path, limit: int) -> tuple[str, bool]:
 
 
 @mcp.tool()
-async def holmake(workdir: str, target: str = None, env: dict = None, log_limit: int = 1024, timeout: int = 600, heap_size: int = 12288, jobs: int = None, detach: bool = False, trace_discovery: bool = False) -> str:
+@_budget_doc
+async def holmake(workdir: str, target: str = None, env: dict = None, log_limit: int = 1024, timeout: int = budgets.HOLMAKE_TIMEOUT, heap_size: int = 12288, jobs: int = None, detach: bool = False, trace_discovery: bool = False) -> str:
     """Run Holmake --qof in directory.
 
     Name the target (hook H32 blocks an untargeted, whole-directory build once;
@@ -2012,7 +2017,8 @@ async def holmake(workdir: str, target: str = None, env: dict = None, log_limit:
         env: Optional environment variables (e.g. {"MY_VAR": "/some/path"})
         log_limit: Max bytes per log file to include on failure (default 1024,
                    0 for unlimited)
-        timeout: Max seconds to wait (default 600, max 1800). Ignored with detach.
+        timeout: Max seconds to wait (default {HOLMAKE_TIMEOUT}, max
+                 {MAX_HOLMAKE_TIMEOUT}). Ignored with detach.
         heap_size: Max heap size in MB for Poly/ML builds (default 12288)
         jobs: Max parallel jobs, passed as -j — jobs=1 included, which forces
               a sequential build in which Holmake streams each theory's
@@ -2023,7 +2029,8 @@ async def holmake(workdir: str, target: str = None, env: dict = None, log_limit:
                 `job=<id>` and the log path; poll hol_build_status(job=...).
                 For builds longer than the synchronous budget — never a shell
                 `nohup Holmake` (hook H28), which nothing reports on.
-                Discovery has its own 1800-second safety limit for detached jobs.
+                Discovery has its own {DETACHED_DISCOVERY_TIMEOUT}-second safety
+                limit for detached jobs.
         trace_discovery: Opt-in Linux/strace diagnostic for opaque filesystem
                 or discovery failures (e.g. SysErr noent). Retains syscall/path
                 evidence and execution-context metadata under
@@ -2059,7 +2066,7 @@ async def holmake(workdir: str, target: str = None, env: dict = None, log_limit:
     and undeclared recipe/pre-exec outputs are outside this coordination.
     """
     # Validate limits
-    timeout = max(1, min(timeout, 1800))
+    timeout = max(1, min(timeout, budgets.MAX_HOLMAKE_TIMEOUT))
     heap_size = max(256, heap_size)
     workdir_path = Path(workdir).resolve()
     if not workdir_path.exists():
@@ -2108,7 +2115,8 @@ async def holmake(workdir: str, target: str = None, env: dict = None, log_limit:
 
     start_time = time.monotonic()
     claim = await _build_claim(holmake_bin, workdir_path, proc_env, target,
-                               1800 if detach else timeout, trace_discovery, detach)
+                               budgets.DETACHED_DISCOVERY_TIMEOUT if detach else timeout,
+                               trace_discovery, detach)
     if isinstance(claim, str):
         return claim
     if detach:
@@ -2661,6 +2669,7 @@ async def _init_file_cursor(
 
 @mcp.tool()
 @_serialized_session()
+@_budget_doc
 async def hol_state_at(
     line: int,
     col: int = 1,
@@ -2717,8 +2726,9 @@ async def hol_state_at(
                       decision. Toggling the mode forces a clean prefix
                       reload. (default: False)
         timeout: Overall wall-clock budget (seconds) for this navigation. None
-                      uses the server default (HOL_STATE_AT_TIMEOUT / 300s). On
-                      expiry the HOL process is interrupted (recoverable) and a
+                      uses the server default ({STATE_AT_TIMEOUT}s, set by
+                      HOL4_MCP_STATE_AT_TIMEOUT). On expiry the HOL process is
+                      interrupted (recoverable) and a
                       TIMEOUT is returned instead of hanging. Raise it only for a
                       genuinely huge prefix replay; <= 0 disables the bound.
 
@@ -3035,7 +3045,7 @@ async def hol_state_at(
                 f"per-tactic timeout. If this span is a lumped chain, split "
                 f"it with `>- suspend` to shrink the replayed unit; a "
                 f"long-running but correct tactic needs a higher "
-                f"--tactic-timeout."
+                f"HOL4_MCP_TACTIC_TIMEOUT (or --tactic-timeout)."
             )
 
         if result.goals and not show_partial:
@@ -3401,10 +3411,8 @@ def _install_pi_extension():
     print(f"Installed pi extension to {ext_target}")
 
 
-def main():
-    """CLI entry point for HOL4 MCP server."""
+def _cli_parser():
     import argparse
-    import logging
 
     parser = argparse.ArgumentParser(description="HOL4 MCP Server and Tools")
     subparsers = parser.add_subparsers(dest="command")
@@ -3423,8 +3431,8 @@ def main():
     serve_parser.add_argument("--port", type=int, default=8000, help="Port for HTTP/SSE (default: 8000)")
     serve_parser.add_argument("--host", default="127.0.0.1", help="Host for HTTP/SSE (default: 127.0.0.1)")
     serve_parser.add_argument("-v", "--verbose", action="store_true", help="Enable debug logging")
-    serve_parser.add_argument("--tactic-timeout", type=float, default=None, help="Max seconds per tactic during proof replay (default: 5.0, or HOL_TACTIC_TIMEOUT env)")
-    serve_parser.add_argument("--state-at-timeout", type=float, default=None, help="Overall wall-clock budget (seconds) per state_at/hol_goals navigation (default: 300.0, or HOL_STATE_AT_TIMEOUT env)")
+    serve_parser.add_argument("--tactic-timeout", type=float, default=None, help=f"Max seconds per tactic during proof replay (default: {budgets.TACTIC_TIMEOUT:g}, from HOL4_MCP_TACTIC_TIMEOUT when set)")
+    serve_parser.add_argument("--state-at-timeout", type=float, default=None, help=f"Overall wall-clock budget (seconds) per state_at/hol_goals navigation (default: {budgets.STATE_AT_TIMEOUT:g}, from HOL4_MCP_STATE_AT_TIMEOUT when set)")
 
     # Also allow serve options at top level for backwards compat
     parser.add_argument("--transport", choices=["stdio", "http", "sse"], default="stdio", help=argparse.SUPPRESS)
@@ -3433,8 +3441,14 @@ def main():
     parser.add_argument("-v", "--verbose", action="store_true", help=argparse.SUPPRESS)
     parser.add_argument("--tactic-timeout", type=float, default=None, help=argparse.SUPPRESS)
     parser.add_argument("--state-at-timeout", type=float, default=None, help=argparse.SUPPRESS)
+    return parser
 
-    args = parser.parse_args()
+
+def main():
+    """CLI entry point for HOL4 MCP server."""
+    import logging
+
+    args = _cli_parser().parse_args()
 
     if args.command == "install-pi":
         _install_pi_extension()

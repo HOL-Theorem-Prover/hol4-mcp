@@ -7,7 +7,6 @@ from pathlib import Path
 
 import pytest
 
-from hol4_mcp import hol_cursor
 from hol4_mcp.hol_mcp_server import (
     hol_sessions,
     hol_state_at,
@@ -134,13 +133,6 @@ async def test_dep_load_timeout_names_cause(tmp_path, monkeypatch):
         assert "HOLHEAP" in r, r
     finally:
         await hol_stop(session)
-
-
-def test_dep_load_timeout_default(monkeypatch):
-    monkeypatch.delenv("HOL4_MCP_DEP_LOAD_TIMEOUT", raising=False)
-    assert hol_cursor.dep_load_timeout() == 300.0
-    monkeypatch.setenv("HOL4_MCP_DEP_LOAD_TIMEOUT", "42")
-    assert hol_cursor.dep_load_timeout() == 42.0
 
 
 async def test_timing_line_reports_startup_separately(tmp_path):

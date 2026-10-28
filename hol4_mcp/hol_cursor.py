@@ -2,7 +2,6 @@
 
 import asyncio
 import hashlib
-import os
 import re
 import time
 import uuid
@@ -16,6 +15,7 @@ from .hol_file_parser import (
     construct_start_line, _find_json_line, suspension_base,
 )
 from .hol_session import HOLSession, HOLDIR, escape_sml_string
+from .budgets import PER_THEOREM_TIMEOUT, PREFIX_LOAD_TIMEOUT, dep_load_timeout
 
 
 @dataclass(frozen=True)
@@ -70,21 +70,6 @@ def _try_find_json_line(output: str, context: str = "") -> dict:
         return _find_json_line(output, context)
     except HOLParseError:
         return {}
-
-
-# Per-theorem whole-proof replay budget (seconds). Legitimately-slow proofs
-# (e.g. large induction bodies ~80-100s) must validate per-theorem rather than
-# being silently auto-cheated, so this is well above the 60s default.
-PER_THEOREM_TIMEOUT = 1200
-
-
-def dep_load_timeout() -> float:
-    """Budget in seconds for one dependency `load` at session init
-    (env HOL4_MCP_DEP_LOAD_TIMEOUT, default 300)."""
-    try:
-        return float(os.environ.get("HOL4_MCP_DEP_LOAD_TIMEOUT", "300"))
-    except ValueError:
-        return 300.0
 
 
 def _line_is_error_marker(s: str) -> bool:
@@ -1563,7 +1548,7 @@ class FileProofCursor:
                 out.append(
                     f"[Broken suspend/Resume chain `{root.name}`: {red_str}."
                     f"{orphan_str} The reload after this edit re-runs that body "
-                    f"(up to {PER_THEOREM_TIMEOUT}s) and auto-cheats it again "
+                    f"(up to {PER_THEOREM_TIMEOUT:g}s) and auto-cheats it again "
                     f"unless the edit fixed it; only the prefix from the edited "
                     f"block on is replayed. {self._CHAIN_REMEDY}]")
             else:
@@ -1598,7 +1583,7 @@ class FileProofCursor:
         self._session_notices.append(
             f"[Auto-cheated {thm.kind} {thm.name} (line {thm.start_line}) "
             f"after its body failed at load: {reason}.{orphan_str} Every load "
-            f"past it re-runs this body (up to {PER_THEOREM_TIMEOUT}s) and "
+            f"past it re-runs this body (up to {PER_THEOREM_TIMEOUT:g}s) and "
             f"auto-cheats it again until it loads green. {self._CHAIN_REMEDY}]")
 
     async def init(self) -> dict:
@@ -1895,7 +1880,8 @@ class FileProofCursor:
                         f"SKIPPED, never ran ({_error_reason(err)})"
                     )
 
-    async def _load_context_to_line(self, target_line: int, timeout: float = 3000) -> str | None:
+    async def _load_context_to_line(self, target_line: int,
+                                    timeout: float = PREFIX_LOAD_TIMEOUT) -> str | None:
         """Load file content up to target_line into HOL session.
         
         Loads content granularly - theorem by theorem - so that a broken proof
@@ -1907,7 +1893,7 @@ class FileProofCursor:
         
         Args:
             target_line: 1-indexed line to load up to (exclusive)
-            timeout: Timeout for HOL send (default 3000s for large files)
+            timeout: Timeout for HOL send (default PREFIX_LOAD_TIMEOUT)
             
         Returns:
             Error message if failed, None if success.
@@ -1980,7 +1966,7 @@ class FileProofCursor:
                                 thm.name, thm.start_line, thm.proof_end_line - 1)
                             if result.startswith("TIMEOUT"):
                                 err = await self._cheat_failed_theorem(
-                                    thm, f"timeout >{thm_timeout}s loading whole proof"
+                                    thm, f"timeout >{thm_timeout:g}s loading whole proof"
                                 )
                                 if err:
                                     return err

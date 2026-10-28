@@ -26,6 +26,25 @@ of at least 256 MB. Startup reports the effective limit; changing the setting
 does not resize an already running session. Session restarts preserve its
 explicit environment. This option is independent of `holmake(heap_size=...)`.
 
+### Time budgets
+
+Each budget, in seconds, is read from the server environment at startup
+(the dependency-load budget at each session init). Set them in the MCP launch
+configuration's `env`; a value that is not a number is refused with an error
+naming the variable.
+
+| Variable | Default | Bounds |
+|---|---|---|
+| `HOL4_MCP_TACTIC_TIMEOUT` | 60 | one tactic during replay (alias `HOL_TACTIC_TIMEOUT`; `--tactic-timeout` overrides) |
+| `HOL4_MCP_STATE_AT_TIMEOUT` | 300 | one `hol_state_at`/`hol_goals` navigation (alias `HOL_STATE_AT_TIMEOUT`; `--state-at-timeout` overrides) |
+| `HOL4_MCP_MAX_STATE_AT_TIMEOUT` | 3600 | the largest per-call `timeout=` accepted |
+| `HOL4_MCP_THEOREM_TIMEOUT` | 1200 | one earlier theorem's whole proof while loading the prefix |
+| `HOL4_MCP_PREFIX_LOAD_TIMEOUT` | 3000 | loading the current file up to the target |
+| `HOL4_MCP_DEP_LOAD_TIMEOUT` | 300 | one dependency `load` at session init |
+| `HOL4_MCP_HOLMAKE_TIMEOUT` | 600 | a synchronous `holmake`, when `timeout=` is not given |
+| `HOL4_MCP_MAX_HOLMAKE_TIMEOUT` | 1800 | the cap applied to `holmake`'s `timeout=` |
+| `HOL4_MCP_DETACHED_DISCOVERY_TIMEOUT` | 1800 | dependency discovery before a detached build starts |
+
 ## Installation
 
 ```bash

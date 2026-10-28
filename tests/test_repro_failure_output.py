@@ -9,6 +9,7 @@ import re
 import pytest
 
 from hol4_mcp.hol_mcp_server import (
+    MAX_STATE_AT_TIMEOUT,
     _init_file_cursor,
     hol_check_proof,
     hol_goals,
@@ -136,9 +137,11 @@ async def test_absurd_timeout_is_refused(tmp_path):
     session = "fo_absurd"
     try:
         await init(tmp_path, "opq", OPAQUE_SCRIPT, session)
-        r = await hol_state_at(line=16, col=3, session=session, timeout=20000)
+        too_big = 2 * MAX_STATE_AT_TIMEOUT
+        r = await hol_state_at(line=16, col=3, session=session, timeout=too_big)
         assert r.startswith("ERROR"), r
-        assert "20000" in r and "3600" in r and "seconds" in r, r
+        assert f"{too_big:g}" in r and f"{MAX_STATE_AT_TIMEOUT:.0f}" in r, r
+        assert "seconds" in r, r
     finally:
         await hol_stop(session)
 
