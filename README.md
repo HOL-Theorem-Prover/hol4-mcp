@@ -241,7 +241,9 @@ regular builds. Build coordination keeps everything else it needs — artifact
 records, locks, detached-job logs and exit statuses — in the same per-user
 directory, never in a project tree. A tracer
 permission/setup failure is not reported as a proof-failure verdict. Missing
-directories are not silently ignored or created, and no retry is automatic.
+directories are not silently ignored or created, and a filesystem failure is
+not retried. A build that fails with Poly/ML's out-of-store message is re-run
+once (per job by Holmake in a parallel build, whole for `jobs=1`).
 
 ## Architecture
 

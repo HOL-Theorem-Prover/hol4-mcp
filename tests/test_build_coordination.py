@@ -85,6 +85,90 @@ Holmake: Failed script build for /w/from_pancake32ProgScript - exited with code 
         Path("/w/to_word32ProgTheory.dat"), Path("/w/bigProgTheory.dat")}
 
 
+SEQUENTIAL_CANCELLED_IN_SCRIPT = """\
+Holmake: Building 3 theory files
+Holmake: Linking /w/aaScript.uo to produce theory-builder executable
+Exporting theory "aa" ... done.
+Holmake: [1/3] aa
+Holmake: Linking /w/bbScript.uo to produce theory-builder executable
+<<HOL message: Created theory "bb">>
+"""
+
+
+def test_signalled_sequential_build_in_a_script_certifies_in_process_compiles():
+    compiled = {Path("/w/.hol/objs/aaTheory.ui"), Path("/w/.hol/objs/aaTheory.uo")}
+    tags = {"aaTheory": {Path("/w/aaTheory.dat")}, "bbTheory": {Path("/w/bbTheory.dat")}}
+    for returncode in (-15, None):
+        done = completed_outputs(tags, compiled, SEQUENTIAL_CANCELLED_IN_SCRIPT, returncode)
+        assert done == compiled | {Path("/w/aaTheory.dat")}, (returncode, done)
+    # Stopped after a progress line, a compile may have been mid-write.
+    between = SEQUENTIAL_CANCELLED_IN_SCRIPT.rsplit("Holmake: Linking", 1)[0]
+    assert completed_outputs(tags, compiled, between, -15) == {Path("/w/aaTheory.dat")}
+    # A monitored build runs nodes in parallel: the rule does not apply.
+    monitored = "Starting work on aaTheory\n" + SEQUENTIAL_CANCELLED_IN_SCRIPT
+    assert not compiled & completed_outputs(tags, compiled, monitored, -15)
+
+
+@pytest.mark.parametrize("returncode", [None, -15, 0])
+def test_finalize_job_certifies_what_the_log_says_finished(tmp_path, returncode):
+    """A detached job finalized by a later server (no exit status: None), a
+    cancelled one (-15) and a successful one all trust the log's progress lines."""
+    objs = tmp_path / ".hol" / "objs"
+    objs.mkdir(parents=True)
+    finished, running = objs / "word_elimTheory.ui", objs / "data_spaceProofTheory.ui"
+    for path in (finished, running):
+        path.write_text("written by the build")
+    record = {
+        "token": f"{time.time_ns() & (16**12 - 1):012x}", "label": "test job",
+        "outputs": [str(finished), str(running)],
+        "before": {str(finished): None, str(running): None},
+        "tags": {"word_elimTheory": [str(finished)],
+                 "data_spaceProofTheory": [str(running)]},
+        "in_process": [], "commands": {},
+    }
+    job_file = coordination.jobs_directory() / f"{record['token']}.json"
+    try:
+        coordination.finalize_job(record, returncode, "Holmake: [↓99] word_elim\n")
+        assert coordination._suspect(finished, adopt=False) is None
+        flagged = coordination._suspect(running, adopt=False)
+        assert (flagged is None) == (returncode == 0), flagged
+        if flagged is not None:
+            assert flagged.get("returncode") == returncode, flagged
+    finally:
+        job_file.unlink(missing_ok=True)
+        for path in (finished, running):
+            coordination._unlink_state(path, "failed")
+
+
+def test_suspect_refusal_lists_suspects_and_who_may_remove_them(tmp_path, monkeypatch):
+    holdir = tmp_path / "HOL"
+    monkeypatch.setattr(coordination, "HOLDIR", holdir)
+    files = {name: holdir / "step" / ".hol" / "objs" / name
+             for name in ("left.ui", "orphan.ui", "touched.ui")}
+    outside = tmp_path / "proj" / "mine.ui"
+    for path in [*files.values(), outside]:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text("partial")
+
+    def record(path, **extra):
+        return {"path": str(path), "stamp": list(coordination._stamp(path)),
+                "label": f"job=aaaaaaaaaaaa ({path.name})", "token": "aaaaaaaaaaaa", **extra}
+
+    suspects = [(files["left.ui"], record(files["left.ui"], returncode=-15)),
+                (files["orphan.ui"], record(files["orphan.ui"])),
+                (files["touched.ui"], record(files["touched.ui"], returncode=1)),
+                (outside, record(outside, returncode=1))]
+    files["touched.ui"].write_text("changed since")
+    text = coordination._suspect_refusal(suspects)
+    for path, _ in suspects:
+        assert f"possibly partial or unverified artifact: {path}" in text, text
+    assert "no build is accepted while these exist" in text, text
+    assert f"{files['left.ui']} is under $HOLDIR. It may be removed" in text, text
+    for name in ("orphan.ui", "touched.ui"):
+        assert f"{files[name]} is under $HOLDIR and is not provably" in text, text
+    assert f"{outside} is under $HOLDIR" not in text, text
+
+
 SEQUENTIAL_SHELL_OUTPUT = """\
 touch first
 quiet-recipe
@@ -210,6 +294,34 @@ async def test_independent_targets_in_one_directory_build_concurrently(tmp_path)
         (tmp_path / "release").touch()
         await _wait_for_job_finished(job)
         assert "Build succeeded" in await srv.hol_build_status(job)
+    finally:
+        (tmp_path / "release").touch()
+        await srv.hol_build_status(job, cancel=True)
+
+
+async def test_cancelled_sequential_build_keeps_the_theories_it_finished(tmp_path):
+    header = "open HolKernel Parse boolLib bossLib;\n"
+    (tmp_path / "aaScript.sml").write_text(
+        header + 'val _ = new_theory "aa";\nval _ = export_theory();\n')
+    (tmp_path / "bbScript.sml").write_text(
+        header + 'open aaTheory;\nval _ = new_theory "bb";\nval _ = export_theory();\n')
+    (tmp_path / "ccScript.sml").write_text(
+        header + 'open bbTheory;\nval _ = new_theory "cc";\n'
+        'val _ = TextIO.closeOut (TextIO.openOut "cc_started");\n'
+        'val _ = while not (OS.FileSys.access ("release", [])) do\n'
+        '          OS.Process.sleep (Time.fromMilliseconds 50);\n'
+        'val _ = export_theory();\n')
+    started = await srv.holmake(str(tmp_path), target="ccTheory", jobs=1, detach=True)
+    job = re.search(r"job=(\S+)", started).group(1)
+    try:
+        async def ready():
+            while not (tmp_path / "cc_started").exists():
+                await asyncio.sleep(.05)
+        await asyncio.wait_for(ready(), 120)
+        status = await srv.hol_build_status(job, cancel=True)
+        assert status.startswith("cancelled"), status
+        result = await srv.holmake(str(tmp_path), target="bbTheory", jobs=1, timeout=120)
+        assert "Build succeeded" in result and "partial" not in result.lower(), result
     finally:
         (tmp_path / "release").touch()
         await srv.hol_build_status(job, cancel=True)

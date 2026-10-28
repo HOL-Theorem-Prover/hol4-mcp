@@ -1943,14 +1943,32 @@ def _condense_discovery(text: str) -> str:
     return "\n".join(kept) + ("\n" if kept and text.endswith("\n") else "")
 
 
+# Holmake's own out-of-store markers (`oos_markers` in its poly/multibuild.sml).
+_OOS_MARKERS = ("Run out of store - interrupting threads", "Failed to recover - exiting")
+_HOLMAKE_OOS_RETRIES_RE = re.compile(
+    r"(\d+) job\(s\) were re-run after Poly/ML reported\s+running out of store")
+_SEQUENTIAL_OOS_RETRY = ("[hol4-mcp: Poly/ML ran out of store; re-running this "
+                         "sequential build once]")
+
+
+def _ran_out_of_store(output: str) -> bool:
+    return any(marker in output for marker in _OOS_MARKERS)
+
+
 def _build_summary(output: str) -> str:
     """One clause per outcome, from the jobs' verdict lines: what the build
-    actually rebuilt and what failed, so the result reads from the top."""
+    actually rebuilt and what failed, so the result reads from the top. An
+    out-of-store retry, Holmake's per job or the server's of a sequential
+    build, gets its own clause."""
     state = coordination.job_verdicts(output)
     done = sorted(tag for tag, verdict in state.items()
                   if verdict in coordination._SUCCESS_VERDICTS)
     failed = sorted(tag for tag, verdict in state.items() if verdict.startswith("FAIL"))
-    if not done and not failed:
+    retries = [f"{m.group(1)} job(s) re-run after Poly/ML ran out of store"
+               for m in _HOLMAKE_OOS_RETRIES_RE.finditer(output)]
+    if _SEQUENTIAL_OOS_RETRY in output:
+        retries.append("re-run once after Poly/ML ran out of store")
+    if not done and not failed and not retries:
         return ""
 
     def show(names):
@@ -1961,6 +1979,7 @@ def _build_summary(output: str) -> str:
         parts.append(f"built {len(done)}: {show(done)}")
     if failed:
         parts.append(f"failed {len(failed)}: {show(failed)}")
+    parts.extend(retries)
     return " " + "; ".join(parts) + "."
 
 
@@ -2037,10 +2056,16 @@ async def holmake(workdir: str, target: str = None, env: dict = None, log_limit:
                 /var/tmp/hol4-mcp-<uid>/discovery (newest five kept). Adds
                 overhead; defaults to False. One traced run is the whole
                 diagnostic: do not retrace retries. Does not ignore missing
-                sources or automatically retry any build.
+                sources or retry a filesystem failure.
 
     Returns: Holmake output (stdout + stderr). On failure, includes recent build logs.
              With detach: the job id and log path.
+
+    Poly/ML sometimes runs out of store with memory to spare; a re-run
+    usually succeeds. Holmake re-runs such a job once in a parallel build,
+    and a jobs=1 build that fails this way is re-run once here, detached
+    included. The summary line names each retry; a second failure is
+    reported as is.
 
     Before recipes run, checks the requested target's dependency graph. Refuses
     an overlap with another MCP build on the same host and user on an artifact
@@ -2051,7 +2076,8 @@ async def holmake(workdir: str, target: str = None, env: dict = None, log_limit:
     When a build fails or is cancelled, each changed output is judged on its
     own: one whose Holmake job reported success keeps its standing, as do the
     .uo/.ui files Holmake compiles in its own process when Holmake exited
-    normally; the rest may be partial or unverified and cannot be reused
+    normally or a sequential build stopped while a theory script ran; the
+    rest may be partial or unverified and cannot be reused
     unchanged as up-to-date dependencies. A sequential `jobs=1` build prints
     no per-job verdicts: its theories are judged by Holmake's progress lines,
     a shell target by a later target having begun, and a quiet (`@`) recipe
@@ -2059,7 +2085,9 @@ async def holmake(workdir: str, target: str = None, env: dict = None, log_limit:
     statuses and discovery traces all live under /var/tmp/hol4-mcp-<uid>/,
     never in the project tree, and survive server restarts. Inspect/remove
     and rebuild suspect outputs, or use a build whose graph explicitly
-    schedules their reconstruction. A detached job's record lets a server
+    schedules their reconstruction. Remove a suspect under $HOLDIR only when
+    the refusal says it may be removed; otherwise that is the user's to do.
+    A detached job's record lets a server
     started later adopt it: hol_build_status reports or cancels it, and a
     build that meets its outputs applies its exit status before judging them.
     Requires Holmake's --json/--dirs graph interface. External build processes
@@ -2102,7 +2130,8 @@ async def holmake(workdir: str, target: str = None, env: dict = None, log_limit:
         except (TypeError, ValueError):
             return f"ERROR: {setting} must be an integer, got {value!r}. No build was started."
 
-    cmd = [str(holmake_bin), "--no_preexecs", "--qof", f"--heap-size={heap_size}"]
+    cmd = [str(holmake_bin), "--no_preexecs", "--qof", f"--heap-size={heap_size}",
+           "--retry-oos=1"]
     if jobs is not None:
         cmd.extend(["-j", str(jobs)])
     if target:
@@ -2121,7 +2150,8 @@ async def holmake(workdir: str, target: str = None, env: dict = None, log_limit:
         return claim
     if detach:
         try:
-            return await _start_detached_build(cmd, workdir_path, proc_env, target, trace_note, claim)
+            return await _start_detached_build(cmd, workdir_path, proc_env, target, trace_note,
+                                               claim, retry_out_of_store=jobs == 1)
         except BaseException:
             build_claims.finish(claim)
             raise
@@ -2129,48 +2159,60 @@ async def holmake(workdir: str, target: str = None, env: dict = None, log_limit:
     proc = None
     stdout_chunks = []
     try:
-        proc = await asyncio.create_subprocess_exec(
-            *cmd,
-            cwd=workdir_path,
-            env=proc_env,
-            stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.STDOUT,
-            start_new_session=True,
-            pass_fds=tuple(claim.lock_fds),
-        )
-        claim.proc = proc
-
         # Poll stdout. Progress notifications were removed: a notification
         # in flight when the response is emitted races on the wire and the
         # client tears down the stdio transport on the late progressToken.
         stdout_chunks = [claim.preflight_output.encode("utf-8")]
         timed_out = False
+        # Holmake's --retry-oos re-runs only parallel jobs; a sequential
+        # build that runs out of store is re-run once here.
+        attempts = 2 if jobs == 1 else 1
 
-        while True:
-            elapsed = time.monotonic() - start_time
-            if elapsed >= timeout:
-                timed_out = True
+        for attempt in range(1, attempts + 1):
+            attempt_start = len(stdout_chunks)
+            proc = await asyncio.create_subprocess_exec(
+                *cmd,
+                cwd=workdir_path,
+                env=proc_env,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.STDOUT,
+                start_new_session=True,
+                pass_fds=tuple(claim.lock_fds),
+            )
+            claim.proc = proc
+
+            while True:
+                elapsed = time.monotonic() - start_time
+                if elapsed >= timeout:
+                    timed_out = True
+                    break
+
+                try:
+                    chunk = await asyncio.wait_for(
+                        proc.stdout.read(4096),
+                        timeout=min(_PROGRESS_INTERVAL, timeout - elapsed)
+                    )
+                    if chunk:
+                        stdout_chunks.append(chunk)
+                    else:
+                        # EOF - wait for process to finish
+                        try:
+                            await asyncio.wait_for(proc.wait(), timeout=5)
+                        except asyncio.TimeoutError:
+                            pass
+                        break
+                except asyncio.TimeoutError:
+                    # Check if process finished
+                    if proc.returncode is not None:
+                        break
+                    continue  # Keep polling
+
+            this_run = b''.join(stdout_chunks[attempt_start:]).decode("utf-8", errors="replace")
+            if (timed_out or attempt == attempts or proc.returncode == 0
+                    or not _ran_out_of_store(this_run)):
                 break
-
-            try:
-                chunk = await asyncio.wait_for(
-                    proc.stdout.read(4096),
-                    timeout=min(_PROGRESS_INTERVAL, timeout - elapsed)
-                )
-                if chunk:
-                    stdout_chunks.append(chunk)
-                else:
-                    # EOF - wait for process to finish
-                    try:
-                        await asyncio.wait_for(proc.wait(), timeout=5)
-                    except asyncio.TimeoutError:
-                        pass
-                    break
-            except asyncio.TimeoutError:
-                # Check if process finished
-                if proc.returncode is not None:
-                    break
-                continue  # Keep polling
+            await _kill_process_group(proc)
+            stdout_chunks.append(f"\n{_SEQUENTIAL_OOS_RETRY}\n".encode("utf-8"))
 
         wall = time.monotonic() - start_time
 
@@ -2248,9 +2290,11 @@ _build_jobs: dict[str, _BuildJob] = {}
 
 
 async def _start_detached_build(cmd: list[str], workdir_path: Path, proc_env: dict,
-                                target: str | None, trace_note: str = "", claim=None) -> str:
+                                target: str | None, trace_note: str = "", claim=None,
+                                retry_out_of_store: bool = False) -> str:
     """Spawn Holmake with its output on a log file under `.hol/` and register
-    it as a job for hol_build_status."""
+    it as a job for hol_build_status. With ``retry_out_of_store``, a run that
+    fails with Poly/ML's out-of-store message is re-run once."""
     import uuid
     job_id = claim.token if claim is not None else uuid.uuid4().hex[:12]
     log_dir = coordination.builds_directory()
@@ -2262,9 +2306,14 @@ async def _start_detached_build(cmd: list[str], workdir_path: Path, proc_env: di
     # is the honest answer for a cancelled build.
     exit_file = log_dir / f"{job_id}.exit"
     exit_file.unlink(missing_ok=True)
+    import shlex
+    markers = " ".join(f"-e {shlex.quote(m)}" for m in _OOS_MARKERS)
     wrapped = ["/bin/sh", "-c",
-               '"$@"; s=$?; printf %s "$s" > "$0.tmp" && mv -f "$0.tmp" "$0"; exit "$s"',
-               str(exit_file), *cmd]
+               'log=$1; shift; "$@"; s=$?; '
+               f'if [ "$s" -ne 0 ] && [ -n "$log" ] && grep -qF {markers} "$log"; then '
+               f'printf "\\n%s\\n" {shlex.quote(_SEQUENTIAL_OOS_RETRY)}; "$@"; s=$?; fi; '
+               'printf %s "$s" > "$0.tmp" && mv -f "$0.tmp" "$0"; exit "$s"',
+               str(exit_file), str(log) if retry_out_of_store else "", *cmd]
     log_fh = open(log, "wb")
     try:
         if claim is not None:

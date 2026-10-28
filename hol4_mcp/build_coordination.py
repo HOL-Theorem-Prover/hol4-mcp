@@ -33,6 +33,8 @@ import tempfile
 import time
 import uuid
 
+from .hol_session import HOLDIR
+
 
 def _stamp(path):
     try:
@@ -243,6 +245,25 @@ def job_verdicts(output, commands=None):
     return state
 
 
+def _sequential_script_was_running(output):
+    """True when a sequential build's last event is a theory script starting
+    (`Holmake: Linking …`) with no completion line after it. Holmake runs one
+    graph node at a time and prints that line inside the script's own node,
+    so no in-process compile was running when the build stopped."""
+    lines = output.splitlines()
+    if any(_JOB_START_RE.match(line) for line in lines):
+        return False
+    last = None
+    for line in lines:
+        stripped = line.strip()
+        if stripped.startswith("Holmake: Linking "):
+            last = "script"
+        elif (_J1_THEORY_DONE_RE.match(stripped)
+              or stripped.startswith("Holmake: Failed script build")):
+            last = "done"
+    return last == "script"
+
+
 def completed_outputs(tags, in_process, output, returncode, commands=None):
     """Outputs a build that did not succeed as a whole nevertheless finished.
 
@@ -251,16 +272,18 @@ def completed_outputs(tags, in_process, output, returncode, commands=None):
     theory's are complete once its progress line follows and a shell target's
     once a later target began. Holmake's in-process compiles are complete
     when Holmake exited of its own accord (a small positive status): it
-    writes them one at a time and nothing interrupted it. A signal —
-    cancellation, a timeout kill, a vanished controller — certifies nothing
-    beyond the verdict lines.
+    writes them one at a time and nothing interrupted it. They are also
+    complete when a sequential build stopped while a theory script ran. A
+    signal — cancellation, a timeout kill, a vanished controller — otherwise
+    certifies nothing beyond the verdict lines.
     """
     state = job_verdicts(output, commands)
     done = set()
     for tag, paths in tags.items():
         if state.get(tag) in _SUCCESS_VERDICTS:
             done.update(paths)
-    if returncode is not None and 0 < returncode < 128:
+    if ((returncode is not None and 0 < returncode < 128)
+            or _sequential_script_was_running(output)):
         done.update(in_process)
     return done
 
@@ -344,16 +367,20 @@ def _record_stamp(record):
     return tuple(record["stamp"]) if record["stamp"] is not None else None
 
 
-def _write_state(path, phase, stamp, claim):
+def _write_state(path, phase, stamp, claim, returncode=None):
+    """``returncode`` is the exit status this server observed for the build
+    that left a failed output; absent when no exit status was seen."""
     destination = _state_file(path, phase)
     destination.parent.mkdir(parents=True, mode=0o700, exist_ok=True)
+    record = {"path": str(path), "stamp": stamp, "label": claim.label, "token": claim.token}
+    if returncode is not None:
+        record["returncode"] = returncode
     temporary = None
     try:
         with tempfile.NamedTemporaryFile(mode="w", encoding="utf-8",
                                          dir=destination.parent, delete=False) as stream:
             temporary = Path(stream.name)
-            json.dump({"path": str(path), "stamp": stamp,
-                       "label": claim.label, "token": claim.token}, stream)
+            json.dump(record, stream)
             stream.flush()
             os.fsync(stream.fileno())
         os.replace(temporary, destination)
@@ -496,9 +523,8 @@ def finalize_job(record, returncode, output):
               for p, s in record["before"].items()}
     tags = {t: {Path(p) for p in ps} for t, ps in record["tags"].items()}
     in_process = {Path(p) for p in record["in_process"]}
-    completed = (completed_outputs(tags, in_process, output, returncode,
-                                   record.get("commands"))
-                 if returncode else set())
+    completed = completed_outputs(tags, in_process, output, returncode,
+                                  record.get("commands"))
     finalize(outputs, before, returncode, owner, completed)
     record["finalized"] = {"returncode": returncode, "at": time.time()}
     write_job(record)
@@ -617,7 +643,7 @@ def finalize(outputs, before, returncode, owner, completed=frozenset()):
         failed = _read_state(path, "failed")
         if returncode != 0 and path not in completed:
             if stamp is not None and stamp != before.get(path):
-                _write_state(path, "failed", stamp, owner)
+                _write_state(path, "failed", stamp, owner, returncode)
         elif failed is not None and stamp != _record_stamp(failed):
             _unlink_state(path, "failed")
         running = _read_state(path, "running")
@@ -638,9 +664,8 @@ class BuildClaims:
             return  # Keep protection if killing/reaping the process failed.
         try:
             returncode = claim.proc.returncode if claim.proc is not None else None
-            completed = (completed_outputs(claim.tags, claim.in_process, output, returncode,
-                                           claim.commands)
-                         if returncode else set())
+            completed = completed_outputs(claim.tags, claim.in_process, output, returncode,
+                                          claim.commands)
             finalize(claim.outputs, claim.before, returncode, claim, completed)
         except (OSError, ValueError) as exc:
             # Keep any unfinalized intent conservative, and always release
@@ -704,13 +729,11 @@ class BuildClaims:
                             "blocking build to finish and retry; foreign job IDs belong "
                             "to their originating MCP server.")
                 _note_holder(unit, "writing" if writing else "reading", claim)
-            for path in sorted(claim.reads):
-                record = _suspect(path)
-                if record is not None and path not in claim.outputs:
-                    return (f"ERROR: {record['label']} left a possibly partial or "
-                            f"unverified artifact: {path}. No build was started. "
-                            "Inspect/remove the failed output and rebuild its prerequisite "
-                            "before retrying; existing files can otherwise be treated as up to date.")
+            suspects = [(path, record) for path in sorted(claim.reads)
+                        if path not in claim.outputs
+                        and (record := _suspect(path)) is not None]
+            if suspects:
+                return _suspect_refusal(suspects)
             claim.before = {path: _stamp(path) for path in claim.outputs}
             for path in sorted(claim.outputs):
                 previous = _suspect(path)
@@ -734,6 +757,39 @@ class BuildClaims:
                             _unlink_state(path, "running")
                 finally:
                     claim.release_locks()
+
+
+def _left_by_observed_failure(path, record):
+    """True when this file is, provably, what an MCP build left unfinished:
+    a failed record with the build's observed nonzero exit status, and the
+    file unchanged since (mtime, ctime, size and inode)."""
+    return (isinstance(record.get("returncode"), int) and record["returncode"] != 0
+            and _stamp(path) == _record_stamp(record))
+
+
+def _suspect_refusal(suspects):
+    """The refusal for reads that a build left possibly unfinished. Holmake
+    takes an existing file for up to date, so no build is accepted while one
+    exists; removing it lets the retried build rebuild it."""
+    lines = [f"ERROR: {record['label']} left a possibly partial or unverified "
+             f"artifact: {path}" for path, record in suspects[:8]]
+    if len(suspects) > 8:
+        lines.append(f"… and {len(suspects) - 8} more")
+    lines.append("No build was started. Holmake treats an existing file as up to date, "
+                 "so no build is accepted while these exist: inspect/remove them, then "
+                 "retry this build, which rebuilds them.")
+    holdir = HOLDIR.resolve()
+    for path, record in suspects[:8]:
+        if not path.resolve().is_relative_to(holdir):
+            continue
+        if _left_by_observed_failure(path, record):
+            lines.append(f"{path} is under $HOLDIR. It may be removed: {record['label']} "
+                         f"ended with exit status {record['returncode']} and the file is "
+                         "unchanged since.")
+        else:
+            lines.append(f"{path} is under $HOLDIR and is not provably a leftover of an "
+                         "MCP build: ask the user to remove it.")
+    return "\n".join(lines)
 
 
 @dataclass
