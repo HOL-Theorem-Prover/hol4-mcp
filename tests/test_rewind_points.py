@@ -44,7 +44,7 @@ QED
 
 val _ = export_theory();
 """
-OPAQUE_MARKER = "  (* stands in for a translate call *)"
+OPAQUE_MARKER = " fun translate_stub x = x; val _ = translate_stub ();"
 
 
 def _script(tmp_path, marker=""):
@@ -77,6 +77,26 @@ async def test_rewind_uses_a_point_and_unbinds_later_names(tmp_path):
         await hol_stop(session=session)
 
 
+async def test_the_heap_keeps_only_the_newest_points(tmp_path, monkeypatch):
+    from hol4_mcp.hol_cursor import FileProofCursor
+    monkeypatch.setattr(FileProofCursor, "POINT_RETENTION", 2)
+    script = _script(tmp_path)
+    session = "rwp_retention"
+    try:
+        await _init_file_cursor(file=str(script), session=session)
+        await hol_state_at(line=30, col=3, session=session)   # inside d_thm
+        cursor = _sessions[session].cursor
+        assert cursor._checkpoints["a_thm"].point_id is None
+        assert cursor._checkpoints["c_thm"].point_id is not None
+        assert "val it = 2" in await hol_send("length (!mcp_points);", session=session)
+        state = await _edit_b_and_return(script, session)        # into c_thm
+        assert "=== Goal" in state and "T ∨ F" in state, state
+        edited = await hol_send("concl b_thm;", session=session)
+        assert "T ∧ T ∧ T" in edited or "T /\\ T /\\ T" in edited, edited
+    finally:
+        await hol_stop(session=session)
+
+
 async def test_rewind_across_an_opaque_span_loads_a_file(tmp_path):
     script = _script(tmp_path, OPAQUE_MARKER)
     session = "rwp_opaque"
@@ -90,6 +110,17 @@ async def test_rewind_across_an_opaque_span_loads_a_file(tmp_path):
         assert "=== Goal" in state, state
         # The SaveState file holds the ref as it was: the span ran once since.
         assert "val it = 1" in await hol_send("!counter;", session=session)
+    finally:
+        await hol_stop(session=session)
+
+
+async def test_a_comment_naming_a_translator_is_not_opaque(tmp_path):
+    script = _script(tmp_path, "  (* no translate call here *)")
+    session = "rwp_comment"
+    try:
+        await _init_file_cursor(file=str(script), session=session)
+        await hol_state_at(line=24, col=3, session=session)
+        assert not _sessions[session].cursor._opaque_points
     finally:
         await hol_stop(session=session)
 

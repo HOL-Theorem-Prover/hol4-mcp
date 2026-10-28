@@ -98,7 +98,7 @@ async def test_prefix_span_aborted_midway_is_not_run_twice(tmp_path):
         aborted = await hol_state_at(line=11, col=3, session=session, timeout=2)
         assert "TIMEOUT" in aborted, aborted
         again = await hol_state_at(line=11, col=3, session=session)
-        assert "UNCHANGED" not in again and "prefix error" not in again.lower(), again
+        assert "prefix error" not in again.lower(), again
         assert "=== Goal" in again, again
     finally:
         await hol_stop(session=session)

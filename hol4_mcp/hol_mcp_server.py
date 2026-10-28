@@ -98,6 +98,10 @@ def _cancelled_call_text(tool: str, state: str, intent: str) -> str:
         return (f"INTERRUPTED: hol_interrupt cancelled this {tool} call; HOL did "
                 f"not answer, so the session was stopped and the next call "
                 f"restarts it and reloads the prefix. {rerun}")
+    if state == "gone":
+        return (f"INTERRUPTED: hol_interrupt cancelled this {tool} call while no "
+                f"HOL was running for it (it was being started, stopped or "
+                f"replaced); the next call starts HOL and loads the prefix. {rerun}")
     return (f"INTERRUPTED: hol_interrupt cancelled this {tool} call before it "
             f"finished; HOL is back at its prompt, and the next navigation "
             f"replays from a clean position. {rerun}")
@@ -109,16 +113,20 @@ async def _preempt(key, intent: str, wait: float, holder=None):
     call holds the guard (or, given `holder`, when that task no longer
     does). A stop or restart overrides an interrupt already under way; any
     cancel is sent once, since a second would outlive the recovery's
-    uncancel and end the call with no reply, and none during a recovery
-    already running (a client's own cancel), which is only waited for."""
+    uncancel and end the call with no reply. A call a client's own cancel
+    is already unwinding is only waited for, and None returned: it ends
+    with no reply, whatever the control tool does."""
     operation = _session_operations.get(key)
     owner = operation.owner if operation is not None else None
     if holder is not None and owner is not holder:
         return None
     if owner is None or owner.done() or owner is asyncio.current_task():
         return None
+    if operation.recovering and operation.intent is None:
+        await asyncio.wait({owner}, timeout=wait)
+        return None
     tool = operation.tool or "running"
-    if operation.intent is None and not operation.recovering:
+    if operation.intent is None:
         operation.intent = intent
         owner.cancel()
     elif operation.intent is not None and intent != "interrupt":
@@ -172,17 +180,17 @@ async def _session_operation(key, tool=None):
 
 async def _recover_cancelled_operation(key, intent=None) -> str:
     """Bring HOL back after a guarded call was cancelled; "recovered",
-    "busy" or "stopped".
+    "busy", "stopped", or "gone" when no HOL was running to bring back.
 
     "interrupt" (hol_interrupt) never kills: HOL that ignores SIGINT is left
     running and marked busy. "stop"/"restart" end the session. A client's
     own cancel (None) stops the session when HOL does not answer in 30s,
     since no caller is left to be told it is busy."""
     entry = _sessions.get(key)
-    if entry is None:
-        # No session (it was being started or replaced): nothing to bring
-        # back, and nothing at a prompt either.
-        return "stopped"
+    if entry is None or (intent == "interrupt" and not entry.session.is_running):
+        # No session (it was being started or replaced) or no process:
+        # nothing to bring back, and nothing at a prompt either.
+        return "gone"
     if intent in ("stop", "restart"):
         state = "stopped"
         try:
@@ -194,7 +202,8 @@ async def _recover_cancelled_operation(key, intent=None) -> str:
             recovered = await entry.session.interrupt_and_realign()
         except Exception:
             recovered = False
-        state = "recovered" if recovered else "busy"
+        state = ("recovered" if recovered else
+                 "busy" if entry.session.is_running else "gone")
     else:
         try:
             entry.session.interrupt()
@@ -210,7 +219,7 @@ async def _recover_cancelled_operation(key, intent=None) -> str:
                 pass
     if entry.cursor:
         entry.cursor.mark_interrupted()
-        if state == "stopped":
+        if state in ("stopped", "gone"):
             entry.cursor._schedule_full_reinit("cancelled request ended the session")
     return state
 
@@ -2870,7 +2879,7 @@ async def _init_file_cursor(
             if old_file == file_path:
                 # Same file - check if content changed
                 old_hash = old_cursor._content_hash
-                new_content = file_path.read_text()
+                new_content = file_path.read_text(encoding="utf-8")
                 new_hash = hashlib.sha256(new_content.encode()).hexdigest()
                 if old_hash and new_hash != old_hash:
                     # File changed - restart session to clear stale definitions
@@ -2905,7 +2914,16 @@ async def _init_file_cursor(
     t0 = time.perf_counter()
     
     cursor = FileProofCursor(file_path, s, tactic_timeout=TACTIC_TIMEOUT)
-    result = await cursor.init()
+    try:
+        result = await cursor.init()
+    except BaseException:
+        # The process may now hold this cursor's deps and base saves in its
+        # SaveState hierarchy, which no later cursor can save over: keep
+        # this one, and let its next call rebuild the session.
+        cursor._schedule_full_reinit("session reinit: the previous start was interrupted")
+        if session in _sessions:
+            _sessions[session].cursor = cursor
+        raise
 
     init_time = time.perf_counter() - t0
     cursor._startup_seconds = time.perf_counter() - t_begin

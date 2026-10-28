@@ -182,18 +182,34 @@ def _heredoc_bodies(s, i, pending, out):
     return i
 
 
-def _arithmetic_end(s, i):
-    """The index after the `))` closing the `$((` at `s[i]`."""
-    depth, j = 0, i + 1
+def _closing(s, i, open_, close):
+    """The index after the `close` matching the `open_` at `s[i]`."""
+    depth, j = 0, i
     while j < len(s):
-        if s[j] == "(":
+        if s[j] == open_:
             depth += 1
-        elif s[j] == ")":
+        elif s[j] == close:
             depth -= 1
             if depth == 0:
                 return j + 1
         j += 1
     return len(s)
+
+
+def _arithmetic_end(s, i, at_word_start):
+    """The index after the arithmetic expression starting at `s[i]` —
+    `$((..))`, `$[..]`, a `((..))` command or a `let` line, where `<<` is
+    a shift, not a heredoc — or None when none starts there."""
+    if s.startswith("$((", i):
+        return _closing(s, i + 1, "(", ")")
+    if s.startswith("$[", i):
+        return _closing(s, i + 1, "[", "]")
+    if at_word_start and s.startswith("((", i):
+        return _closing(s, i, "(", ")")
+    if at_word_start and re.match(r"let[ \t]", s[i:i + 4]):
+        m = re.compile(r"[\n;&|]").search(s, i)
+        return m.start() if m else len(s)
+    return None
 
 
 def _prev_token(s, i):
@@ -223,8 +239,9 @@ def visible_command(command):
             out.append("" if s[i + 1] == "\n" else s[i:i + 2])
             i += 2
             continue
-        if s.startswith("$((", i):
-            j = _arithmetic_end(s, i)
+        at_word_start = i == 0 or s[i - 1] in _WORD_BREAK
+        j = _arithmetic_end(s, i, at_word_start)
+        if j is not None:
             out.append(s[i:j])
             i = j
             continue
@@ -234,23 +251,26 @@ def visible_command(command):
             out.append(m.group(0))
             i = m.end()
             continue
-        if c == "#" and (i == 0 or s[i - 1] in _WORD_BREAK):
+        if c == "#" and at_word_start:
             end = s.find("\n", i)
             i = len(s) if end < 0 else end
             continue
-        if c in "'\"":
+        # `$'...'` (ANSI-C quoting) escapes with backslashes, as "..." does.
+        ansi = s.startswith("$'", i)
+        if c in "'\"" or ansi:
             keep = _prev_token(s, i) in _KEEP_ARG_OF
-            j = i + 1
-            while j < len(s) and s[j] != c:
-                j += 2 if (c == '"' and s[j] == "\\") else 1
-            body = s[i + 1:j]
+            q, start = ("'", i + 2) if ansi else (c, i + 1)
+            j = start
+            while j < len(s) and s[j] != q:
+                j += 2 if (q == '"' or ansi) and s[j] == "\\" else 1
+            body = s[start:j]
             if keep:
-                out.append(c + body + c)
+                out.append(q + body + q)
             elif _SINGLE_WORD.match(body):
                 out.append(body)
             else:
-                out.append(c + (_substitutions(visible_command(body))
-                                if c == '"' else "") + c)
+                out.append(q + (_substitutions(visible_command(body))
+                                if q == '"' else "") + q)
             i = j + 1
             continue
         out.append(c)

@@ -13,6 +13,7 @@ from .hol_file_parser import (
     build_line_starts, line_col_to_offset, HOLParseError,
     parse_step_plan_output, StepPlan, step_text_start,
     construct_start_line, _find_json_line, suspension_base, step_plan_error,
+    _strip_comments,
 )
 from .hol_session import HOLSession, HOLDIR, escape_sml_string
 from .budgets import PER_THEOREM_TIMEOUT, PREFIX_LOAD_TIMEOUT, dep_load_timeout
@@ -881,7 +882,7 @@ class FileProofCursor:
 
         Raises FileNotFoundError if file was deleted.
         """
-        content = self.file.read_text()  # Let FileNotFoundError propagate
+        content = self.file.read_text(encoding="utf-8")  # Let FileNotFoundError propagate
         content_hash = self._compute_hash(content)
 
         rebuilt = self._check_dep_artifacts()
@@ -1378,10 +1379,13 @@ class FileProofCursor:
         keep the SaveState chain short; points make the common rewind cheap.
         """
         self._point_seq += 1
-        reply = await self.session.send(f"mcp_point {self._point_seq};", timeout=30)
-        point_id = None if _is_hol_error(reply) else self._point_seq
+        reply = await self.session.send(
+            f"mcp_point {self._point_seq} {self.POINT_RETENTION};", timeout=30)
+        oldest = _try_find_json_line(reply).get("ok")
+        point_id = self._point_seq if isinstance(oldest, int) else None
         if point_id is not None:
             self._head_point = point_id
+            self._forget_points_before(oldest)
 
         # Merge with any existing end_of_proof entry. The hash is refreshed
         # too — see _save_end_of_proof_checkpoint.
@@ -1403,6 +1407,16 @@ class FileProofCursor:
     # A SaveState file after this many in-memory points (and after any opaque
     # span): a rewind no point can serve loads the nearest file instead.
     SAVESTATE_EVERY = 16
+    # The live heap keeps at most this many points, which bounds the memory
+    # they hold; a rewind to an older one loads a file.
+    POINT_RETENTION = 256
+
+    def _forget_points_before(self, oldest: int) -> None:
+        """The live heap no longer holds points older than `oldest`."""
+        for ckpt in self._checkpoints.values():
+            if ckpt.point_id is not None and ckpt.point_id < oldest:
+                ckpt.point_id = None
+        self._opaque_points = {p for p in self._opaque_points if p >= oldest}
 
     def _forget_points_after(self, head: int) -> None:
         """The live heap's newest rewind point is now `head`: points after it
@@ -2105,7 +2119,7 @@ class FileProofCursor:
         if names:
             await self.session.send(
                 f"mcp_capture {self._head_point} {_sml_string_list(names)};", timeout=30)
-        if _OPAQUE_RE.search(content):
+        if _OPAQUE_RE.search(_strip_comments(content)):
             self._opaque_points.add(self._head_point)
             self._force_savestate = True
 

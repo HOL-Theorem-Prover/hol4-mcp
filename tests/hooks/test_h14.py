@@ -17,6 +17,7 @@ PASS_CASES = [
     pytest.param("# then git push\ngit status", id="comment"),
     pytest.param("cat <<'EOF'\ngit push\nEOF\ngit status", id="quoted-heredoc"),
     pytest.param("echo 'a' # don't\ngit status", id="apostrophe-in-comment"),
+    pytest.param("echo $'it\\'s git push'", id="ansi-c-quoted-prose"),
 ]
 
 BLOCK_CASES = [
@@ -36,6 +37,10 @@ BLOCK_CASES = [
     pytest.param("git 'push'", id="single-quoted-verb"),
     pytest.param("git \\\n  push", id="line-continuation"),
     pytest.param("echo a#b; git push", id="hash-inside-word"),
+    pytest.param("(( x = 1<<2 ))\ngit push", id="arithmetic-command"),
+    pytest.param("echo $[1<<2]\ngit push", id="old-arithmetic"),
+    pytest.param("let x=1<<2\ngit push", id="let"),
+    pytest.param("bash -c $'git push'", id="ansi-c-quoted-arg"),
 ]
 
 

@@ -71,6 +71,7 @@ class HOLSession:
         self.env = env  # Extra env vars to merge with os.environ
         self.process: Optional[asyncio.subprocess.Process] = None
         self._buffer = b""
+        self._last_raw = b""  # the bytes of the last frame read, NULs kept
         self._lock = asyncio.Lock()  # Serialize send() to prevent concurrent stdout reads
         # (command, diagnostic line) pairs, so a reader can separate what HOL
         # said about the caller's own tactics from prefix-loading chatter.
@@ -323,11 +324,11 @@ class HOLSession:
                     claimed = True
                     if sentinel in frame:
                         # One read can hold the command's reply and then the
-                        # sentinel's: only a frame with nothing before the
-                        # sentinel means the reply was lost.
-                        before = frame[:frame.index(sentinel)].rstrip()
-                        if before:
-                            return before
+                        # sentinel's: the reply was lost only when no frame
+                        # ended before the sentinel's, not even an empty one.
+                        raw = self._last_raw
+                        if b"\0" in raw[:raw.find(sentinel.encode())]:
+                            return frame[:frame.index(sentinel)].rstrip()
                         return (f"ERROR: HOL finished this command without sending "
                                 f"its reply (idle for {idle_checks * self.LOST_REPLY_INTERVAL:g}s"
                                 f" with no output); its output is lost. The session "
@@ -380,7 +381,7 @@ class HOLSession:
                 self._buffer += chunk
 
             parts = self._buffer.split(b'\0')
-            self._buffer = b""
+            self._last_raw, self._buffer = self._buffer, b""
             result = "\n".join(p.decode("utf-8", errors="replace") for p in parts if p)
             return strip_ansi(result) if self.strip_ansi else result
 

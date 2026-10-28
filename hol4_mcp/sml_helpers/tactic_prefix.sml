@@ -1131,9 +1131,19 @@ val mcp_points : (int * Context.t * (unit -> unit) * int) list ref = ref [];
 val mcp_captures :
       (int * (string * PolyML.NameSpace.Values.value option) list) list ref = ref [];
 
-fun mcp_point id =
-  mcp_points := (id, Context.snapshot (), Meta.snapshotLoaded (),
-                 length (Meta.loaded ())) :: !mcp_points;
+(* Take point `id`, keeping only the newest `keep` points and the captures
+   a rewind to one of them needs. Prints the oldest point kept. *)
+fun mcp_point id keep =
+  let
+    val all = (id, Context.snapshot (), Meta.snapshotLoaded (),
+               length (Meta.loaded ())) :: !mcp_points
+    val kept = List.take (all, Int.min (length all, Int.max (keep, 1)))
+    val oldest = #1 (List.last kept)
+  in
+    mcp_points := kept;
+    mcp_captures := List.filter (fn (i, _) => i >= oldest) (!mcp_captures);
+    print (json_ok (Int.toString oldest) ^ "\n")
+  end;
 
 (* `id`: the newest point before the chunk about to run. *)
 fun mcp_capture id names =

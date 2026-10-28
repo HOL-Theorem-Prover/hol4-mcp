@@ -416,3 +416,85 @@ def test_clip_reports_the_count_it_elided():
     marker = re.search(r"\n\n\[\.\.\. (\d+) bytes elided \.\.\.\]\n\n", clipped)
     kept = len(clipped) - len(marker.group(0))
     assert kept + int(marker.group(1)) == len(output) and len(clipped) <= 1000
+
+
+async def test_interrupted_init_leaves_checkpoints_that_work(tmp_path, monkeypatch):
+    """An interrupt after init saved the deps checkpoint: the session's
+    next cursor still has one (the live process cannot save over it)."""
+    from hol4_mcp.hol_cursor import FileProofCursor
+    script = tmp_path / "iniScript.sml"
+    script.write_text('open HolKernel Parse boolLib bossLib;\n'
+                      'val _ = new_theory "ini";\n'
+                      'Theorem t: T\nProof\n  simp[]\nQED\n'
+                      'val _ = export_theory();\n')
+    session, saved = "cp_init_interrupt", []
+    real = FileProofCursor._save_base_checkpoint
+
+    async def slow_base(self):
+        saved.append(self._deps_checkpoint_saved)
+        await asyncio.sleep(60)
+        return await real(self)
+    monkeypatch.setattr(FileProofCursor, "_save_base_checkpoint", slow_base)
+    try:
+        call = asyncio.create_task(hol_state_at(file=str(script), line=5, col=3,
+                                                session=session))
+        await _until(lambda: saved, 120)
+        await asyncio.wait_for(hol_interrupt(session=session), 30)
+        assert (await asyncio.wait_for(call, 30)).startswith("INTERRUPTED")
+        monkeypatch.setattr(FileProofCursor, "_save_base_checkpoint", real)
+        state = await hol_state_at(file=str(script), line=5, col=3, session=session)
+        assert "=== Goal" in state, state
+        assert _sessions[session].cursor._deps_checkpoint_saved
+    finally:
+        await hol_stop(session=session)
+
+
+async def test_recovery_with_no_hol_says_so(monkeypatch):
+    from types import SimpleNamespace
+    from hol4_mcp.hol_mcp_server import (
+        _cancelled_call_text, _recover_cancelled_operation)
+    assert await _recover_cancelled_operation("cp_no_entry", "interrupt") == "gone"
+    dead = SimpleNamespace(session=SimpleNamespace(is_running=False), cursor=None)
+    monkeypatch.setitem(_sessions, "cp_dead", dead)
+    assert await _recover_cancelled_operation("cp_dead", "interrupt") == "gone"
+    text = _cancelled_call_text("hol_start", "gone", "interrupt")
+    assert "no HOL was running" in text and "did not answer" not in text
+
+
+async def test_control_tool_does_not_claim_a_call_a_client_cancelled():
+    from hol4_mcp.hol_mcp_server import _SessionOperation, _preempt, _session_operations
+    operation = _SessionOperation()
+    operation.owner = asyncio.create_task(asyncio.sleep(0.2))
+    operation.tool, operation.recovering = "hol_send", True
+    _session_operations["cp_client_cancel"] = operation
+    try:
+        assert await _preempt("cp_client_cancel", "stop", wait=5) is None
+        assert operation.intent is None and not operation.owner.cancelled()
+    finally:
+        del _session_operations["cp_client_cancel"]
+
+
+async def test_empty_reply_read_with_the_probe_is_not_lost(monkeypatch):
+    """An idle command that replies with nothing, its frame read together
+    with the lost-reply probe's: the command answered."""
+    import re
+    from hol4_mcp.hol_session import HOLSession
+    hol = HOLSession("/nonexistent")
+    hol.LOST_REPLY_INTERVAL = 0.05
+    written = []
+
+    async def write(command):
+        written.append(command)
+
+    async def read(timeout):
+        while not written:
+            await asyncio.sleep(0.01)
+        sentinel = re.search(r"HOL_MCP_RESYNC_\d+", written[0]).group(0)
+        hol._last_raw = f"\0{sentinel}\n\0".encode()
+        return f"{sentinel}\n"
+
+    async def idle():
+        return False
+    hol._write_command, hol._read_response, hol.is_computing = write, read, idle
+    assert await hol._await_reply(timeout=10) == ""
+    assert not hol._unclaimed_sentinel
