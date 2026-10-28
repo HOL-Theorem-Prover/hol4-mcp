@@ -1075,3 +1075,59 @@ end
 
 val e = safe_e
 val expand = safe_e
+
+(* =============================================================================
+ * In-memory rewind points (the cursor's context checkpoints)
+ *
+ * A point is the Context and the loaded-module set before a stretch of file
+ * content runs. Context.restore rewinds the kernel signatures, theorem DB,
+ * simpsets, grammars and proof manager, but not the SML namespace: so before
+ * each chunk the cursor records the bindings the chunk's names have
+ * (mcp_capture), and a rewind puts them back. A module loaded since a point
+ * cannot be taken back (loading seals a theory), so such a rewind is refused
+ * and the caller falls back to a SaveState checkpoint.
+ * ============================================================================= *)
+
+val mcp_points : (int * Context.t * (unit -> unit) * int) list ref = ref [];
+val mcp_captures :
+      (int * (string * PolyML.NameSpace.Values.value option) list) list ref = ref [];
+
+fun mcp_point id =
+  mcp_points := (id, Context.snapshot (), Meta.snapshotLoaded (),
+                 length (Meta.loaded ())) :: !mcp_points;
+
+(* `id`: the newest point before the chunk about to run. *)
+fun mcp_capture id names =
+  mcp_captures :=
+    (id, map (fn n => (n, #lookupVal PolyML.globalNameSpace n)) names) :: !mcp_captures;
+
+(* Rewind to point `id`. Prints the names a chunk after the point bound that
+   had no binding before it, for the caller to shadow; or an error, having
+   changed nothing. *)
+fun mcp_rewind_json id =
+  (case List.find (fn (i, _, _, _) => i = id) (!mcp_points) of
+     NONE => print (json_err ("no rewind point " ^ Int.toString id) ^ "\n")
+   | SOME (_, ctx, restore_loaded, nloaded) =>
+       if length (Meta.loaded ()) > nloaded then
+         print (json_err "a module was loaded since the rewind point" ^ "\n")
+       else
+         let
+           val (undo, keep) = List.partition (fn (i, _) => i >= id) (!mcp_captures)
+           (* oldest capture first: a name's value before its earliest rebinding *)
+           fun before ([], seen) = seen
+             | before ((_, names) :: rest, seen) =
+                 before (rest, List.foldl (fn ((n, v), acc) =>
+                   if List.exists (fn (m, _) => m = n) acc then acc else (n, v) :: acc)
+                   seen names)
+           val values = before (rev undo, [])
+           val unbound = List.mapPartial (fn (n, NONE) => SOME n | _ => NONE) values
+         in
+           List.app (fn (n, SOME v) => #enterVal PolyML.globalNameSpace (n, v)
+                      | _ => ()) values;
+           Context.restore ctx;
+           restore_loaded ();
+           mcp_points := List.filter (fn (i, _, _, _) => i <= id) (!mcp_points);
+           mcp_captures := keep;
+           print (json_ok (json_string_array unbound) ^ "\n")
+         end)
+  handle e => print (json_err (exnMessage e) ^ "\n");

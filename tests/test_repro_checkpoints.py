@@ -58,16 +58,19 @@ from hol4_mcp.hol_cursor import (
 
 class _SaveStateSession:
     """Stub session that emulates the Poly/ML SaveState calls the checkpoint
-    code makes: ``showHierarchy`` returns a depth, ``saveChild`` creates the
-    checkpoint file so existence checks see a real save."""
+    code makes: ``showHierarchy`` returns a depth or a three-entry hierarchy,
+    ``saveChild`` creates the checkpoint file so existence checks see a real
+    save."""
 
     def __init__(self):
         self.sent: list[tuple[str, float | None]] = []
 
     async def send(self, command: str, timeout: float | None = None) -> str:
         self.sent.append((command, timeout))
-        if "showHierarchy" in command:
+        if "length (PolyML.SaveState.showHierarchy" in command:
             return "> val it = 3 : int"
+        if "showHierarchy" in command:
+            return '> val it = ["state0", "heap", "base"] : string list'
         m = re.search(r'saveChild\s*\("([^"]+)"', command)
         if m:
             Path(m.group(1)).write_text("stub checkpoint")
@@ -235,6 +238,7 @@ async def test_repeated_context_save_uses_fresh_path(tmp_path: Path):
     )
     cursor._reparse_if_changed()
     cursor._base_checkpoint_saved = True
+    cursor.SAVESTATE_EVERY = 1
 
     await cursor._save_context_checkpoint("first_thm")
     first = cursor._checkpoints["first_thm"].context_path

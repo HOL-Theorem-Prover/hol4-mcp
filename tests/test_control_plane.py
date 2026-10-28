@@ -110,7 +110,7 @@ async def test_interrupt_recovers_a_lost_reply(tmp_path):
         await _started(waiting, 1.5)
         hol._read_response = read
         reply = await asyncio.wait_for(hol_interrupt(session=session), 10)
-        assert "idle" in reply.lower(), reply
+        assert "no CPU" in reply and "lost" in reply, reply
         result = await asyncio.wait_for(waiting, 10)
         assert result.startswith("INTERRUPTED"), result
         assert "val it = 2" in await hol_send("2;", session=session)

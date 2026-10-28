@@ -1790,8 +1790,8 @@ async def hol_interrupt(session: str = "default") -> str:
     Cancels the call in progress — hol_state_at, hol_check_proof, hol_send,
     ... — which sends SIGINT to HOL (twice if needed) and re-aligns the pipe;
     that call then returns "INTERRUPTED: ..." instead of a result. Returns
-    once it has. Says so when nothing was running, and when HOL was idle
-    while the call waited (its reply had been lost). Never kills: HOL that
+    once it has. Says so when nothing was running, and when HOL used no CPU
+    while the call waited (its reply was most likely lost). Never kills: HOL that
     ignores SIGINT is left running, marked busy, and nothing more is sent to
     it; hol_stop ends the session (the next call restarts HOL and reloads
     the prefix).
@@ -1832,8 +1832,9 @@ async def hol_interrupt(session: str = "default") -> str:
                 f"but it has not returned within 60s. hol_stop ends the session.")
     if s.busy:
         return f"Cancelled the {tool} call on session '{session}', but {still_busy}"
-    idle = (" HOL was idle while that call waited: its reply had been lost, "
-            "not delayed." if computing is False else "")
+    idle = (" HOL used no CPU while that call waited: its reply had most likely "
+            "been lost, unless the command was sleeping or blocked."
+            if computing is False else "")
     return (f"Interrupted the {tool} call on session '{session}'; it returns "
             f"\"INTERRUPTED: ...\".{idle}")
 

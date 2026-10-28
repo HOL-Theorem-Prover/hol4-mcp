@@ -141,6 +141,55 @@ def _trace_reason(trace: list["TraceEntry"], limit: int = 120) -> str:
     return "proof failed"
 
 
+# Entry points of libraries that keep state in plain SML refs, which an
+# in-memory rewind point does not cover (CakeML's ml_translatorLib and
+# ml_progLib; cv_transLib's abbreviation table): a span calling one is opaque.
+_OPAQUE_RE = re.compile(
+    r"\b(?:translate\w*|m_translate\w*|register_\w*type|abs_register_type|"
+    r"ml_prog_update|append_prog|translation_extends|update_precondition|"
+    r"add_dec|open_module|close_module|open_local_block|open_local_in_block|"
+    r"close_local_block|cv_trans\w*|cv_auto_trans\w*|ml_translatorLib\.\w+|"
+    r"ml_progLib\.\w+)\b")
+_BINDER_RE = re.compile(
+    r"^[ \t]*(?:(Theorem|Triviality|Definition|Inductive|CoInductive)[ \t]+"
+    r"([A-Za-z][\w']*)|val[ \t]+([A-Za-z][\w']*)[ \t]*(?::[^=\n]*)?=|"
+    r"fun[ \t]+([A-Za-z][\w']*))", re.M)
+_SML_IDENT_RE = re.compile(r"[A-Za-z][\w']*")
+
+
+def _bound_names(content: str) -> list[str]:
+    """The top-level SML names a chunk of script text binds, as far as its
+    keywords show: a Theorem's name, a Definition's `_def` and `_ind`, an
+    Inductive's `_rules`, `_ind`, `_cases` and `_strongind`, `val` and `fun`.
+    Datatype, `local` and `structure` bindings are not seen."""
+    names: list[str] = []
+    for m in _BINDER_RE.finditer(content):
+        kind, name, val, fun = m.groups()
+        if kind in ("Theorem", "Triviality"):
+            names.append(name)
+        elif kind == "Definition":
+            stem = name[:-4] if name.endswith("_def") else name
+            names += [name, f"{stem}_ind"]
+        elif kind in ("Inductive", "CoInductive"):
+            names += [f"{name}_{s}" for s in ("rules", "ind", "cases", "strongind")]
+        elif val and val != "it":
+            names.append(val)
+        elif fun:
+            names.append(fun)
+    return list(dict.fromkeys(names))
+
+
+def _sml_string_list(items: list[str]) -> str:
+    return "[" + ", ".join(f'"{escape_sml_string(s)}"' for s in items) + "]"
+
+
+def _statement_key(thm: TheoremInfo) -> tuple:
+    """What fixes a block's starting goal: a Theorem's statement, a
+    Definition's text (its Termination goal), a Resume's suspension and
+    label."""
+    return (thm.kind, thm.name, thm.goal, thm.suspension_name, thm.label_name)
+
+
 def _is_interrupt_reply(output: str) -> bool:
     """A reply HOL gave because SIGINT stopped the command from outside —
     hol_interrupt, a signal sent by hand — not the session's own timeout,
@@ -426,6 +475,9 @@ class TheoremCheckpoint:
       Valid prefix for successor theorems. Saved during _load_context_to_line.
     - end_of_proof_path: proof replay state after all tactics (for backup_n).
       NOT a valid prefix — theorem not bound. Saved during state_at.
+    - point_id: the same state as context_path, as an in-memory rewind point
+      (`mcp_point`): taken after every theorem, where a SaveState file is
+      taken only after some (see _save_context_checkpoint).
     """
     theorem_name: str
     tactics_count: int            # Number of tactics when end_of_proof saved
@@ -434,6 +486,11 @@ class TheoremCheckpoint:
     content_hash: str = ""        # Hash of the file PREFIX through this
                                   # theorem, i.e. the content this saved state
                                   # was produced from (_theorem_prefix_hash)
+    point_id: int | None = None
+    # The newest rewind point in the heap when each SaveState file was saved:
+    # loading the file brings back exactly the points up to it.
+    context_head: int = 0
+    end_of_proof_head: int = 0
 
 
 class FileProofCursor:
@@ -474,6 +531,23 @@ class FileProofCursor:
         # checkpoints that still refer to the earlier file.
         self._checkpoint_nonce = uuid.uuid4().hex[:8]
         self._checkpoint_generation = 0
+        # In-memory rewind points. Ids only grow, so an id names one point in
+        # whichever heap holds it. `_head_point` is the newest point in the
+        # live heap: the chunk about to run is captured under it.
+        self._point_seq = 0
+        self._head_point = 0
+        # Points after which an opaque span ran (one whose library keeps
+        # state in plain SML refs, which no rewind point covers).
+        self._opaque_points: set[int] = set()
+        self._since_savestate = self.SAVESTATE_EVERY - 1   # first checkpoint saves a file
+        self._force_savestate = False
+        # SaveState layout (_save_file): each per-theorem file's parent, the
+        # hierarchy depth that makes a save a child of the base, and the
+        # bytes that decide when the next file is saved as an anchor.
+        self._save_parent: dict[str, str] = {}
+        self._base_depth: int | None = None
+        self._last_anchor_bytes = 0
+        self._chained_bytes = 0
 
         # Cached file state
         self._content: str = ""
@@ -491,6 +565,9 @@ class FileProofCursor:
         # a non-state_at caller (e.g. cursor.status for hol_sessions) and
         # updates _content_hash without re-running goalfrag_step_plan_json.
         self._step_plan_hash: str = ""
+        # `_statement_key` of the block _step_plan belongs to: incremental
+        # replay reuses steps only from the same starting goal.
+        self._step_plan_statement: tuple | None = None
         self._pos = SessionPosition()  # Where HOL session is (updated atomically by state_at)
         # Set when a hol_send command may have mutated the live proofManager out
         # from under our position cache (set_goal/e/b/drop_all/set_suspended_goal/…).
@@ -950,6 +1027,8 @@ class FileProofCursor:
         self._active_theorem = None
         self._step_plan = []
         self._step_plan_hash = ""
+        self._step_plan_statement = None
+        self._reset_points()
         self._needs_session_reinit = False
 
         # Re-run full initialization to rebuild deps/context/checkpoints
@@ -1003,6 +1082,59 @@ class FileProofCursor:
         depth_match = re.search(r'val it = (\d+)', depth_result)
         return int(depth_match.group(1)) if depth_match else None
 
+    async def _hierarchy_list(self) -> list[str] | None:
+        """The live heap's SaveState hierarchy, root first, or None if the
+        reply does not state it."""
+        reply = await self.session.send('PolyML.SaveState.showHierarchy();', timeout=5)
+        if "val it" not in reply:
+            return None
+        return [re.sub(r'\\(["\\])', r'\1', s)
+                for s in re.findall(r'"((?:[^"\\]|\\.)*)"', reply)]
+
+    async def _save_file(self, path: Path, anchor_ok: bool = False) -> str | None:
+        """saveChild the live heap to `path`: as a child of the base when
+        `anchor_ok` and the files chained since the last anchor outweigh it
+        (so a load walks a bounded chain), else of the newest state. Records
+        the file's parent for _gc_checkpoint_files. An error text, or None."""
+        hierarchy = await self._hierarchy_list()
+        if not hierarchy:
+            return self._DEPTH_UNREADABLE
+        depth = len(hierarchy)
+        anchor = (anchor_ok and self._base_depth is not None
+                  and depth > self._base_depth
+                  and self._chained_bytes > self._last_anchor_bytes)
+        save_depth = self._base_depth if anchor else depth
+        result = await self.session.send(
+            f'PolyML.SaveState.saveChild ("{escape_sml_string(str(path))}", {save_depth});',
+            timeout=60)
+        if _is_hol_error(result):
+            return result
+        self._save_parent[str(path)] = hierarchy[save_depth - 1]
+        size = path.stat().st_size if path.exists() else 0
+        if anchor:
+            self._last_anchor_bytes, self._chained_bytes = size, 0
+        else:
+            self._chained_bytes += size
+        return None
+
+    async def _gc_checkpoint_files(self) -> None:
+        """Delete the per-theorem saved states nothing can need any more: a
+        file stays while it is in the live heap's hierarchy or is an ancestor
+        of a checkpoint still held, since loading a file loads its parents."""
+        live = await self._hierarchy_list()
+        if live is None:
+            return
+        keep = set(live)
+        for ckpt in self._checkpoints.values():
+            for path in (ckpt.context_path, ckpt.end_of_proof_path):
+                node = str(path) if path is not None else None
+                while node is not None and node not in keep:
+                    keep.add(node)
+                    node = self._save_parent.get(node)
+        for name in [n for n in self._save_parent if n not in keep]:
+            Path(name).unlink(missing_ok=True)
+            del self._save_parent[name]
+
     async def _save_base_checkpoint(self) -> bool:
         """Save base checkpoint after dependencies loaded.
 
@@ -1029,6 +1161,10 @@ class FileProofCursor:
             return False
 
         self._base_checkpoint_saved = True
+        self._base_depth = depth + 1
+        self._last_anchor_bytes = (self._base_checkpoint_path.stat().st_size
+                                   if self._base_checkpoint_path.exists() else 0)
+        self._chained_bytes = 0
         return True
 
     async def _save_deps_checkpoint(self) -> bool:
@@ -1076,6 +1212,7 @@ class FileProofCursor:
         # Reset loaded state - no file content after restore
         self._loaded_to_line = 0
         self._loaded_content_hash = ""
+        self._reset_points()
         return True
 
     async def _rewind_or_reinit(self, thm: TheoremInfo | None, reason: str) -> str | None:
@@ -1093,10 +1230,12 @@ class FileProofCursor:
         Returns None on success, or an error string from the restart.
         """
         if thm is not None:
-            predecessor = self._find_predecessor_checkpoint(thm)
-            if (predecessor is not None
-                    and await self._load_context_checkpoint(predecessor.name)):
-                return None
+            # Nearest first; one whose point is refused (an opaque span or a
+            # module load since) and that has no file of its own leaves the
+            # next one back to try.
+            for predecessor in self._predecessor_checkpoints(thm):
+                if await self._load_context_checkpoint(predecessor.name):
+                    return None
         if await self._restore_to_deps():
             return None
         self._schedule_full_reinit(reason)
@@ -1134,11 +1273,13 @@ class FileProofCursor:
         return True
 
     def _is_context_checkpoint_valid(self, theorem_name: str) -> bool:
-        """Check if context checkpoint exists and is valid."""
+        """Check if a context checkpoint — a live point or a file — exists
+        and is valid."""
         ckpt = self._checkpoints.get(theorem_name)
         if ckpt is None:
             return False
-        if ckpt.context_path is None or not ckpt.context_path.exists():
+        if ckpt.point_id is None and (ckpt.context_path is None
+                                      or not ckpt.context_path.exists()):
             return False
         if (ckpt.content_hash != ""
                 and ckpt.content_hash != self._theorem_prefix_hash(theorem_name)):
@@ -1168,18 +1309,10 @@ class FileProofCursor:
 
         self._checkpoint_dir.mkdir(parents=True, exist_ok=True)
         ckpt_path = self._new_checkpoint_path(theorem_name, "end_of_proof")
-        ckpt_path_str = escape_sml_string(str(ckpt_path))
-
-        depth = await self._get_hierarchy_depth()
-        if depth is None:
-            self._note_checkpoint_save_failure(ckpt_path, self._DEPTH_UNREADABLE)
-            return False
         # Save checkpoint directly from current state
-        result = await self.session.send(
-            f'PolyML.SaveState.saveChild ("{ckpt_path_str}", {depth});', timeout=30
-        )
-        if _is_hol_error(result):
-            self._note_checkpoint_save_failure(ckpt_path, result)
+        error = await self._save_file(ckpt_path)
+        if error is not None:
+            self._note_checkpoint_save_failure(ckpt_path, error)
             return False
 
         # Merge with existing entry (may already have context_path). The hash
@@ -1197,6 +1330,7 @@ class FileProofCursor:
                 end_of_proof_path=ckpt_path,
                 content_hash=self._theorem_prefix_hash(theorem_name),
             )
+        self._checkpoints[theorem_name].end_of_proof_head = self._head_point
         return True
 
     def _note_checkpoint_save_failure(self, ckpt_path: Path, result: str) -> None:
@@ -1216,41 +1350,69 @@ class FileProofCursor:
         successor theorems — unlike end_of_proof checkpoints which have
         proof replay state but no theorem binding.
 
-        Called after each theorem loads in _load_context_to_line.
-        Unconditional — frequent checkpoints keep saveChild deltas small
-        and bound replay distance for backward navigation.
+        Called after each theorem loads in _load_context_to_line. Every call
+        takes an in-memory rewind point (one round trip, no disk); a
+        SaveState file only on the first call, after SAVESTATE_EVERY points,
+        after an opaque span, or when the point could not be taken. Files
+        keep the SaveState chain short; points make the common rewind cheap.
         """
+        self._point_seq += 1
+        reply = await self.session.send(f"mcp_point {self._point_seq};", timeout=30)
+        point_id = None if _is_hol_error(reply) else self._point_seq
+        if point_id is not None:
+            self._head_point = point_id
+
+        # Merge with any existing end_of_proof entry. The hash is refreshed
+        # too — see _save_end_of_proof_checkpoint.
+        ckpt = self._checkpoints.get(theorem_name) or TheoremCheckpoint(
+            theorem_name=theorem_name, tactics_count=0)
+        ckpt.point_id = point_id
+        ckpt.content_hash = self._theorem_prefix_hash(theorem_name)
+        if (point_id is None or self._force_savestate
+                or self._since_savestate + 1 >= self.SAVESTATE_EVERY):
+            if await self._save_context_file(theorem_name, ckpt):
+                self._since_savestate = 0
+                self._force_savestate = False
+        else:
+            self._since_savestate += 1
+        if ckpt.point_id is not None or ckpt.context_path is not None \
+                or ckpt.end_of_proof_path is not None:
+            self._checkpoints[theorem_name] = ckpt
+
+    # A SaveState file after this many in-memory points (and after any opaque
+    # span): a rewind no point can serve loads the nearest file instead.
+    SAVESTATE_EVERY = 16
+
+    def _forget_points_after(self, head: int) -> None:
+        """The live heap's newest rewind point is now `head`: points after it
+        are gone (a rewind dropped them, or a SaveState file saved when
+        `head` was newest replaced the heap)."""
+        for ckpt in self._checkpoints.values():
+            if ckpt.point_id is not None and ckpt.point_id > head:
+                ckpt.point_id = None
+        self._head_point = head
+        self._opaque_points = {p for p in self._opaque_points if p <= head}
+
+    def _reset_points(self) -> None:
+        """A heap holding no rewind point (a fresh HOL, the deps checkpoint)."""
+        self._forget_points_after(0)
+        self._since_savestate = self.SAVESTATE_EVERY - 1
+        self._force_savestate = False
+
+    async def _save_context_file(self, theorem_name: str, ckpt: TheoremCheckpoint) -> bool:
+        """SaveState the current heap as `ckpt`'s context file."""
         if not self._base_checkpoint_saved:
-            return
+            return False
 
         self._checkpoint_dir.mkdir(parents=True, exist_ok=True)
         ckpt_path = self._new_checkpoint_path(theorem_name, "context")
-        ckpt_path_str = escape_sml_string(str(ckpt_path))
-
-        depth = await self._get_hierarchy_depth()
-        if depth is None:
-            self._note_checkpoint_save_failure(ckpt_path, self._DEPTH_UNREADABLE)
-            return
-        result = await self.session.send(
-            f'PolyML.SaveState.saveChild ("{ckpt_path_str}", {depth});', timeout=60
-        )
-        if _is_hol_error(result):
-            self._note_checkpoint_save_failure(ckpt_path, result)
-            return
-
-        # Update checkpoint dict (merge with any existing end_of_proof entry).
-        # The hash is refreshed too — see _save_end_of_proof_checkpoint.
-        if theorem_name in self._checkpoints:
-            self._checkpoints[theorem_name].context_path = ckpt_path
-            self._checkpoints[theorem_name].content_hash = \
-                self._theorem_prefix_hash(theorem_name)
-        else:
-            self._checkpoints[theorem_name] = TheoremCheckpoint(
-                theorem_name=theorem_name,
-                tactics_count=0,
-                context_path=ckpt_path,
-                content_hash=self._theorem_prefix_hash(theorem_name),
-            )
+        error = await self._save_file(ckpt_path, anchor_ok=True)
+        if error is not None:
+            self._note_checkpoint_save_failure(ckpt_path, error)
+            return False
+        ckpt.context_path = ckpt_path
+        ckpt.context_head = self._head_point
+        return True
 
     async def _load_checkpoint_and_backup(self, theorem_name: str, target_tactic_idx: int) -> bool:
         """Load checkpoint and backup to target position.
@@ -1277,12 +1439,15 @@ class FileProofCursor:
             # loadState failure may leave PolyML in corrupted state.
             # Invalidate this checkpoint and reset tracking so the caller's
             # fallback path (full replay) can restart cleanly.
+            await self._record_checkpoint_chain(ckpt.end_of_proof_path, result)
             self._invalidate_checkpoint(theorem_name)
             self._loaded_to_line = 0
             self._loaded_content_hash = ""
             self._pos = SessionPosition()
             return False
         
+        self._forget_points_after(ckpt.end_of_proof_head)
+        await self._gc_checkpoint_files()
         # End-of-proof checkpoint has proof replay state but NO theorem binding
         # (proof was replayed via g/e, not loaded via QED). Set _loaded_to_line
         # to this theorem's proof_end_line — the session has content up to here
@@ -1307,12 +1472,37 @@ class FileProofCursor:
         Walks theorems backward from target, returning the closest one
         whose context checkpoint exists and content_hash matches.
         """
+        return next(self._predecessor_checkpoints(target_thm), None)
+
+    def _predecessor_checkpoints(self, target_thm: TheoremInfo):
+        """Predecessors with a valid context checkpoint, nearest first."""
         for thm in reversed(self._theorems):
             if thm.proof_end_line > target_thm.start_line:
                 continue  # Not a predecessor
             if self._is_context_checkpoint_valid(thm.name):
-                return thm
-        return None
+                yield thm
+
+    async def _record_checkpoint_chain(self, path: Path, load_result: str) -> None:
+        """Failure evidence for a checkpoint that would not load: its SaveState
+        parent chain, each with whether the file still exists — a missing
+        ancestor fails the load with ENOENT although `path` itself exists."""
+        chain, current = [], str(path)
+        for _ in range(32):
+            exists = Path(current).exists()
+            chain.append(f"{current} ({'exists' if exists else 'MISSING'})")
+            if not exists:
+                break
+            reply = await self.session.send(
+                f'PolyML.SaveState.showParent "{escape_sml_string(current)}";', timeout=10)
+            parent = re.search(r'SOME\s+"([^"]+)"', reply)
+            if parent is None:
+                break
+            current = parent.group(1)
+        record = getattr(self.session, "_record_failure", None)
+        if record is not None:
+            record(f'PolyML.SaveState.loadState "{path}";',
+                   load_result + "\nSaveState chain:\n" + "\n".join(chain),
+                   "checkpoint load")
 
     async def _load_context_checkpoint(self, theorem_name: str) -> bool:
         """Load a context checkpoint (theory state after theorem stored).
@@ -1321,10 +1511,20 @@ class FileProofCursor:
         has the theorem bound in theory — valid prefix for successors.
         Sets _loaded_to_line to the theorem's proof_end_line.
 
+        Rewinds in memory to the checkpoint's point when one is live and no
+        opaque span ran after it, else loads its SaveState file.
+
         Returns True if loaded successfully.
         """
         ckpt = self._checkpoints.get(theorem_name)
-        if ckpt is None or ckpt.context_path is None:
+        if ckpt is None:
+            return False
+        if await self._rewind_to_point(ckpt):
+            thm = self._get_theorem(theorem_name)
+            self._loaded_to_line = thm.proof_end_line if thm else 0
+            self._loaded_content_hash = ckpt.content_hash
+            return True
+        if ckpt.context_path is None:
             return False
         if not ckpt.context_path.exists():
             # File gone — clean up the stale reference
@@ -1338,9 +1538,9 @@ class FileProofCursor:
             f'PolyML.SaveState.loadState "{ckpt_path_str}";', timeout=30
         )
         if _is_hol_error(result):
-            # Remove just the context_path (keep end_of_proof if any)
-            if ckpt.context_path and ckpt.context_path.exists():
-                ckpt.context_path.unlink()
+            await self._record_checkpoint_chain(ckpt.context_path, result)
+            # Forget just the context_path (keep end_of_proof if any); the
+            # file may be a parent of other saves, so it stays until GC.
             ckpt.context_path = None
             self._loaded_to_line = 0
             self._loaded_content_hash = ""
@@ -1349,20 +1549,38 @@ class FileProofCursor:
                 self._checkpoints.pop(theorem_name, None)
             return False
 
+        self._forget_points_after(ckpt.context_head)
+        await self._gc_checkpoint_files()
         thm = self._get_theorem(theorem_name)
         self._loaded_to_line = thm.proof_end_line if thm else 0
         self._loaded_content_hash = ckpt.content_hash
         return True
 
+    async def _rewind_to_point(self, ckpt: TheoremCheckpoint) -> bool:
+        """Restore `ckpt`'s in-memory point: Context, loaded modules and the
+        bindings of every name the file bound since, which go back to their
+        earlier values (unbound ones shadowed by `()`). Refused — nothing
+        changed — when no point is live, an opaque span ran since (its
+        library's SML refs would keep their later values), or a module was
+        loaded since (loading seals a theory, which no restore takes back)."""
+        point = ckpt.point_id
+        if point is None or any(p >= point for p in self._opaque_points):
+            return False
+        reply = await self.session.send(f"mcp_rewind_json {point};", timeout=60)
+        data = _try_find_json_line(reply)
+        if "ok" not in data:
+            return False
+        unbound = [n for n in data["ok"] if _SML_IDENT_RE.fullmatch(n)]
+        if unbound:
+            await self.session.send(" ".join(f"val {n} = ();" for n in unbound), timeout=30)
+        self._forget_points_after(point)
+        return True
+
     def _invalidate_checkpoint(self, theorem_name: str) -> None:
-        """Invalidate and delete checkpoint for a theorem."""
-        ckpt = self._checkpoints.pop(theorem_name, None)
-        if not ckpt:
-            return
-        if ckpt.end_of_proof_path and ckpt.end_of_proof_path.exists():
-            ckpt.end_of_proof_path.unlink()
-        if ckpt.context_path and ckpt.context_path.exists():
-            ckpt.context_path.unlink()
+        """Forget a theorem's checkpoints. The files stay until cursor GC:
+        a later save may name one as its SaveState parent, and loading that
+        save needs the whole chain."""
+        self._checkpoints.pop(theorem_name, None)
 
     def _invalidate_all_checkpoints(self) -> None:
         """Invalidate all checkpoints (e.g., when file changes significantly)."""
@@ -1809,6 +2027,7 @@ class FileProofCursor:
 
         attrs = f"[{','.join(thm.attributes)}]" if thm.attributes else ""
         cheat_block = f'Theorem {thm.name}{attrs}:\n{thm.goal}\nProof\n  cheat\nQED'
+        await self._capture_bindings(cheat_block)
         result = await self.session.send(cheat_block, timeout=30)
         if f"val {thm.name}" in result:
             self._skipped_thms.add(thm.name)
@@ -1842,9 +2061,24 @@ class FileProofCursor:
             return 0
         return line - 1
 
+    _CAPTURED_PHASES = ("preceding theorem", "top-level SML/translation", "local SML block")
+
+    async def _capture_bindings(self, content: str) -> None:
+        """Before file content runs: record what its names are bound to, so
+        a rewind to the newest point can put them back; mark an opaque span."""
+        names = _bound_names(content)
+        if names:
+            await self.session.send(
+                f"mcp_capture {self._head_point} {_sml_string_list(names)};", timeout=30)
+        if _OPAQUE_RE.search(content):
+            self._opaque_points.add(self._head_point)
+            self._force_savestate = True
+
     async def _send_phase(self, content: str, timeout: float, phase: str,
                           item: str = "", start_line: int = 0,
                           end_line: int = 0) -> str:
+        if phase in self._CAPTURED_PHASES:
+            await self._capture_bindings(content)
         self._phase = {"phase": phase, "item": item, "file": str(self.file),
                        "start_line": start_line, "end_line": end_line,
                        "started": time.perf_counter(), "budget": timeout,
@@ -2126,6 +2360,7 @@ class FileProofCursor:
         else:
             self._step_plan = []
         self._step_plan_hash = self._content_hash
+        self._step_plan_statement = _statement_key(thm)
 
         self._active_theorem = name
         self._pos = SessionPosition()  # Reset position for new theorem
@@ -2610,6 +2845,7 @@ class FileProofCursor:
         """
         old_plan = list(self._step_plan)
         old_tactic_idx = self._pos.tactic_idx
+        old_statement = self._step_plan_statement
         self._invalidate_checkpoint(self._active_theorem)
 
         if thm.proof_body:
@@ -2628,10 +2864,11 @@ class FileProofCursor:
         else:
             self._step_plan = []
         self._step_plan_hash = self._content_hash
+        self._step_plan_statement = _statement_key(thm)
 
-        # Commands that match produce identical proof state.
-        # Keep the common prefix, redo from first divergence.
-        if (old_plan and self._step_plan
+        # Commands that match produce identical proof state — from the same
+        # starting goal only. Keep the common prefix, redo from first divergence.
+        if (old_plan and self._step_plan and old_statement == self._step_plan_statement
                 and self._pos.initialized and old_tactic_idx > 0):
             first_diff = self._common_prefix_length(old_plan)
             if first_diff > 0:
@@ -2673,8 +2910,14 @@ class FileProofCursor:
         return _NavResult(reached_idx=replayed, error_msg=replay_error, strategy=strategy)
 
     def _update_position(self, target: _TargetInfo, nav: _NavResult) -> None:
-        """Update session position tracking after successful navigation."""
+        """Update session position tracking after a navigation.
+
+        After an error the live goal stack sits wherever the replay stopped,
+        which no recorded position describes: forget the position, so the
+        next navigation sets the goal up again instead of replaying forward
+        from a step the stack has already passed."""
         if nav.error_msg is not None:
+            self._pos = SessionPosition()
             return
         self._pos = self._pos.at_step(target.tactic_idx, self._content_hash)
         # The session is now re-synced with the cache at this position; any
@@ -2990,9 +3233,19 @@ class FileProofCursor:
         An overall-budget timeout aborts a tactic partway, leaving the live
         proofManager goal stack at an unknown point. Discard the cached
         position and flag the session dirty so the next state_at rebuilds the
-        goal from scratch instead of trusting a stale checkpoint."""
+        goal from scratch instead of trusting a stale checkpoint.
+
+        An abort inside the prefix load (a dependency, a preceding theorem, a
+        top-level span) may have run part of a span past `_loaded_to_line`;
+        sending it again would re-run what already ran (a duplicate
+        definition, a simpset fragment removed twice). The next entry rewinds
+        to a checkpoint taken before it instead, as after an edit."""
         self._pos = SessionPosition()
         self._session_dirty = True
+        if self._phase.get("interrupted"):
+            self._phase["interrupted"] = False
+            self._context_rewind_pending = True
+            self._active_theorem = None
 
     def _parse_goals_json(self, output: str) -> list[dict]:
         """Parse JSON goal output from goals_json().
