@@ -376,48 +376,49 @@ and reexpand_group_atoms_in arm frags =
        running the LT op once per source. The two diverge in multi-goal
        contexts. Keep Group opaque so goalFrag.expand runs the whole tactic
        atomically per source goal — matches Holmake. *)
-    (* Mutually recursive: an LT element is goal-positional if it's a direct
-       goal-positional op (LThen1/LFirst/LTacsToLT/LSplit) OR a wrapper
-       (LNullOk/LRepeat/LTry/LFirstLT) around an expression that itself
-       contains goal-positional structure. Empirically `>|` parses as
-       `ThenLT(_, [LNullOk (LTacsToLT _)])` so the wrapper form matters. *)
-    fun ltElemIsGoalPositional (TacticParse.LThen1 _) = true
-      | ltElemIsGoalPositional (TacticParse.LFirst _) = true
-      | ltElemIsGoalPositional (TacticParse.LTacsToLT _) = true
-      | ltElemIsGoalPositional (TacticParse.LSplit _) = true
-      | ltElemIsGoalPositional (TacticParse.LNullOk e) = exprHasGoalPositional e
-      | ltElemIsGoalPositional (TacticParse.LRepeat e) = exprHasGoalPositional e
-      | ltElemIsGoalPositional (TacticParse.LTry e) = exprHasGoalPositional e
-      | ltElemIsGoalPositional (TacticParse.LFirstLT e) = exprHasGoalPositional e
-      | ltElemIsGoalPositional _ = false
-    and lsHasGoalPositional ls = List.exists ltElemIsGoalPositional ls
-    (* Recursive: any nested sub-expression contains a goal-positional LT
-       operator? Used to issue a WARNING when a Group is re-expanded but
-       its body contains a deeper sub-expression with goal-positional LT —
-       those inner LT ops would still execute globally inside the
-       re-expanded fragments, diverging from Holmake if the Group is in a
-       per-goal context. The static composability check only catches the
-       case where the Group's body is DIRECTLY a goal-positional ThenLT. *)
-    and exprHasGoalPositional (TacticParse.Then es) =
-          List.exists exprHasGoalPositional es
-      | exprHasGoalPositional (TacticParse.ThenLT (e, ls)) =
-          exprHasGoalPositional e orelse lsHasGoalPositional ls
-      | exprHasGoalPositional (TacticParse.LThenLT ls) = lsHasGoalPositional ls
-      | exprHasGoalPositional (TacticParse.Group (_, _, e)) =
-          exprHasGoalPositional e
-      (* These tac_expr constructors are goal-positional themselves when
-         they appear as expressions (not just as LT-elements inside a
-         ThenLT). LTacsToLT/LSplit/etc. can be wrapped by LNullOk and
-         appear as the inner expression of an LT-element. *)
-      | exprHasGoalPositional (TacticParse.LThen1 _) = true
-      | exprHasGoalPositional (TacticParse.LFirst _) = true
-      | exprHasGoalPositional (TacticParse.LTacsToLT _) = true
-      | exprHasGoalPositional (TacticParse.LSplit _) = true
-      | exprHasGoalPositional (TacticParse.LRepeat e) = exprHasGoalPositional e
-      | exprHasGoalPositional (TacticParse.LTry e) = exprHasGoalPositional e
-      | exprHasGoalPositional (TacticParse.LNullOk e) = exprHasGoalPositional e
-      | exprHasGoalPositional (TacticParse.LFirstLT e) = exprHasGoalPositional e
-      | exprHasGoalPositional _ = false
+    (* An expression is goal-positional if it contains, at any depth, an
+       operator that picks goals by position or pattern: `>-`, `>|`,
+       `>>>` with NTH_GOAL/LASTGOAL/HEADGOAL/FIRST_LT, a split, or a
+       goal selection. The same test serves an LT element and a Group
+       body: `>|` parses as `ThenLT(_, [LNullOk (LTacsToLT _)])`, and a
+       positional operator under TRY, REPEAT, FIRST, MAP_EVERY or `by`
+       still runs once per goal the enclosing tactic is applied to. *)
+    fun exprHasGoalPositional e =
+          case e of
+            TacticParse.LThen1 _ => true
+          | TacticParse.LFirst _ => true
+          | TacticParse.LTacsToLT _ => true
+          | TacticParse.LSplit _ => true
+          | TacticParse.LNthGoal _ => true
+          | TacticParse.LLastGoal _ => true
+          | TacticParse.LHeadGoal _ => true
+          | TacticParse.LSelectThen _ => true
+          | TacticParse.LSelectGoal _ => true
+          | TacticParse.LSelectGoals _ => true
+          | TacticParse.Then es => lsHasGoalPositional es
+          | TacticParse.ThenLT (e, ls) =>
+              exprHasGoalPositional e orelse lsHasGoalPositional ls
+          | TacticParse.LThen (e, ls) =>
+              exprHasGoalPositional e orelse lsHasGoalPositional ls
+          | TacticParse.LThenLT ls => lsHasGoalPositional ls
+          | TacticParse.First es => lsHasGoalPositional es
+          | TacticParse.FirstProve es => lsHasGoalPositional es
+          | TacticParse.MapEvery (_, es) => lsHasGoalPositional es
+          | TacticParse.MapFirst (_, es) => lsHasGoalPositional es
+          | TacticParse.List (_, es) => lsHasGoalPositional es
+          | TacticParse.Try e => exprHasGoalPositional e
+          | TacticParse.Repeat e => exprHasGoalPositional e
+          | TacticParse.By (_, _, e) => exprHasGoalPositional e
+          | TacticParse.SufficesBy (_, _, e) => exprHasGoalPositional e
+          | TacticParse.LAllGoals e => exprHasGoalPositional e
+          | TacticParse.LRepeat e => exprHasGoalPositional e
+          | TacticParse.LTry e => exprHasGoalPositional e
+          | TacticParse.LNullOk e => exprHasGoalPositional e
+          | TacticParse.LFirstLT e => exprHasGoalPositional e
+          | TacticParse.Group (_, _, e) => exprHasGoalPositional e
+          | TacticParse.RepairGroup (_, _, e, _) => exprHasGoalPositional e
+          | _ => false
+    and lsHasGoalPositional ls = List.exists exprHasGoalPositional ls
     fun isComposable (TacticParse.Then _) = true
       | isComposable (TacticParse.ThenLT (_, ls)) =
           not (lsHasStructuralOnly ls) andalso
@@ -882,12 +883,11 @@ val _ = load "Defn" handle _ => ();
 exception MCP_TC_Rollback;
 
 (* The body arrives as the quotation HOL's own filter would compile, so its
-   ANTIQUOTE frags name SML values of the session. The goal goes back as a
-   string that is reparsed in the file's grammar: with every variable and
-   numeral typed, an unannotated `-` or `<` cannot resolve to another
-   overload there (int, once integerTheory is open). *)
-(* Each extracted termination goal, as a term, by the Definition's name: the
-   goal is set from it, not re-parsed from its printed form. *)
+   ANTIQUOTE frags name SML values of the session. Each extracted termination
+   goal is kept as a term, by the Definition's name, and the goal is set from
+   it. The printed form goes back too, as the fallback: with every variable
+   and numeral typed, an unannotated `-` or `<` cannot resolve to another
+   overload when it is reparsed (int, once integerTheory is open). *)
 val mcp_tc_goals : (string * term) list ref = ref [];
 
 fun extract_tc_goal_json_named name (q : term frag list) =
@@ -1161,10 +1161,11 @@ fun mcp_rewind_json id =
            val values = before (rev undo, [])
            val unbound = List.mapPartial (fn (n, NONE) => SOME n | _ => NONE) values
          in
-           List.app (fn (n, SOME v) => #enterVal PolyML.globalNameSpace (n, v)
-                      | _ => ()) values;
+           (* The restores can fail; the namespace changes only after them. *)
            Context.restore ctx;
            restore_loaded ();
+           List.app (fn (n, SOME v) => #enterVal PolyML.globalNameSpace (n, v)
+                      | _ => ()) values;
            mcp_points := List.filter (fn (i, _, _, _) => i <= id) (!mcp_points);
            mcp_captures := keep;
            print (json_ok (json_string_array unbound) ^ "\n")

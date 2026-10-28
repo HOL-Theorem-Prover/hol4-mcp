@@ -309,3 +309,110 @@ async def test_server_sigint_cancels_the_running_call(tmp_path):
         assert "val it = 6" in await hol_send("6;", session=session)
     finally:
         await hol_stop(session=session)
+
+
+def _slow_start(monkeypatch, started):
+    """HOLSession.start that has started HOL but has not returned."""
+    from hol4_mcp.hol_session import HOLSession
+    real = HOLSession.start
+
+    async def start(self):
+        await real(self)
+        started.append(self)
+        await asyncio.sleep(60)
+    monkeypatch.setattr(HOLSession, "start", start)
+
+
+async def _until(predicate, seconds):
+    deadline = time.monotonic() + seconds
+    while not predicate():
+        assert time.monotonic() < deadline
+        await asyncio.sleep(0.05)
+
+
+async def test_interrupt_reaches_a_call_still_starting_the_session(tmp_path, monkeypatch):
+    session, started = "cp_start_interrupt", []
+    _slow_start(monkeypatch, started)
+    call = asyncio.create_task(hol_start(workdir=str(tmp_path), name=session))
+    try:
+        await _until(lambda: started, 60)
+        reply = await asyncio.wait_for(hol_interrupt(session=session), 30)
+        assert "Interrupted the hol_start call" in reply, reply
+        result = await asyncio.wait_for(call, 10)
+        assert result.startswith("INTERRUPTED"), result
+        assert not started[0].is_running
+    finally:
+        await hol_stop(session=session)
+
+
+async def test_stop_reaches_a_call_still_starting_the_session(tmp_path, monkeypatch):
+    session, started = "cp_start_stop", []
+    _slow_start(monkeypatch, started)
+    call = asyncio.create_task(hol_start(workdir=str(tmp_path), name=session))
+    try:
+        await _until(lambda: started, 60)
+        reply = await asyncio.wait_for(hol_stop(session=session), 30)
+        assert "Stopped the hol_start call" in reply, reply
+        result = await asyncio.wait_for(call, 10)
+        assert result.startswith("STOPPED"), result
+        assert not started[0].is_running
+    finally:
+        await hol_stop(session=session)
+
+
+async def test_restart_keeps_a_forced_second_session(tmp_path):
+    first, second = "cp_forced_a", "cp_forced_b"
+    await hol_start(workdir=str(tmp_path), name=first)
+    try:
+        assert "started" in await hol_start(workdir=str(tmp_path), name=second, force=True)
+        restarted = await asyncio.wait_for(hol_restart(session=first), 60)
+        assert "started" in restarted and "refusing" not in restarted, restarted
+        assert _sessions[first].session.is_running
+        assert _sessions[second].session.is_running
+    finally:
+        await hol_stop(session=first)
+        await hol_stop(session=second)
+
+
+async def test_session_listing_does_not_reparse_the_file(tmp_path):
+    from hol4_mcp.hol_mcp_server import hol_sessions
+    script = tmp_path / "lstScript.sml"
+    script.write_text('open HolKernel Parse boolLib bossLib;\n'
+                      'val _ = new_theory "lst";\n'
+                      'Theorem t: T\nProof\n  simp[]\nQED\n'
+                      'val _ = export_theory();\n')
+    session = "cp_listing"
+    try:
+        await _init_file_cursor(file=str(script), session=session)
+        cursor, reparsed = _sessions[session].cursor, []
+        cursor._reparse_if_changed = lambda: reparsed.append(1)
+        listing = await hol_sessions()
+        assert session in listing, listing
+        assert reparsed == []
+    finally:
+        await hol_stop(session=session)
+
+
+def test_orphan_gc_keeps_a_live_cursors_checkpoints(tmp_path, monkeypatch):
+    from types import SimpleNamespace
+    from hol4_mcp.hol_mcp_server import _gc_workdir_orphans
+    live = tmp_path / "a" / ".hol" / "cursor_checkpoints"
+    orphan = tmp_path / "b" / ".hol" / "cursor_checkpoints"
+    for d in (live, orphan):
+        d.mkdir(parents=True)
+        (d / "t_context.save").write_text("")
+    monkeypatch.setitem(_sessions, "cp_gc_live", SimpleNamespace(
+        cursor=SimpleNamespace(_checkpoint_dir=live)))
+    _gc_workdir_orphans(tmp_path)
+    assert (live / "t_context.save").exists()
+    assert not (orphan / "t_context.save").exists()
+
+
+def test_clip_reports_the_count_it_elided():
+    import re
+    from hol4_mcp.hol_mcp_server import _clip
+    output = "".join(chr(97 + i % 26) for i in range(10000))
+    clipped = _clip(output, 1000)
+    marker = re.search(r"\n\n\[\.\.\. (\d+) bytes elided \.\.\.\]\n\n", clipped)
+    kept = len(clipped) - len(marker.group(0))
+    assert kept + int(marker.group(1)) == len(output) and len(clipped) <= 1000

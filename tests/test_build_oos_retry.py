@@ -1,8 +1,8 @@
-"""`holmake` and Poly/ML's out-of-store failure: every build passes
-Holmake's own --retry-oos=1, and a sequential build (jobs=1) that runs out of
-store is re-run once by the server, synchronous or detached. A stand-in
-Holmake hands dependency discovery to the real one and fails a build run with
-the out-of-store message the given number of times."""
+"""`holmake` and Poly/ML's out-of-store failure: a build that may run in
+parallel passes Holmake's own --retry-oos=1, and a sequential build (jobs=1)
+that runs out of store is re-run once by the server, synchronous or detached.
+A stand-in Holmake hands dependency discovery to the real one and fails a
+build run with the given message the given number of times."""
 import asyncio
 import re
 import stat
@@ -19,7 +19,7 @@ SCRIPT = ('open HolKernel Parse boolLib bossLib;\n'
 @pytest.fixture
 def flaky_holmake(tmp_path, monkeypatch):
     """Returns ``(workdir, runs)``; ``runs()`` lists each build run's args."""
-    def make(failures):
+    def make(failures, message="Run out of store - interrupting threads"):
         holdir = tmp_path / "fakeHOL"
         (holdir / "bin").mkdir(parents=True)
         fake = holdir / "bin" / "Holmake"
@@ -28,7 +28,7 @@ def flaky_holmake(tmp_path, monkeypatch):
             f'case " $* " in *" --json "*) exec "{HOLDIR}/bin/Holmake" "$@";; esac\n'
             f'echo "$*" >> "{tmp_path}/runs"\n'
             f'if [ "$(wc -l < "{tmp_path}/runs")" -le {failures} ]; then\n'
-            '  echo "Run out of store - interrupting threads"; exit 1\nfi\n'
+            f'  echo "{message}"; exit 1\nfi\n'
             f'exec "{HOLDIR}/bin/Holmake" "$@"\n')
         fake.chmod(fake.stat().st_mode | stat.S_IXUSR)
         monkeypatch.setattr(srv, "HOLDIR", holdir)
@@ -48,7 +48,7 @@ async def test_sequential_build_is_rerun_once_after_running_out_of_store(flaky_h
     result = await srv.holmake(str(work), target="aaTheory", jobs=1, timeout=120)
     assert result.startswith("Build succeeded"), result
     assert "re-run once after Poly/ML ran out of store" in result.splitlines()[0], result
-    assert len(runs()) == 2 and all("--retry-oos=1" in r for r in runs()), runs()
+    assert len(runs()) == 2 and not any("--retry-oos" in r for r in runs()), runs()
 
 
 async def test_second_out_of_store_failure_is_reported_as_is(flaky_holmake):
@@ -76,6 +76,54 @@ async def test_detached_sequential_build_is_rerun_once(flaky_holmake):
         assert len(runs()) == 2, runs()
     finally:
         await srv.hol_build_status(job, cancel=True)
+
+
+async def test_status_summary_does_not_depend_on_the_tail(flaky_holmake):
+    work, _ = flaky_holmake(failures=1)
+    started = await srv.holmake(str(work), target="aaTheory", jobs=1, detach=True)
+    job = re.search(r"job=(\S+)", started).group(1)
+    try:
+        status = await srv.hol_build_status(job, wait=120, tail=0)
+        assert "Build succeeded" in status, status
+        assert "re-run once after Poly/ML ran out of store" in status, status
+    finally:
+        await srv.hol_build_status(job, cancel=True)
+
+
+async def test_detached_retry_reads_only_the_runs_output(flaky_holmake, monkeypatch):
+    """The marker in the discovery text before the run is not the run's."""
+    work, runs = flaky_holmake(failures=1, message="a real failure")
+    real_claim = srv._build_claim
+
+    async def claim_quoting_the_marker(*args, **kwargs):
+        claim = await real_claim(*args, **kwargs)
+        claim.preflight_output += "Run out of store - interrupting threads\n"
+        return claim
+
+    monkeypatch.setattr(srv, "_build_claim", claim_quoting_the_marker)
+    started = await srv.holmake(str(work), target="aaTheory", jobs=1, detach=True)
+    job = re.search(r"job=(\S+)", started).group(1)
+    try:
+        status = await srv.hol_build_status(job, wait=120)
+        assert "a real failure" in status, status
+        assert len(runs()) == 1, runs()
+    finally:
+        await srv.hol_build_status(job, cancel=True)
+
+
+async def test_no_build_runs_once_discovery_used_the_budget(flaky_holmake, monkeypatch):
+    work, runs = flaky_holmake(failures=0)
+    real_claim = srv._build_claim
+
+    async def slow_claim(*args, **kwargs):
+        claim = await real_claim(*args, **kwargs)
+        await asyncio.sleep(1.2)
+        return claim
+
+    monkeypatch.setattr(srv, "_build_claim", slow_claim)
+    result = await srv.holmake(str(work), target="aaTheory", jobs=1, timeout=1)
+    assert result.startswith("ERROR: Build timed out"), result
+    assert runs() == [], runs()
 
 
 def test_summary_reports_holmakes_own_retries():

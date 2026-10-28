@@ -342,11 +342,12 @@ remote without -add/-rm, branch listing) are unmatched and pass through.
 - A verb is matched as a whole token: `git merge-base` is not `git merge`.
 - Read-only forms of destructive verbs: `git stash list`, `git stash show`,
   `git clean -n` / `--dry-run` (any short-flag cluster containing `n`).
-- Text the shell would not execute: quoted strings and heredoc bodies are
-  blanked before matching (`hook_payload.visible_command`), so a commit
-  message or an `echo` mentioning `git checkout` passes. What the shell WOULD
-  run inside a string is kept and still matched: `$(git stash)`, backticks,
-  and the argument of `bash -c` / `eval`.
+- Text the shell would not execute: quoted strings, `#` comments and heredoc
+  bodies are blanked before matching (`hook_payload.visible_command`), so a
+  commit message or an `echo` mentioning `git checkout` passes. What the shell
+  WOULD run is kept and still matched: a quoted single word (`git "push"`),
+  `$(git stash)`, backticks, the argument of `bash -c` / `eval`, and a command
+  joined by a backslash-newline.
 
 ### Consent mechanism
 
@@ -363,9 +364,10 @@ skipped (`hook_payload._user_turn_text`). A slash command counts as a turn,
 so it ends an earlier message's grant, but its arguments grant nothing. The
 soft hooks' pre-grants read the same turns.
 
-`git ok` is a one-shot grant tied to that specific message — it does not
-persist across subsequent user messages. If you say `git ok` and I push;
-your next message without `git ok` does NOT consent to another push. This is
+`git ok` is a grant tied to that specific message: it covers the git calls
+of the agent turn that answers it, and does not persist across subsequent
+user messages. If you say `git ok` and I push, your next message without
+`git ok` does NOT consent to another push. This is
 the HARD shape, shared only with H27's `wip ok`; the soft hooks (H28–H33)
 pre-grant from any earlier message and pass on a deliberate retry instead
 (see *Soft hooks*).
@@ -674,8 +676,8 @@ agent must not miss. They share one protocol (`hook_payload.soft_block`):
    decisions surface where the work is recorded.
 
 The hard hooks are unchanged: H14 (`git ok`) and H27 (`wip ok`) read the
-latest user message only and never pass on a retry; H1, H17, H20 and H23
-block a wrong tactic form outright, with no override.
+latest user message only and never pass on a retry; H1, H17, H18, H20 and
+H23 block a wrong tactic form or query outright, with no override.
 
 ## Installing the full suite
 
@@ -776,8 +778,8 @@ Two files here are **not** hooks — `install_hooks.py` discovers only
 - `hook_payload.py` — `output_text(payload)` (a PostToolUse result flattened to
   searchable text, strings kept raw), `latest_user_message(payload)` (newest
   turn the user typed, for the consent-gated hooks) and `visible_command(command)`
-  (a Bash command with quoted strings and heredoc bodies blanked, keeping the
-  substitutions and `-c`/`eval` arguments the shell would still run — what
+  (a Bash command with quoted strings, comments and heredoc bodies blanked,
+  keeping what the shell would still run — what
   H14 and H28 match against), plus the soft-hook protocol: `granted` /
   `pregranted` (a phrase in any user turn), `soft_block` (block once, pass an
   identical retry with a note, log it), `overrides_summary` (the tally H14

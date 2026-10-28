@@ -75,6 +75,9 @@ class HOLSession:
         # (command, diagnostic line) pairs, so a reader can separate what HOL
         # said about the caller's own tactics from prefix-loading chatter.
         self.diagnostics: list[tuple[str, str]] = []
+        # Diagnostics ever recorded: `diagnostics` keeps only the newest 500,
+        # so a reader takes its own as the last (seen - seen_before) entries.
+        self.diagnostics_seen = 0
         self._resync_seq = 0              # distinct sentinel per resync
         # A command timed out and HOL has not answered a sentinel since: it is
         # still running, so no new command may be written behind it.
@@ -262,12 +265,12 @@ class HOLSession:
             return "ERROR: HOL not running"
 
         async with self._lock:
-            if self.busy and not (await self._realign(timeout=1))[0]:
+            if ((self.busy and not (await self._realign(timeout=1))[0])
+                    or (self._unclaimed_sentinel and not (await self._realign(timeout=5))[0])):
+                self.busy = True
                 return (f"ERROR: {BUSY_TEXT} Nothing was sent. hol_interrupt "
                         f"may stop it; hol_stop ends the session (the next call "
                         f"restarts HOL and reloads the prefix).")
-            if self._unclaimed_sentinel:
-                await self._realign(timeout=5)
             await self._drain_pipe()
             await self._write_command(sml_code)
 
@@ -278,6 +281,8 @@ class HOLSession:
                 partial = self._buffer.decode("utf-8", errors="replace")
                 self.interrupt()
                 aligned, remaining = await self._realign(timeout=5)
+                if not aligned and not self.is_running:
+                    raise RuntimeError(await self._death_reason())
                 if aligned:
                     msg = f"TIMEOUT after {timeout}s - sent interrupt."
                 else:
@@ -302,11 +307,12 @@ class HOLSession:
         HOL can finish a command without sending its reply frame (a SIGINT
         from outside the server stops it that way). When no byte has arrived
         and HOL has used no CPU for LOST_REPLY_CHECKS checks in a row, write a
-        sentinel: if its reply is the next frame, the command's own was lost.
-        A command that legitimately sleeps that long without CPU is reported
-        as lost too."""
+        sentinel: HOL reads it only once the command is over, so if the
+        sentinel's reply comes with no reply before it, the command's own was
+        lost. A command that merely sleeps answers first and is returned as
+        usual; the sentinel's reply is then swallowed by the next send."""
         reader = asyncio.ensure_future(self._read_response(timeout))
-        idle_checks, seen, sentinel = 0, 0, None
+        idle_checks, seen, sentinel, claimed = 0, 0, None, False
         try:
             while True:
                 done, _ = await asyncio.wait({reader}, timeout=self.LOST_REPLY_INTERVAL)
@@ -314,7 +320,14 @@ class HOLSession:
                     frame = reader.result()
                     if sentinel is None:
                         return frame
+                    claimed = True
                     if sentinel in frame:
+                        # One read can hold the command's reply and then the
+                        # sentinel's: only a frame with nothing before the
+                        # sentinel means the reply was lost.
+                        before = frame[:frame.index(sentinel)].rstrip()
+                        if before:
+                            return before
                         return (f"ERROR: HOL finished this command without sending "
                                 f"its reply (idle for {idle_checks * self.LOST_REPLY_INTERVAL:g}s"
                                 f" with no output); its output is lost. The session "
@@ -332,6 +345,8 @@ class HOLSession:
                     sentinel = f"HOL_MCP_RESYNC_{self._resync_seq}"
                     await self._write_command(f'print "{sentinel}\\n";')
         finally:
+            if sentinel is not None and not claimed:
+                self._unclaimed_sentinel = True
             if not reader.done():
                 reader.cancel()
                 await asyncio.wait({reader})
@@ -347,6 +362,7 @@ class HOLSession:
         """Record HOL diagnostics from one reply; returns the reply unchanged."""
         for m in _DIAGNOSTIC_RE.finditer(output):
             self.diagnostics.append((command, m.group(1).strip()))
+            self.diagnostics_seen += 1
         if len(self.diagnostics) > 500:
             del self.diagnostics[:-500]
         if record_failure and _FAILURE_RE.search(output):
@@ -365,7 +381,7 @@ class HOLSession:
 
             parts = self._buffer.split(b'\0')
             self._buffer = b""
-            result = "\n".join(p.decode() for p in parts if p)
+            result = "\n".join(p.decode("utf-8", errors="replace") for p in parts if p)
             return strip_ansi(result) if self.strip_ansi else result
 
         return await asyncio.wait_for(read_loop(), timeout=timeout)

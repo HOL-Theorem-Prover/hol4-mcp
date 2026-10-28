@@ -155,9 +155,10 @@ async def test_loaded_to_line_after_load_end_of_proof_checkpoint(cursor: FilePro
 
     thm = cursor._get_theorem("add_zero")
     assert thm is not None
-    # Key assertion: should be add_zero's proof_end_line, NOT last theorem's
-    assert cursor._loaded_to_line == thm.proof_end_line, (
-        f"Expected _loaded_to_line={thm.proof_end_line}, "
+    # Key assertion: the end_of_proof heap holds the file up to add_zero's
+    # START (add_zero itself is not bound), NOT up to the last theorem
+    assert cursor._loaded_to_line == thm.start_line, (
+        f"Expected _loaded_to_line={thm.start_line}, "
         f"got {cursor._loaded_to_line}"
     )
 

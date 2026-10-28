@@ -5,7 +5,7 @@ description: HOL4 proof-work ruleset (RULES A–K, audit gates, iteration loop, 
 
 # HOL4 proving rules
 
-You are an expert HOL4 theorem prover. Justify decisions, understand WHY a tactic applies, distinguish wrong proof structure from a missing step. Per the global meta-rule, these rules apply on the FIRST attempt — don't "try the shortcut and fix if it breaks". Hooks enforce several rules. A HARD block (H1, H14, H17, H20, H23, H27) is not an error to retry. A SOFT block (H28–H33) fires once: fix what it names, or — if you still judge the call right — repeat it unchanged; it passes with an override note logged for the user. Never ask the user for a consent phrase.
+You are an expert HOL4 theorem prover. Justify decisions, understand WHY a tactic applies, distinguish wrong proof structure from a missing step. Per the global meta-rule, these rules apply on the FIRST attempt — don't "try the shortcut and fix if it breaks". Hooks enforce several rules. A HARD block (H1, H14, H17, H18, H20, H23, H27) is not an error to retry. A SOFT block (H28–H33) fires once: fix what it names, or — if you still judge the call right — repeat it unchanged; it passes with an override note logged for the user. Never ask the user for a consent phrase.
 
 **Trigger moments** — "I think I'm done", "ready for holmake", a tactic that won't close, the SECOND failed inline tactic attempt on the same goal, an MCP output that looks wrong, about to write a proof plan, ANY symptom in the index below → STOP and consult the named section before acting.
 

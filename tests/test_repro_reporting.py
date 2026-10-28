@@ -273,8 +273,10 @@ class _QuietSession:
     depth for ``showHierarchy`` and a real file for ``saveChild``."""
 
     async def send(self, command, timeout=None):
-        if "showHierarchy" in command:
+        if "length (PolyML.SaveState.showHierarchy" in command:
             return "> val it = 3 : int"
+        if "showHierarchy" in command:
+            return '> val it = ["state0", "heap", "base"] : string list'
         m = re.search(r'saveChild\s*\("([^"]+)"', command)
         if m:
             Path(m.group(1)).write_text("stub checkpoint")

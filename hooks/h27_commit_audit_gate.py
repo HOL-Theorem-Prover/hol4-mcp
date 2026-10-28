@@ -10,16 +10,16 @@ mechanical moment: when proof code leaves your hands.
 
 DIFF-SCOPED. Only what this commit introduces is judged:
   - unchanged inherited composition findings are matched against HEAD;
-  - banned tactics, `cheat` and `[local]` helpers count only on ADDED lines.
+  - banned tactics and `cheat` count only on ADDED lines.
 The proposed bytes come from the index, or the selected tracked worktree files
 for -a/--only/--include. This hook never changes the real index.
 
-Checks (skill audit gates 1, 2, 3, 5, 6 + the composition sweep):
+Checks (skill audit gates 1, 2, 3, 5 + the composition sweep; Gate 6 is not
+enforced, see below):
   Gate 1  a Resume block added -- name the (a)/(b) justification or inline it
   Gate 2  a theorem left with Resume but no Finalise
   Gate 3  `cheat` added
   Gate 5  banned tactics added
-  Gate 6  a `[local]` helper added that is used once
   sweep   proof_sweep.py over each touched theorem
 
 Override: put `wip ok` in the message alongside `git ok`. Deliberate WIP commits
@@ -61,8 +61,6 @@ BANNED = [(re.compile(r"\bTRY\b"), "TRY"), (re.compile(r"\bORELSE\b"), "ORELSE")
           (re.compile(r">\|", ), ">|")]
 BLOCK_START = re.compile(r"^(Theorem|Definition|Triviality|Resume)\s+([A-Za-z0-9_']+)")
 BLOCK_END = re.compile(r"^(QED|End)\b")
-LOCAL_DEF = re.compile(r"^Theorem\s+([A-Za-z0-9_']+)\s*\[[^\]]*\blocal\b")
-COMMENT = re.compile(r"\(\*.*?\*\)", re.DOTALL)
 MAX_SHOWN = 12
 # Calibrated so a reviewed, cleaned proof script reports NOTHING. Gate 1 keeps a
 # per-case Resume ladder, so only a short one reads as the deferred tail it calls

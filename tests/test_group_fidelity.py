@@ -46,6 +46,45 @@ val _ = export_theory();
 """
 
 
+# The inner conj_tac gives each goal [n = n, T]. Per goal, LASTGOAL closes
+# `T`, and the `>-` under TRY closes `n = n`; flattened over both goals, each
+# acts on one goal of four and the next step meets a goal it cannot close.
+NESTED_SCRIPT = """\
+open HolKernel Parse boolLib bossLib;
+
+val _ = new_theory "nst";
+
+Theorem last_goal:
+  ((0 = 0) /\\ T) /\\ ((1 = 1) /\\ T)
+Proof
+  conj_tac \\\\ (conj_tac >>> LASTGOAL (ACCEPT_TAC TRUTH) \\\\ REFL_TAC)
+QED
+
+Theorem under_try:
+  ((0 = 0) /\\ T) /\\ ((1 = 1) /\\ T)
+Proof
+  conj_tac \\\\ (TRY (conj_tac >- REFL_TAC) \\\\ ACCEPT_TAC TRUTH)
+QED
+
+val _ = export_theory();
+"""
+
+
+@pytest.mark.parametrize("theorem", ["last_goal", "under_try"])
+async def test_nested_goal_positional_group_runs_per_goal(tmp_path, theorem):
+    script = tmp_path / "nstScript.sml"
+    script.write_text(NESTED_SCRIPT)
+    built = await holmake(str(tmp_path), target="nstTheory", timeout=120)
+    assert "Build succeeded" in built, built
+    session = f"nst_{theorem}"
+    try:
+        await _init_file_cursor(file=str(script), session=session)
+        checked = await hol_check_proof(theorem=theorem, session=session)
+        assert "Status: OK" in checked, checked
+    finally:
+        await hol_stop(session=session)
+
+
 @pytest.mark.parametrize("theorem", ["in_arm", "in_selected_arm"])
 async def test_group_inside_an_arm_runs_per_goal(tmp_path, theorem):
     script = tmp_path / "grpScript.sml"

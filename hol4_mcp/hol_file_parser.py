@@ -30,15 +30,20 @@ class HOLParseError(Exception):
     pass
 
 
-class StepPlanTimeout(HOLParseError):
-    """The step-plan request ran out of time: no plan, but nothing wrong
-    with the proof text either."""
+class StepPlanUnavailable(HOLParseError):
+    """No step plan, for a reason that is not the proof text's: the request
+    timed out, or the session refused it (busy, not running, reply lost)."""
+    pass
+
+
+class StepPlanTimeout(StepPlanUnavailable):
+    """The step-plan request ran out of time."""
     pass
 
 
 def step_plan_error(error: HOLParseError) -> str:
     """The message for a step plan that could not be computed."""
-    if isinstance(error, StepPlanTimeout):
+    if isinstance(error, StepPlanUnavailable):
         return str(error)
     return f"Failed to parse step plan: {error}"
 
@@ -467,6 +472,9 @@ def parse_step_plan_output(output: str, body: str | None = None) -> list[StepPla
         raise StepPlanTimeout(
             f"TIMEOUT computing the step plan; the proof text was not parsed "
             f"in time: {output.splitlines()[0]}")
+    if output.lstrip().startswith("ERROR:"):
+        raise StepPlanUnavailable(
+            f"The step plan could not be computed: {output.strip()}")
     result = _find_json_line(output, "goalfrag_step_plan_json")
 
     if 'ok' in result:
@@ -742,7 +750,9 @@ def _strip_attributes(content: str) -> str:
     return ''.join(result)
 
 
-_STMT_OPEN_RE = re.compile(r'^(Theorem|Triviality|Resume)\b[^=\n]*?:', re.M)
+# A Resume header has no statement (its tactics follow the colon), so it
+# opens no region; with no `Proof` of its own it would run to the next one.
+_STMT_OPEN_RE = re.compile(r'^(Theorem|Triviality)\b[^=\n]*?:', re.M)
 _DEF_OPEN_RE = re.compile(
     r'^(Definition|Inductive|CoInductive|Datatype)\b[^=\n]*?:', re.M
 )
@@ -855,7 +865,7 @@ def parse_theorems(content: str) -> list[TheoremInfo]:
         proof_body_offset = match.end() + proof_match.end() + leading_ws
 
         # Check for cheat (strip comments first to avoid false positives)
-        proof_no_comments = re.sub(r'\(\*.*?\*\)', '', proof_body_raw, flags=re.DOTALL)
+        proof_no_comments = _strip_comments(proof_body_raw)
         has_cheat = bool(re.search(r'\bcheat\b', proof_no_comments, re.IGNORECASE))
 
         theorems.append(TheoremInfo(
@@ -917,7 +927,7 @@ def parse_theorems(content: str) -> list[TheoremInfo]:
         leading_ws = len(proof_body_raw) - len(proof_body_raw.lstrip())
         proof_body_offset = match.end() + term_match.end() + leading_ws
 
-        proof_no_comments = re.sub(r'\(\*.*?\*\)', '', proof_body_raw, flags=re.DOTALL)
+        proof_no_comments = _strip_comments(proof_body_raw)
         has_cheat = bool(re.search(r'\bcheat\b', proof_no_comments, re.IGNORECASE))
 
         theorems.append(TheoremInfo(
@@ -974,7 +984,7 @@ def parse_theorems(content: str) -> list[TheoremInfo]:
         proof_body_offset = match.end() + leading_ws
 
         # Check for cheat
-        proof_no_comments = re.sub(r'\(\*.*?\*\)', '', proof_body_raw, flags=re.DOTALL)
+        proof_no_comments = _strip_comments(proof_body_raw)
         has_cheat = bool(re.search(r'\bcheat\b', proof_no_comments, re.IGNORECASE))
 
         theorems.append(TheoremInfo(
@@ -1000,7 +1010,7 @@ def parse_theorems(content: str) -> list[TheoremInfo]:
 
 def parse_file(path: Path) -> list[TheoremInfo]:
     """Parse .sml file, return all theorems."""
-    content = path.read_text()
+    content = path.read_text(encoding="utf-8")
     return parse_theorems(content)
 
 

@@ -53,9 +53,10 @@ def test_old_name_is_an_alias(reload_budgets, monkeypatch, attr, var, alias):
     assert getattr(reload_budgets(), attr) == 13
 
 
-def test_bad_value_names_the_variable(reload_budgets, monkeypatch):
-    monkeypatch.setenv("HOL4_MCP_THEOREM_TIMEOUT", "20m")
-    with pytest.raises(ValueError, match="HOL4_MCP_THEOREM_TIMEOUT.*'20m'"):
+@pytest.mark.parametrize("bad", ["20m", "nan", "inf", ""])
+def test_bad_value_names_the_variable(reload_budgets, monkeypatch, bad):
+    monkeypatch.setenv("HOL4_MCP_HOLMAKE_TIMEOUT", bad)
+    with pytest.raises(ValueError, match=f"HOL4_MCP_HOLMAKE_TIMEOUT.*'{bad}'"):
         reload_budgets()
 
 

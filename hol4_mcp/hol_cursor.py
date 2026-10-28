@@ -22,9 +22,9 @@ from .budgets import PER_THEOREM_TIMEOUT, PREFIX_LOAD_TIMEOUT, dep_load_timeout
 class SessionPosition:
     """Immutable snapshot of where the HOL session is within the active theorem.
 
-    Updated atomically — only state_at sets this. All other methods
-    read from it but never mutate it. This prevents the tracking state
-    from getting out of sync (which silently killed incremental/reuse paths).
+    Replaced whole, never mutated: navigation sets it after goal setup, a
+    checkpoint load or a successful replay, and resets it whenever the live
+    goal stack may no longer match (an error, an interrupt, a new theorem).
     """
     tactic_idx: int = 0          # Step index (0 = before any tactic)
     content_hash: str = ""       # File hash when this position was established
@@ -152,28 +152,43 @@ _OPAQUE_RE = re.compile(
     r"ml_progLib\.\w+)\b")
 _BINDER_RE = re.compile(
     r"^[ \t]*(?:(Theorem|Triviality|Definition|Inductive|CoInductive)[ \t]+"
-    r"([A-Za-z][\w']*)|val[ \t]+([A-Za-z][\w']*)[ \t]*(?::[^=\n]*)?=|"
+    r"([A-Za-z][\w']*)([^:\n]*)|val[ \t]+(\(?[\w', \t]+\)?)[ \t]*(?::[^=\n]*)?=|"
     r"fun[ \t]+([A-Za-z][\w']*))", re.M)
+_INDUCTION_ATTR_RE = re.compile(r"\binduction\s*=\s*([A-Za-z][\w']*)")
+_RULE_LABEL_RE = re.compile(r"\[(~?)([A-Za-z][\w']*)[^\]:\n]*:\]")
 _SML_IDENT_RE = re.compile(r"[A-Za-z][\w']*")
 
 
 def _bound_names(content: str) -> list[str]:
     """The top-level SML names a chunk of script text binds, as far as its
-    keywords show: a Theorem's name, a Definition's `_def` and `_ind`, an
-    Inductive's `_rules`, `_ind`, `_cases` and `_strongind`, `val` and `fun`.
-    Datatype, `local` and `structure` bindings are not seen."""
+    keywords show (HOL's tools/parsing/HOLSourceExpand.sml): a Theorem's
+    name; a Definition's name and its induction theorem (`_def`→`_ind`,
+    `_DEF`→`_IND`, else `[induction=…]` or name`_ind`); an Inductive's
+    `_rules`, `_ind` (`_coind` for CoInductive), `_cases`, `_strongind` and
+    each labelled rule; `val` (a tuple's names too) and `fun`. Datatype,
+    `local`, `structure`, `open` and `and`-joined bindings are not seen."""
     names: list[str] = []
     for m in _BINDER_RE.finditer(content):
-        kind, name, val, fun = m.groups()
+        kind, name, attrs, val, fun = m.groups()
         if kind in ("Theorem", "Triviality"):
             names.append(name)
         elif kind == "Definition":
-            stem = name[:-4] if name.endswith("_def") else name
-            names += [name, f"{stem}_ind"]
+            ind = _INDUCTION_ATTR_RE.search(attrs or "")
+            if ind:
+                names += [name, ind.group(1)]
+            elif name.endswith(("_def", "_DEF")):
+                names += [name, name[:-4] + ("_ind" if name.endswith("_def") else "_IND")]
+            else:
+                names += [name, f"{name}_ind"]
         elif kind in ("Inductive", "CoInductive"):
-            names += [f"{name}_{s}" for s in ("rules", "ind", "cases", "strongind")]
-        elif val and val != "it":
-            names.append(val)
+            ind = "coind" if kind == "CoInductive" else "ind"
+            names += [f"{name}_{s}" for s in ("rules", ind, "cases", "strongind")]
+            body = content[m.end():]
+            end = re.search(r"^[ \t]*End\b", body, re.M)
+            for tilde, label in _RULE_LABEL_RE.findall(body[:end.start()] if end else body):
+                names.append(f"{name}_{label}" if tilde else label)
+        elif val:
+            names += [n for n in _SML_IDENT_RE.findall(val) if n != "it"]
         elif fun:
             names.append(fun)
     return list(dict.fromkeys(names))
@@ -421,11 +436,11 @@ class StateAtResult:
     timings: dict[str, float] | None = None  # Timing breakdown (ms)
     inside_by: bool = False   # Position is inside a decomposed by/>- subproof (between open/close)
     inside_step_idx: int | None = None  # Step index when position is strictly INSIDE
+                                        # an opaque step (state shown = step entry)
     # Set when the position inside an opaque step was reached by replaying
     # the step's flat sub-plan (single-goal group entry): {"step", "sub_idx",
     # "sub_total", "start_line", "end_line", "error", "fail_line"}.
     inside_group: dict | None = None
-                                        # an opaque step (state shown = step entry)
     warnings: list[str] | None = None   # HOL diagnostics emitted while producing
                                         # this state (success path included)
 
@@ -541,6 +556,7 @@ class FileProofCursor:
         self._opaque_points: set[int] = set()
         self._since_savestate = self.SAVESTATE_EVERY - 1   # first checkpoint saves a file
         self._force_savestate = False
+        self._prefix_dirty = False
         # SaveState layout (_save_file): each per-theorem file's parent, the
         # hierarchy depth that makes a save a child of the base, and the
         # bytes that decide when the next file is saved as an anchor.
@@ -1029,6 +1045,12 @@ class FileProofCursor:
         self._step_plan_hash = ""
         self._step_plan_statement = None
         self._reset_points()
+        # A new process has none of the old one's saved states in its
+        # hierarchy: init saves deps and base afresh, and the layout follows.
+        self._deps_checkpoint_saved = False
+        self._base_checkpoint_saved = False
+        self._base_depth = None
+        self._save_parent = {}
         self._needs_session_reinit = False
 
         # Re-run full initialization to rebuild deps/context/checkpoints
@@ -1257,7 +1279,7 @@ class FileProofCursor:
             # Renamed or deleted: no prefix to compare, so nothing validates.
             return self._content_hash
         return self._compute_hash(
-            '\n'.join(self._content.split('\n')[:thm.proof_end_line - 1])
+            '\n'.join(self._content.split('\n')[:self._context_end_line(thm) - 1])
         )
 
     def _is_checkpoint_valid(self, theorem_name: str) -> bool:
@@ -1296,11 +1318,10 @@ class FileProofCursor:
         The session already has base as parent (from init), context loaded,
         and tactics replayed. Just call saveChild to capture the delta.
 
-        ASSUMPTION: The PolyML state hierarchy (ancestors) must not change between
-        checkpoint save and load. If the hierarchy changes (e.g., HOL is restarted
-        with different heaps), checkpoints become invalid. This is detected by
-        content_hash validation - if the file changes, checkpoints are invalidated.
-        If HOL restarts, a new session starts fresh without cached checkpoints.
+        The file names its SaveState parents, so it loads only while they are
+        on disk (see _gc_checkpoint_files); a restart of HOL drops every
+        checkpoint (_schedule_full_reinit), and an edit before the theorem
+        drops this one (content_hash).
 
         Returns True if checkpoint was saved successfully.
         """
@@ -1449,12 +1470,13 @@ class FileProofCursor:
         self._forget_points_after(ckpt.end_of_proof_head)
         await self._gc_checkpoint_files()
         # End-of-proof checkpoint has proof replay state but NO theorem binding
-        # (proof was replayed via g/e, not loaded via QED). Set _loaded_to_line
-        # to this theorem's proof_end_line — the session has content up to here
-        # from the checkpoint's parent chain (base + context), but NOT later theorems.
+        # (proof was replayed via g/e, not loaded via QED): the heap holds the
+        # file up to this theorem's start, so a later load sends the theorem.
         thm = self._get_theorem(theorem_name)
-        self._loaded_to_line = thm.proof_end_line if thm else 0
-        self._loaded_content_hash = ckpt.content_hash
+        self._loaded_to_line = thm.start_line if thm else 0
+        self._loaded_content_hash = self._compute_hash(
+            '\n'.join(self._content.split('\n')[:self._loaded_to_line - 1])
+            if self._loaded_to_line else "")
 
         # Backup to target position (~11ms for any N)
         backups_needed = ckpt.tactics_count - target_tactic_idx
@@ -1521,7 +1543,7 @@ class FileProofCursor:
             return False
         if await self._rewind_to_point(ckpt):
             thm = self._get_theorem(theorem_name)
-            self._loaded_to_line = thm.proof_end_line if thm else 0
+            self._loaded_to_line = self._context_end_line(thm) if thm else 0
             self._loaded_content_hash = ckpt.content_hash
             return True
         if ckpt.context_path is None:
@@ -1552,9 +1574,16 @@ class FileProofCursor:
         self._forget_points_after(ckpt.context_head)
         await self._gc_checkpoint_files()
         thm = self._get_theorem(theorem_name)
-        self._loaded_to_line = thm.proof_end_line if thm else 0
+        self._loaded_to_line = self._context_end_line(thm) if thm else 0
         self._loaded_content_hash = ckpt.content_hash
         return True
+
+    def _context_end_line(self, thm: TheoremInfo) -> int:
+        """The first line a context checkpoint of `thm` has not run: past
+        its QED, or past the `end` of the `local` block it closes (a block's
+        checkpoint is taken after the whole block)."""
+        block = self._local_block_at(thm.start_line)
+        return block.end_line + 1 if block is not None else thm.proof_end_line
 
     async def _rewind_to_point(self, ckpt: TheoremCheckpoint) -> bool:
         """Restore `ckpt`'s in-memory point: Context, loaded modules and the
@@ -1858,24 +1887,29 @@ class FileProofCursor:
         # Required theory interfaces must not be silently skipped.
         try:
             deps = await get_script_dependencies(self.file)
-            await self._record_dep_artifacts(deps)
-            budget = dep_load_timeout()
-            for dep in deps:
-                t_dep = time.perf_counter()
+        except (FileNotFoundError, RuntimeError):
+            deps = []  # holdeptool not available or failed (parse error), skip dep loading
+        await self._record_dep_artifacts(deps)
+        budget = dep_load_timeout()
+        for dep in deps:
+            t_dep = time.perf_counter()
+            try:
                 result = await self._send_phase(
                     f'load "{dep}";', budget, "dependency load", dep)
-                if _is_hol_error(result):
-                    if "Cannot find file" in result and not dep.endswith("Theory"):
-                        continue
-                    self._needs_session_reinit = True
-                    return {
-                        "theorems": [],
-                        "cheats": [],
-                        "error": self._dep_load_error(
-                            dep, result, time.perf_counter() - t_dep, budget),
-                    }
-        except (FileNotFoundError, RuntimeError):
-            pass  # holdeptool not available or failed (parse error), skip dep loading
+            except RuntimeError as exc:   # HOL died
+                self._needs_session_reinit = True
+                return {"theorems": [], "cheats": [],
+                        "error": f"HOL died loading dependency {dep}: {exc}"}
+            if _is_hol_error(result):
+                if "Cannot find file" in result and not dep.endswith("Theory"):
+                    continue
+                self._needs_session_reinit = True
+                return {
+                    "theorems": [],
+                    "cheats": [],
+                    "error": self._dep_load_error(
+                        dep, result, time.perf_counter() - t_dep, budget),
+                }
 
         thm_list = [
             {"name": t.name, "line": t.start_line, "has_cheat": t.has_cheat}
@@ -2078,15 +2112,15 @@ class FileProofCursor:
     async def _send_phase(self, content: str, timeout: float, phase: str,
                           item: str = "", start_line: int = 0,
                           end_line: int = 0) -> str:
-        if phase in self._CAPTURED_PHASES:
-            await self._capture_bindings(content)
         self._phase = {"phase": phase, "item": item, "file": str(self.file),
                        "start_line": start_line, "end_line": end_line,
                        "started": time.perf_counter(), "budget": timeout,
-                       "active": True}
+                       "active": True, "interrupted": False}
         previous_context = getattr(self.session, "request_context", {})
         self.session.request_context = self._phase
         try:
+            if phase in self._CAPTURED_PHASES:
+                await self._capture_bindings(content)
             return await self.session.send(content, timeout=timeout)
         except asyncio.CancelledError:
             self._phase["interrupted"] = True
@@ -2102,6 +2136,10 @@ class FileProofCursor:
             return None
         result = await self._send_phase(content, timeout, "top-level SML/translation",
                                         start_line=start_line, end_line=end_line)
+        if result.lstrip().startswith("ERROR:"):
+            # The session's own refusal (not running, busy, reply lost): the
+            # span may not have run at all.
+            return f"Error executing file content (lines {start_line}-{end_line}): {result}"
         if _is_fatal_hol_error(result):
             return f"Error executing file content: {_format_context_error(result)}"
         if any(line.startswith("Exception-") for line in result.split('\n')):
@@ -2158,7 +2196,11 @@ class FileProofCursor:
         """
         if target_line <= self._loaded_to_line:
             return None
-            
+        # Cleared only when the whole range has run: an error return or a
+        # cancel leaves content past `_loaded_to_line` that may have run, so
+        # the next entry rewinds before sending it again (enter_theorem).
+        self._prefix_dirty = True
+
         content_lines = self._content.split('\n')
         theorems_in_range = [
             t for t in self._theorems
@@ -2183,6 +2225,7 @@ class FileProofCursor:
             self._loaded_to_line = actual_target
             loaded_content = '\n'.join(content_lines[:actual_target - 1])
             self._loaded_content_hash = self._compute_hash(loaded_content)
+            self._prefix_dirty = False
             return None
         else:
             current_line = self._loaded_to_line
@@ -2289,6 +2332,7 @@ class FileProofCursor:
         self._loaded_to_line = max(target_line, current_line)
         loaded_content = '\n'.join(content_lines[:self._loaded_to_line - 1])
         self._loaded_content_hash = self._compute_hash(loaded_content)
+        self._prefix_dirty = False
         return None
 
     async def enter_theorem(self, name: str) -> dict:
@@ -2320,6 +2364,10 @@ class FileProofCursor:
         if not thm:
             return {"error": f"Theorem '{name}' not found"}
 
+        if self._prefix_dirty:
+            # The last prefix load stopped early (see _load_context_to_line).
+            self._prefix_dirty = False
+            self._context_rewind_pending = True
         if self._context_rewind_pending:
             error = await self._rewind_or_reinit(
                 thm, "session reinit: no context or deps checkpoint "
@@ -2931,8 +2979,11 @@ class FileProofCursor:
         self._session_dirty = False
 
     # Operators that make a parenthesised group's flat replay depend on how
-    # many goals the group receives.
-    _POSITIONAL_RE = re.compile(r">-|>\||>~|>>~|\bTHEN1\b|\bTHENL\b")
+    # many goals the group receives; the source forms of the constructors
+    # `exprHasGoalPositional` in tactic_prefix.sml tests for.
+    _POSITIONAL_RE = re.compile(
+        r">-|>\||>~|>>~|\b(?:THEN1|THENL|NTH_GOAL|LASTGOAL|HEADGOAL|SPLIT_LT"
+        r"|SELECT_LT_THEN|SELECT_LT)\b")
 
     def _file_line(self, file_offset: int) -> int:
         return self._content.count("\n", 0, file_offset) + 1
@@ -3117,10 +3168,17 @@ class FileProofCursor:
         """
         sink = getattr(self.session, "diagnostics", None)
         mark = len(sink) if isinstance(sink, list) else None
+        seen = getattr(self.session, "diagnostics_seen", None)
         result = await self._state_at_traced(line, col, skip_prefix)
         if mark is not None and result.warnings is None:
+            if isinstance(seen, int):
+                # The list keeps only the newest entries; count what arrived.
+                new = self.session.diagnostics_seen - seen
+                mine = sink[-new:] if new > 0 else []
+            else:
+                mine = sink[mark:]
             fresh: list[str] = []
-            for cmd, text in sink[mark:]:
+            for cmd, text in mine:
                 # `<<HOL message: …>>` is chatty — a cold prefix load emits one
                 # per parsed quotation — so keep only those from the caller's
                 # own tactics. A `WARNING:` is rare and kept wherever it came
@@ -3248,8 +3306,9 @@ class FileProofCursor:
         to a checkpoint taken before it instead, as after an edit."""
         self._pos = SessionPosition()
         self._session_dirty = True
-        if self._phase.get("interrupted"):
+        if self._phase.get("interrupted") or self._prefix_dirty:
             self._phase["interrupted"] = False
+            self._prefix_dirty = False
             self._context_rewind_pending = True
             self._active_theorem = None
 
@@ -3269,6 +3328,8 @@ class FileProofCursor:
         if isinstance(sink, list):
             for w in result.get('warnings') or []:
                 sink.append(("goals_json();", str(w)))
+                if isinstance(getattr(self.session, "diagnostics_seen", None), int):
+                    self.session.diagnostics_seen += 1
 
         if 'ok' in result:
             goals = []

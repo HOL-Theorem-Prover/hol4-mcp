@@ -294,9 +294,10 @@ async def test_concurrent_state_at_calls_report_their_own_positions(conc_session
     )
 
 
-@pytest.mark.parametrize("operation", ["check", "send", "goals", "switch", "cancel_waiter", "gc", "start", "restart", "setenv"])
+@pytest.mark.parametrize("operation", ["check", "send", "goals", "switch", "cancel_waiter", "gc", "start", "setenv"])
 async def test_other_operations_wait_for_navigation(conc_session, monkeypatch, tmp_path, operation):
-    """A peer cannot inspect, reset or replace a session partway through navigation."""
+    """A peer cannot inspect, reset or replace a session partway through
+    navigation. hol_restart, which preempts, is in test_control_plane.py."""
     expected = await hol_state_at(line=ALPHA_LINE, session=conc_session)
     await hol_state_at(line=PARK_LINE, session=conc_session)
     cursor = srv._sessions[conc_session].cursor

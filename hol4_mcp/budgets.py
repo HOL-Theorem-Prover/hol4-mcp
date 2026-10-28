@@ -5,6 +5,7 @@ Every budget reads `HOL4_MCP_<NAME>`. `HOL_TACTIC_TIMEOUT` and
 budgets; the `HOL4_MCP_` name wins when both are set.
 """
 
+import math
 import os
 
 
@@ -15,9 +16,12 @@ def env_seconds(name: str, default: float, alias: str | None = None) -> float:
         if raw is None:
             continue
         try:
-            return float(raw)
+            value = float(raw)
         except ValueError:
-            raise ValueError(f"{var} must be a number of seconds, got {raw!r}") from None
+            value = math.nan
+        if not math.isfinite(value):
+            raise ValueError(f"{var} must be a number of seconds, got {raw!r}")
+        return value
     return default
 
 

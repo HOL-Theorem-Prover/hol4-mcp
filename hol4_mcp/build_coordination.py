@@ -783,9 +783,11 @@ def _suspect_refusal(suspects):
         if not path.resolve().is_relative_to(holdir):
             continue
         if _left_by_observed_failure(path, record):
+            code = record["returncode"]
+            ending = (f"was killed by signal {-code}" if code < 0
+                      else f"ended with exit status {code}")
             lines.append(f"{path} is under $HOLDIR. It may be removed: {record['label']} "
-                         f"ended with exit status {record['returncode']} and the file is "
-                         "unchanged since.")
+                         f"{ending} and the file is unchanged since.")
         else:
             lines.append(f"{path} is under $HOLDIR and is not provably a leftover of an "
                          "MCP build: ask the user to remove it.")

@@ -14,6 +14,9 @@ PASS_CASES = [
                  id="quoted-prose"),
     pytest.param("git status --short && git diff --stat", id="status-diff"),
     pytest.param("git log --oneline -5 -- fooScript.sml", id="log"),
+    pytest.param("# then git push\ngit status", id="comment"),
+    pytest.param("cat <<'EOF'\ngit push\nEOF\ngit status", id="quoted-heredoc"),
+    pytest.param("echo 'a' # don't\ngit status", id="apostrophe-in-comment"),
 ]
 
 BLOCK_CASES = [
@@ -26,6 +29,13 @@ BLOCK_CASES = [
     pytest.param("git branch -D x", id="branch-D"),
     pytest.param("bash -c 'git push origin HEAD'", id="bash-c-push"),
     pytest.param('echo "$(git stash)"', id="stash-in-subst"),
+    pytest.param("cat <<<foo\ngit push", id="here-string"),
+    pytest.param("echo $((1<<2))\ngit push", id="arithmetic-shift"),
+    pytest.param("# don't do this\ngit reset --hard\necho 'x'", id="apostrophe-in-comment"),
+    pytest.param('git "commit" -m x', id="quoted-verb"),
+    pytest.param("git 'push'", id="single-quoted-verb"),
+    pytest.param("git \\\n  push", id="line-continuation"),
+    pytest.param("echo a#b; git push", id="hash-inside-word"),
 ]
 
 

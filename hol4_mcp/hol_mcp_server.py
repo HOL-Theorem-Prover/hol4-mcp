@@ -30,10 +30,10 @@ from .build_coordination import build_claims, claim_from_graph
 from . import _mcp_cancel_patch  # noqa: F401 — patches mcp SDK on import
 from fastmcp import FastMCP
 
-from .hol_session import BUSY_TEXT, HOLSession, HOLDIR, escape_sml_string
+from .hol_session import HOLSession, HOLDIR, escape_sml_string
 from .hol_cursor import FileProofCursor, StateAtResult, _try_find_json_line
 from .hol_file_parser import (
-    HOLParseError, step_line_numbers, format_steps, format_step_context,
+    step_line_numbers, format_steps, format_step_context,
     step_text_start, elide_long_text, suspension_base,
 )
 from .quote_check import quote_diagnosis_lines
@@ -68,6 +68,9 @@ class _SessionOperation:
         # Why a control tool cancelled the holder: "interrupt", "stop" or
         # "restart"; None for no cancel or a client's own.
         self.intent = None
+        # The holder is in its shielded recovery: another cancel would be
+        # thrown into it, so a control tool only waits.
+        self.recovering = False
 
 
 class _Interrupted(Exception):
@@ -100,23 +103,27 @@ def _cancelled_call_text(tool: str, state: str, intent: str) -> str:
             f"replays from a clean position. {rerun}")
 
 
-async def _preempt(key, intent: str, wait: float):
+async def _preempt(key, intent: str, wait: float, holder=None):
     """Cancel the call holding `key`'s guard, as `intent`, and wait up to
     `wait` seconds for it to return. Its tool name, or None when no other
-    call holds the guard. A stop or restart overrides an interrupt already
-    under way; any cancel is sent once, since a second would outlive the
-    recovery's uncancel and end the call with no reply."""
+    call holds the guard (or, given `holder`, when that task no longer
+    does). A stop or restart overrides an interrupt already under way; any
+    cancel is sent once, since a second would outlive the recovery's
+    uncancel and end the call with no reply, and none during a recovery
+    already running (a client's own cancel), which is only waited for."""
     operation = _session_operations.get(key)
-    holder = operation.owner if operation is not None else None
-    if holder is None or holder.done() or holder is asyncio.current_task():
+    owner = operation.owner if operation is not None else None
+    if holder is not None and owner is not holder:
+        return None
+    if owner is None or owner.done() or owner is asyncio.current_task():
         return None
     tool = operation.tool or "running"
-    if operation.intent is None:
+    if operation.intent is None and not operation.recovering:
         operation.intent = intent
-        holder.cancel()
-    elif intent != "interrupt":
+        owner.cancel()
+    elif operation.intent is not None and intent != "interrupt":
         operation.intent = intent
-    await asyncio.wait({holder}, timeout=wait)
+    await asyncio.wait({owner}, timeout=wait)
     return tool
 
 
@@ -146,6 +153,7 @@ async def _session_operation(key, tool=None):
             # Only the holder recovers. Cancelling a waiter must not interrupt
             # the operation it was waiting for. Shield MCP cancel scopes so
             # pipe recovery finishes before another request takes the lock.
+            operation.recovering = True
             with anyio.CancelScope(shield=True):
                 state = await _recover_cancelled_operation(key, operation.intent)
             if operation.intent and task.cancelling():
@@ -159,6 +167,7 @@ async def _session_operation(key, tool=None):
             operation.owner = None
             operation.tool = None
             operation.intent = None
+            operation.recovering = False
 
 
 async def _recover_cancelled_operation(key, intent=None) -> str:
@@ -171,7 +180,9 @@ async def _recover_cancelled_operation(key, intent=None) -> str:
     since no caller is left to be told it is busy."""
     entry = _sessions.get(key)
     if entry is None:
-        return "recovered"
+        # No session (it was being started or replaced): nothing to bring
+        # back, and nothing at a prompt either.
+        return "stopped"
     if intent in ("stop", "restart"):
         state = "stopped"
         try:
@@ -237,7 +248,7 @@ def _timeout_arg_error(timeout: float | None) -> str | None:
     return (
         f"ERROR: timeout={timeout:g} exceeds the maximum {MAX_STATE_AT_TIMEOUT:.0f}s. "
         f"The unit is seconds ({timeout / 3600:.1f} h requested). Pass e.g. "
-        f"timeout={2 * budgets.STATE_AT_TIMEOUT:g} for a heavy prefix, or timeout=0 "
+        f"timeout={2 * STATE_AT_TIMEOUT:g} for a heavy prefix, or timeout=0 "
         f"to disable the bound."
     )
 
@@ -864,10 +875,14 @@ def _clip(output: str, budget: int) -> str:
     if len(output) <= budget:
         return output
     head_budget = min(budget // 3, 1500)
-    marker = f"\n\n[... {len(output) - budget} bytes elided ...]\n\n"
-    tail_budget = budget - head_budget - len(marker)
+    # The marker's length bounds itself: the elided count has at most as
+    # many digits as len(output).
+    marker_len = len(f"\n\n[... {len(output)} bytes elided ...]\n\n")
+    tail_budget = budget - head_budget - marker_len
     if tail_budget < 100:
         return f"[TRUNCATED: {len(output)} bytes, showing last {budget}]\n\n" + output[-budget:]
+    elided = len(output) - head_budget - tail_budget
+    marker = f"\n\n[... {elided} bytes elided ...]\n\n"
     return output[:head_budget] + marker + output[-tail_budget:]
 
 
@@ -1026,13 +1041,17 @@ def _gc_cursor_checkpoints(cursor: FileProofCursor):
 def _gc_workdir_orphans(workdir: Path):
     """Clean orphaned per-theorem checkpoints from a workdir.
 
-    Called on hol_start when no existing session owns the workdir.
-    Deletes *_context.save and *_end_of_proof.save (cheap replay rebuilds)
-    across all cursor_checkpoints/ dirs under the workdir.
+    Called on hol_start. Deletes *_context.save and *_end_of_proof.save
+    (cheap replay rebuilds) across the cursor_checkpoints/ dirs under the
+    workdir, except those of this server's live cursors.
     Keeps base_deps.save and deps_only.save (expensive ~200MB rebuilds).
     """
+    live = {
+        Path(e.cursor._checkpoint_dir).resolve()
+        for e in _sessions.values() if e.cursor is not None
+    }
     for ckpt_dir in workdir.glob("**/cursor_checkpoints"):
-        if not ckpt_dir.is_dir():
+        if not ckpt_dir.is_dir() or ckpt_dir.resolve() in live:
             continue
         for f in ckpt_dir.glob("*_context.save"):
             f.unlink(missing_ok=True)
@@ -1083,6 +1102,7 @@ _GC_CALL_INTERVAL = 10    # At most once per N tool calls
 _GC_TIME_INTERVAL = 120   # At most once per K seconds
 _gc_call_counter = 0
 _gc_last_time = 0.0
+_gc_tasks: set[asyncio.Task] = set()
 
 
 @_serialized_session("session_name")
@@ -1110,7 +1130,10 @@ def _schedule_gc(session_name: str):
         return
     _gc_call_counter = 0
     _gc_last_time = now
-    asyncio.create_task(_do_gc(session_name))
+    # The loop keeps only a weak reference to a task.
+    task = asyncio.create_task(_do_gc(session_name))
+    _gc_tasks.add(task)
+    task.add_done_callback(_gc_tasks.discard)
 
 
 async def _get_session(name: str) -> Optional[HOLSession]:
@@ -1212,7 +1235,13 @@ async def hol_start(workdir: str, name: str = "default", env: dict = None,
     try:
         result = await session.start()
     except Exception as e:
+        await session.stop()
         return f"ERROR starting HOL: {e}"
+    except BaseException:
+        # A cancel (hol_interrupt, hol_stop, the client) must not leave an
+        # unregistered HOL process behind.
+        await asyncio.shield(session.stop())
+        raise
 
     if not session.is_running:
         return f"ERROR: HOL failed to start. Output: {result}"
@@ -1259,12 +1288,9 @@ async def hol_sessions() -> str:
         if len(workdir_str) > 40:
             workdir_str = "..." + workdir_str[-37:]
 
-        # Cursor info
-        if entry.cursor:
-            cs = entry.cursor.status
-            cursor_str = cs.get('active_theorem') or "(none)"
-        else:
-            cursor_str = "(none)"
+        # Cursor info. Not `cursor.status`: it reparses the file, which may
+        # rearm a reinit under the call that holds the session.
+        cursor_str = getattr(entry.cursor, "_active_theorem", None) or "(none)"
 
         lines.append(f"{name:<12} {workdir_str:<42} {age:<7} {idle_str:<7} {status:<8} {cursor_str}")
         phase = getattr(entry.cursor, "_phase", None)
@@ -1803,6 +1829,12 @@ async def hol_interrupt(session: str = "default") -> str:
     """
     s = await _get_session(session)
     if not s:
+        # A call may be starting the session (hol_start, auto-init) before
+        # it is registered: that call is still interruptible.
+        tool = await _preempt(session, "interrupt", wait=60)
+        if tool:
+            return (f"Interrupted the {tool} call that was starting session "
+                    f"'{session}'; it returns \"INTERRUPTED: ...\".")
         return f"ERROR: Session '{session}' not found."
 
     if not s.is_running:
@@ -1824,7 +1856,7 @@ async def hol_interrupt(session: str = "default") -> str:
         return f"Session '{session}': {still_busy}"
 
     computing = await s.is_computing()
-    tool = await _preempt(session, "interrupt", wait=60)
+    tool = await _preempt(session, "interrupt", wait=60, holder=holder)
     if tool is None:
         return f"Session '{session}': the running call finished before the interrupt."
     if not holder.done():
@@ -1854,15 +1886,23 @@ async def hol_stop(session: str = "default") -> str:
     Returns: Confirmation message
     """
     entry = _sessions.get(session)
-    if entry:
-        tool = await _preempt(session, "stop", wait=15)
-        if entry.cursor:
-            _gc_cursor_checkpoints(entry.cursor)
-        await entry.session.stop()
-        _sessions.pop(session, None)
-        ended = f" The {tool} call running on it returns STOPPED." if tool else ""
-        return f"Session '{session}' stopped.{ended}"
-    return f"Session '{session}' not found."
+    tool = await _preempt(session, "stop", wait=15)
+    # While the cancelled call unwound, a queued call may have replaced the
+    # entry: stop the session as it is now, and remove only that entry.
+    current = _sessions.get(session) or entry
+    if current is None:
+        if tool:
+            return (f"Stopped the {tool} call that was starting session "
+                    f"'{session}'; it returns STOPPED.")
+        return f"Session '{session}' not found."
+    for stale in {id(e): e for e in (entry, current) if e is not None}.values():
+        if stale.cursor:
+            _gc_cursor_checkpoints(stale.cursor)
+        await stale.session.stop()
+    if _sessions.get(session) is current:
+        del _sessions[session]
+    ended = f" The {tool} call running on it returns STOPPED." if tool else ""
+    return f"Session '{session}' stopped.{ended}"
 
 
 @mcp.tool()
@@ -1885,14 +1925,13 @@ async def hol_restart(session: str = "default") -> str:
     Args:
         session: Session name to restart
 
-    Returns: Same as hol_start (cursor is cleared, use hol_state_at file= to re-init)
+    Returns: hol_start's reply (cursor is cleared, use hol_state_at file= to
+             re-init), plus a line when a running call was stopped
     """
     entry = _sessions.get(session)
     if not entry:
         return f"Session '{session}' not found."
 
-    workdir = entry.workdir
-    env = entry.env  # Preserve env through restart
     tool = await _preempt(session, "restart", wait=15)
     if tool:
         # Its recovery stops HOL; make sure, so the guard is released.
@@ -1900,8 +1939,14 @@ async def hol_restart(session: str = "default") -> str:
     # Hold the guard so no queued call runs between the stop and the start.
     try:
         async with _session_operation(session, "hol_restart"):
+            # A queued call (a workdir switch, hol_setenv) may have replaced
+            # the entry meanwhile: restart what is there now.
+            entry = _sessions.get(session) or entry
+            workdir, env = entry.workdir, entry.env  # Preserve env through restart
             await hol_stop(session)
-            started = await hol_start(workdir=str(workdir), name=session, env=env)
+            # Replacing this session is not a second one: RULE J does not apply.
+            started = await hol_start(workdir=str(workdir), name=session, env=env,
+                                      force=True)
     except _Interrupted as cancelled:
         return _cancelled_call_text("hol_restart", cancelled.state, cancelled.intent)
     ended = f"\nThe {tool} call that was running returns STOPPED." if tool else ""
@@ -2289,8 +2334,10 @@ async def holmake(workdir: str, target: str = None, env: dict = None, log_limit:
         except (TypeError, ValueError):
             return f"ERROR: {setting} must be an integer, got {value!r}. No build was started."
 
-    cmd = [str(holmake_bin), "--no_preexecs", "--qof", f"--heap-size={heap_size}",
-           "--retry-oos=1"]
+    cmd = [str(holmake_bin), "--no_preexecs", "--qof", f"--heap-size={heap_size}"]
+    if jobs != 1:
+        # Holmake ignores it, with a warning, under -j1.
+        cmd.append("--retry-oos=1")
     if jobs is not None:
         cmd.extend(["-j", str(jobs)])
     if target:
@@ -2329,6 +2376,11 @@ async def holmake(workdir: str, target: str = None, env: dict = None, log_limit:
 
         for attempt in range(1, attempts + 1):
             attempt_start = len(stdout_chunks)
+            # Discovery shares the budget: a build spawned with none left
+            # would be killed a moment into a recipe.
+            if time.monotonic() - start_time >= timeout:
+                timed_out = True
+                break
             proc = await asyncio.create_subprocess_exec(
                 *cmd,
                 cwd=workdir_path,
@@ -2443,6 +2495,9 @@ class _BuildJob:
     claim: object = None
     done: asyncio.Event = field(default_factory=asyncio.Event)
     cancel_requested: bool = False
+    # The whole log, judged once when the job ends: a status poll then reads
+    # only the bytes it returns.
+    full_log_verdict: str | None = None
 
 
 _build_jobs: dict[str, _BuildJob] = {}
@@ -2467,9 +2522,12 @@ async def _start_detached_build(cmd: list[str], workdir_path: Path, proc_env: di
     exit_file.unlink(missing_ok=True)
     import shlex
     markers = " ".join(f"-e {shlex.quote(m)}" for m in _OOS_MARKERS)
+    # Only the first run's output decides a retry, not the preflight text
+    # before it.
     wrapped = ["/bin/sh", "-c",
-               'log=$1; shift; "$@"; s=$?; '
-               f'if [ "$s" -ne 0 ] && [ -n "$log" ] && grep -qF {markers} "$log"; then '
+               'log=$1; shift; n=0; [ -n "$log" ] && n=$(wc -c < "$log"); "$@"; s=$?; '
+               f'if [ "$s" -ne 0 ] && [ -n "$log" ] && '
+               f'tail -c +$((n + 1)) "$log" | grep -qF {markers}; then '
                f'printf "\\n%s\\n" {shlex.quote(_SEQUENTIAL_OOS_RETRY)}; "$@"; s=$?; fi; '
                'printf %s "$s" > "$0.tmp" && mv -f "$0.tmp" "$0"; exit "$s"',
                str(exit_file), str(log) if retry_out_of_store else "", *cmd]
@@ -2510,12 +2568,17 @@ async def _start_detached_build(cmd: list[str], workdir_path: Path, proc_env: di
             await _kill_reaped_process_group(proc)
         finally:
             try:
+                try:
+                    output = _read_log_tail(log, 0)[0]
+                except OSError:
+                    output = None
+                if output is not None:
+                    job.full_log_verdict = (
+                        ("Build succeeded" if proc.returncode == 0 else
+                         build_failure_heading(proc.returncode, output, bool(trace_note)))
+                        + f".{_build_summary(output)}")
                 if claim is not None:
-                    try:
-                        output = _read_log_tail(log, 0)[0]
-                    except OSError:
-                        output = ""
-                    build_claims.finish(claim, output)
+                    build_claims.finish(claim, output or "")
                     coordination.record_finalized(claim.token, proc.returncode)
             finally:
                 job.finished = time.time()
@@ -2596,7 +2659,7 @@ async def _adopted_build_status(job: str, cancel: bool, tail: int, wait: int = 0
             f"[{elapsed:.0f}s]")
     if state == "done":
         verdict = ("Build succeeded" if returncode == 0 else
-                   build_failure_heading(returncode, text, bool(record.get("trace_note"))))
+                   build_failure_heading(returncode, full, bool(record.get("trace_note"))))
         head += f"\n{verdict}.{_build_summary(full)}"
     elif state == "lost":
         head += ("\nThe controller and the build process are both gone and no exit "
@@ -2664,8 +2727,9 @@ async def hol_build_status(job: str, cancel: bool = False, tail: int = 2000,
         state = "finishing"
     end = entry.finished or time.time()
     elapsed = end - entry.started
-    # The log is read once, bounded by `tail`; the summary and progress below
-    # are drawn from that same text, so a small tail never costs a large read.
+    # The log is read once, bounded by `tail`. A done job's verdict and
+    # summary were drawn from its whole log when it ended; progress comes
+    # from the text returned.
     truncated = False
     try:
         text, truncated = _read_log_tail(entry.log, tail) if tail > 0 else ("", False)
@@ -2674,7 +2738,9 @@ async def hol_build_status(job: str, cancel: bool = False, tail: int = 2000,
     head = f"{state}: job={job} target={entry.target or '(all)'} workdir={entry.workdir} [{elapsed:.0f}s]"
     if entry.claim is not None and entry.claim.state_error:
         head += f"\nWARNING: {entry.claim.state_error}"
-    if state == "done":
+    if state == "done" and entry.full_log_verdict is not None:
+        head += f"\n{entry.full_log_verdict}"
+    elif state == "done":
         verdict = ("Build succeeded" if proc.returncode == 0 else
                    build_failure_heading(proc.returncode, text, bool(entry.trace_note)))
         summary = _build_summary(text)
@@ -2825,7 +2891,9 @@ async def _init_file_cursor(
     if not s or not s.is_running:
         # Preserve per-session HOL env (e.g., VFMDIR) across auto-restarts.
         start_env = entry.env if entry else None
-        start_result = await hol_start(workdir=str(target_workdir), name=session, env=start_env)
+        # Replacing an existing session is not a second one (RULE J).
+        start_result = await hol_start(workdir=str(target_workdir), name=session,
+                                       env=start_env, force=entry is not None)
         if start_result.startswith("ERROR"):
             return start_result
         s = await _get_session(session)
@@ -2906,7 +2974,7 @@ async def hol_state_at(
         col: 1-indexed column number (default 1)
         file: Path to .sml file (auto-inits cursor if no cursor exists)
         workdir: Working directory for HOL (used with file)
-        max_output: Max bytes of output (default 1000)
+        max_output: Max characters of output (default 4096)
         session: Session name (default: "default")
         show_partial: If True, show best-effort goals even when replay fails
                       before reaching the requested position (default: False)

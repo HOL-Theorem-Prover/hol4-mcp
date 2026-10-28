@@ -18,11 +18,12 @@ Two things every hook needs and none should reimplement:
   results and harness-written lines (the compaction summary, request copies,
   hook and goal echoes, task notifications) ride the transcript as
   `role=user` too; those are plumbing, not prompts, and are skipped.
-- `visible_command(command)` — a Bash command with its quoted strings and
-  heredoc bodies blanked, so a hook that matches command names sees only
-  text the shell would execute. What the shell WOULD run inside a string is
-  kept: `$(...)` and backtick substitutions, the argument of `-c`/`eval`,
-  and the substitutions of an unquoted heredoc.
+- `visible_command(command)` — a Bash command with its quoted strings,
+  `#` comments and heredoc bodies blanked and its backslash-newlines joined,
+  so a hook that matches command names sees only text the shell would
+  execute. What the shell WOULD run inside a string is kept: a quoted single
+  word (unquoted), `$(...)` and backtick substitutions, the argument of
+  `-c`/`eval`, and the substitutions of an unquoted heredoc.
 - `soft_block(...)` / `pregranted(...)` / `session_overrides(...)` — the
   soft-hook protocol: a situation is blocked ONCE per session window with
   the full message; an identical retry passes with a prominent override
@@ -132,8 +133,11 @@ def overrides_summary(payload):
         return ""
     return "; ".join(f"{h} ×{n} ({what})" for h, (n, what) in sorted(counts.items()))
 
-_HEREDOC = re.compile(r"<<-?\s*(?:(['\"])(\w+)\1|\\?(\w+))")
+_HEREDOC = re.compile(r"(?<!<)<<(?!<)-?\s*(?:(['\"])(\w+)\1|\\?(\w+))")
 _KEEP_ARG_OF = ("-c", "-lc", "-ec", "-lec", "eval")
+# A quoted single word is the word itself to the shell: `git "push"`.
+_SINGLE_WORD = re.compile(r"[\w./:@=+,%-]+\Z")
+_WORD_BREAK = " \t\n;|&()"
 
 
 def _substitutions(s):
@@ -162,21 +166,34 @@ def _substitutions(s):
     return " ".join(out)
 
 
-def _blank_heredocs(command):
-    lines = command.split("\n")
-    out, i = [], 0
-    while i < len(lines):
-        line = lines[i]
-        out.append(line)
-        m = _HEREDOC.search(line)
-        i += 1
-        if not m:
-            continue
-        quoted, tag = m.group(1) is not None, m.group(2) or m.group(3)
-        while i < len(lines) and lines[i].lstrip("\t") != tag:
-            out.append("" if quoted else _substitutions(lines[i]))
-            i += 1
-    return "\n".join(out)
+def _heredoc_bodies(s, i, pending, out):
+    """Blank the bodies of the heredocs in `pending`, which start at `s[i]`;
+    returns the index after the last terminator line."""
+    for quoted, tag in pending:
+        while i < len(s):
+            end = s.find("\n", i)
+            end = len(s) if end < 0 else end
+            line, nl = s[i:end], s[end:end + 1]
+            i = end + len(nl)
+            if line.lstrip("\t") == tag:
+                out.append(line + nl)
+                break
+            out.append(("" if quoted else _substitutions(line)) + nl)
+    return i
+
+
+def _arithmetic_end(s, i):
+    """The index after the `))` closing the `$((` at `s[i]`."""
+    depth, j = 0, i + 1
+    while j < len(s):
+        if s[j] == "(":
+            depth += 1
+        elif s[j] == ")":
+            depth -= 1
+            if depth == 0:
+                return j + 1
+        j += 1
+    return len(s)
 
 
 def _prev_token(s, i):
@@ -190,14 +207,36 @@ def _prev_token(s, i):
 
 
 def visible_command(command):
-    """`command` with quoted strings and heredoc bodies blanked (see module doc)."""
-    s = _blank_heredocs(command)
-    out, i = [], 0
+    """`command` with quoted strings, comments and heredoc bodies blanked
+    (see module doc)."""
+    s = command
+    out, i, pending = [], 0, []
     while i < len(s):
         c = s[i]
+        if c == "\n":
+            out.append(c)
+            i = _heredoc_bodies(s, i + 1, pending, out)
+            pending = []
+            continue
         if c == "\\" and i + 1 < len(s):
-            out.append(s[i:i + 2])
+            # A backslash-newline joins the lines.
+            out.append("" if s[i + 1] == "\n" else s[i:i + 2])
             i += 2
+            continue
+        if s.startswith("$((", i):
+            j = _arithmetic_end(s, i)
+            out.append(s[i:j])
+            i = j
+            continue
+        m = _HEREDOC.match(s, i)
+        if m:
+            pending.append((m.group(1) is not None, m.group(2) or m.group(3)))
+            out.append(m.group(0))
+            i = m.end()
+            continue
+        if c == "#" and (i == 0 or s[i - 1] in _WORD_BREAK):
+            end = s.find("\n", i)
+            i = len(s) if end < 0 else end
             continue
         if c in "'\"":
             keep = _prev_token(s, i) in _KEEP_ARG_OF
@@ -205,8 +244,13 @@ def visible_command(command):
             while j < len(s) and s[j] != c:
                 j += 2 if (c == '"' and s[j] == "\\") else 1
             body = s[i + 1:j]
-            out.append(c + (body if keep else
-                            (_substitutions(body) if c == '"' else "")) + c)
+            if keep:
+                out.append(c + body + c)
+            elif _SINGLE_WORD.match(body):
+                out.append(body)
+            else:
+                out.append(c + (_substitutions(visible_command(body))
+                                if c == '"' else "") + c)
             i = j + 1
             continue
         out.append(c)
