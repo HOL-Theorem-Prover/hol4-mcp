@@ -46,6 +46,9 @@ _FAILURE_RE = re.compile(
     r'^(?:Exception[- ]|Fail |TIMEOUT|poly: : error:|parse error at )|'
     r'"error"\s*:\s*"[^"\s]', re.M)
 
+BUSY_TEXT = ("HOL is still busy with an earlier command that did not stop on "
+             "SIGINT.")
+
 # Compiles only against a TacticParse whose combinator fragments carry spans,
 # the shapes sml_helpers/tactic_prefix.sml matches.
 _TACTICPARSE_PROBE = (
@@ -68,6 +71,9 @@ class HOLSession:
         # said about the caller's own tactics from prefix-loading chatter.
         self.diagnostics: list[tuple[str, str]] = []
         self._resync_seq = 0              # distinct sentinel per resync
+        # A command timed out and HOL has not answered a sentinel since: it is
+        # still running, so no new command may be written behind it.
+        self.busy = False
         self.maxheap_mb: int | None = None  # effective limit of the live process
         self.failure_evidence = FailureEvidence()
         self.request_context: dict = {}
@@ -181,24 +187,39 @@ class HOLSession:
         if not self.process or self.process.returncode is not None:
             return False
         async with self._lock:
-            self._resync_seq += 1
-            marker = f"HOL_MCP_RESYNC_{self._resync_seq}"
-            self._buffer = b""
+            return (await self._realign(timeout))[0]
+
+    async def _realign(self, timeout: float) -> tuple[bool, str]:
+        """`resync`'s body, for a caller that holds the send lock: whether
+        HOL's own reply to a sentinel arrived in time, and the text of the
+        frames swallowed before it.
+
+        A command interrupted by SIGINT may never get its reply frame: HOL
+        returns to the prompt without one. Waiting for that reply would last
+        the caller's whole budget while HOL sits idle; the sentinel's reply
+        always comes once HOL reads input again.
+        """
+        self._resync_seq += 1
+        marker = f"HOL_MCP_RESYNC_{self._resync_seq}"
+        self._buffer = b""
+        swallowed = []
+        try:
+            await self._write_command(f'print "{marker}\\n";')
+        except Exception:
+            return False, ""
+        deadline = time.monotonic() + timeout
+        while True:
+            left = deadline - time.monotonic()
+            if left <= 0:
+                return False, "\n".join(swallowed)
             try:
-                await self._write_command(f'print "{marker}\\n";')
-            except Exception:
-                return False
-            deadline = time.monotonic() + timeout
-            while True:
-                left = deadline - time.monotonic()
-                if left <= 0:
-                    return False
-                try:
-                    frame = await self._read_response(timeout=left)
-                except (asyncio.TimeoutError, RuntimeError):
-                    return False
-                if marker in frame:
-                    return True
+                frame = await self._read_response(timeout=left)
+            except (asyncio.TimeoutError, RuntimeError):
+                return False, "\n".join(swallowed)
+            if marker in frame:
+                self.busy = False
+                return True, "\n".join(swallowed)
+            swallowed.append(frame)
 
     async def drain_stale(self):
         """Drop residual output, holding the send lock.
@@ -219,6 +240,10 @@ class HOLSession:
             return "ERROR: HOL not running"
 
         async with self._lock:
+            if self.busy and not (await self._realign(timeout=1))[0]:
+                return (f"ERROR: {BUSY_TEXT} Nothing was sent. hol_interrupt "
+                        f"may stop it; hol_stop ends the session (the next call "
+                        f"restarts HOL and reloads the prefix).")
             await self._drain_pipe()
             await self._write_command(sml_code)
 
@@ -228,11 +253,15 @@ class HOLSession:
             except asyncio.TimeoutError:
                 partial = self._buffer.decode("utf-8", errors="replace")
                 self.interrupt()
-                try:
-                    remaining = await self._read_response(timeout=5)
-                except asyncio.TimeoutError:
-                    remaining = ""
-                msg = f"TIMEOUT after {timeout}s - sent interrupt."
+                aligned, remaining = await self._realign(timeout=5)
+                if aligned:
+                    msg = f"TIMEOUT after {timeout}s - sent interrupt."
+                else:
+                    self.busy = True
+                    msg = (f"TIMEOUT after {timeout}s - sent interrupt, but HOL "
+                           f"did not return to the prompt: {BUSY_TEXT} hol_stop "
+                           f"ends the session (the next call restarts HOL and "
+                           f"reloads the prefix).")
                 self._record_failure(sml_code, partial + "\n" + remaining, "timeout")
                 return self._note_diagnostics(
                     sml_code, f"{msg}\n{remaining}" if remaining else msg,
@@ -294,6 +323,37 @@ class HOLSession:
             return f"HOL process killed by signal {-rc} (returncode={rc})"
         return f"HOL process died unexpectedly (returncode={rc})"
 
+    async def is_computing(self, window: float = 0.3) -> bool | None:
+        """Whether HOL's process group used CPU over `window` seconds; None
+        where /proc is unavailable."""
+        if not self.is_running:
+            return False
+        try:
+            pgid = os.getpgid(self.process.pid)
+        except (ProcessLookupError, PermissionError):
+            return False
+
+        def ticks():
+            total = 0
+            for entry in os.listdir("/proc"):
+                if not entry.isdigit():
+                    continue
+                try:
+                    with open(f"/proc/{entry}/stat", encoding="utf-8",
+                              errors="replace") as stream:
+                        fields = stream.read().rsplit(")", 1)[1].split()
+                except (OSError, IndexError):
+                    continue
+                if int(fields[2]) == pgid:
+                    total += int(fields[11]) + int(fields[12])
+            return total
+        try:
+            before = ticks()
+            await asyncio.sleep(window)
+            return ticks() > before
+        except OSError:
+            return None
+
     def interrupt(self):
         """Send SIGINT to entire process group."""
         if self.process and self.process.returncode is None:
@@ -340,6 +400,7 @@ class HOLSession:
                     pass
         self.process = None
         self._buffer = b""
+        self.busy = False
 
     @property
     def is_running(self) -> bool:

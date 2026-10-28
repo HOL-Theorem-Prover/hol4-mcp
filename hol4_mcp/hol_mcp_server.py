@@ -30,7 +30,7 @@ from .build_coordination import build_claims, claim_from_graph
 from . import _mcp_cancel_patch  # noqa: F401 — patches mcp SDK on import
 from fastmcp import FastMCP
 
-from .hol_session import HOLSession, HOLDIR, escape_sml_string
+from .hol_session import BUSY_TEXT, HOLSession, HOLDIR, escape_sml_string
 from .hol_cursor import FileProofCursor, StateAtResult, _try_find_json_line
 from .hol_file_parser import (
     HOLParseError, step_line_numbers, format_steps, format_step_context,
@@ -64,6 +64,17 @@ class _SessionOperation:
     def __init__(self):
         self.lock = asyncio.Lock()
         self.owner = None
+        self.tool = None          # the holder's tool name
+        self.interrupted = False  # hol_interrupt cancelled the holder
+
+
+class _Interrupted(Exception):
+    """A guarded call that hol_interrupt cancelled; ``recovered`` says whether
+    HOL came back to its prompt or the session had to be stopped."""
+
+    def __init__(self, recovered: bool):
+        super().__init__(recovered)
+        self.recovered = recovered
 
 
 # A strong reference lives with every holder/waiter. Idle names disappear,
@@ -73,7 +84,7 @@ _startup_operation = object()
 
 
 @asynccontextmanager
-async def _session_operation(key):
+async def _session_operation(key, tool=None):
     operation = _session_operations.get(key)
     if operation is None:
         operation = _SessionOperation()
@@ -85,6 +96,7 @@ async def _session_operation(key):
         return
     async with operation.lock:
         operation.owner = task
+        operation.tool = tool
         try:
             yield
         except asyncio.CancelledError:
@@ -92,16 +104,27 @@ async def _session_operation(key):
             # the operation it was waiting for. Shield MCP cancel scopes so
             # pipe recovery finishes before another request takes the lock.
             with anyio.CancelScope(shield=True):
-                await _recover_cancelled_operation(key)
+                recovered = await _recover_cancelled_operation(key)
+            if operation.interrupted and task.cancelling():
+                # hol_interrupt's own cancel: the call answers instead of
+                # vanishing. Any other pending cancel still propagates.
+                task.uncancel()
+                if not task.cancelling():
+                    raise _Interrupted(recovered) from None
             raise
         finally:
             operation.owner = None
+            operation.tool = None
+            operation.interrupted = False
 
 
-async def _recover_cancelled_operation(key):
+async def _recover_cancelled_operation(key) -> bool:
+    """Interrupt HOL and re-align the pipe after a guarded call was cancelled;
+    stop the session when it does not answer. True when HOL is back at its
+    prompt (or no session was involved)."""
     entry = _sessions.get(key)
     if entry is None:
-        return
+        return True
     try:
         entry.session.interrupt()
         recovered = await entry.session.resync()
@@ -117,6 +140,7 @@ async def _recover_cancelled_operation(key):
         entry.cursor.mark_interrupted()
         if not recovered:
             entry.cursor._schedule_full_reinit("cancelled request pipe recovery failed")
+    return recovered
 
 
 def _serialized_session(parameter="session"):
@@ -135,8 +159,18 @@ def _serialized_session(parameter="session"):
             if parameter is not None:
                 arguments = signature.bind(*args, **kwargs).arguments
                 key = arguments.get(parameter, signature.parameters[parameter].default)
-            async with _session_operation(key):
-                return await function(*args, **kwargs)
+            try:
+                async with _session_operation(key, function.__name__):
+                    return await function(*args, **kwargs)
+            except _Interrupted as interrupted:
+                state = ("HOL is back at its prompt, and the next navigation "
+                         "replays from a clean position" if interrupted.recovered
+                         else "HOL did not answer, so the session was stopped; "
+                              "the next call restarts it and reloads the prefix")
+                return (f"INTERRUPTED: hol_interrupt cancelled this "
+                        f"{function.__name__} call before it finished; {state}. "
+                        f"This is not a HOL verdict: re-run the call once the "
+                        f"cause is fixed.")
         return serialized
     return decorate
 
@@ -1675,12 +1709,19 @@ async def hol_goals(
 
 @mcp.tool()
 async def hol_interrupt(session: str = "default") -> str:
-    """Send SIGINT to abort runaway tactic.
+    """Stop the call running on a session (a runaway tactic, a stuck load).
+
+    Cancels the call in progress — hol_state_at, hol_check_proof, hol_send,
+    ... — which sends SIGINT to HOL and re-aligns the pipe; that call then
+    returns "INTERRUPTED: ..." instead of a result. Returns once it has. Says
+    so when nothing was running, and when HOL was idle while the call waited
+    (its reply had been lost: the interrupt is the remedy). If HOL does not
+    answer, the session is stopped and the next call restarts it.
 
     Args:
         session: Session name (default: "default")
 
-    Returns: Confirmation message
+    Returns: What was interrupted, or that the session was idle
     """
     s = await _get_session(session)
     if not s:
@@ -1690,14 +1731,34 @@ async def hol_interrupt(session: str = "default") -> str:
         del _sessions[session]
         return f"ERROR: Session '{session}' died."
 
-    s.interrupt()
+    operation = _session_operations.get(session)
+    holder = operation.owner if operation is not None else None
+    if holder is None or holder.done():
+        if not s.busy:
+            return (f"Session '{session}' is idle: no call is running on it, so "
+                    f"there was nothing to interrupt.")
+        s.interrupt()
+        if await s.resync(timeout=5):
+            return (f"Interrupted the command a timed-out call left running on "
+                    f"session '{session}'; HOL is back at its prompt.")
+        return (f"ERROR: Session '{session}': {BUSY_TEXT} hol_stop ends the "
+                f"session (the next call restarts HOL and reloads the prefix).")
 
-    # Flush interrupt message by sending dummy command
-    # HOL queues "Compilation interrupted" which pollutes next send() otherwise
-    await asyncio.sleep(0.1)
-    await s.send(";", timeout=1)
-
-    return f"Sent SIGINT to session '{session}'. The tactic should be interrupted."
+    computing = await s.is_computing()
+    tool = operation.tool or "running"
+    if not operation.interrupted:
+        # One cancel per holder: a second would outlive the recovery's
+        # uncancel and end the call with no reply at all.
+        operation.interrupted = True
+        holder.cancel()
+    await asyncio.wait({holder}, timeout=60)
+    if not holder.done():
+        return (f"Sent the interrupt to the {tool} call on session '{session}', "
+                f"but it has not returned within 60s. hol_stop ends the session.")
+    idle = (" HOL was idle while that call waited: its reply had been lost, "
+            "not delayed." if computing is False else "")
+    return (f"Interrupted the {tool} call on session '{session}'; it returns "
+            f"\"INTERRUPTED: ...\".{idle}")
 
 
 @mcp.tool()

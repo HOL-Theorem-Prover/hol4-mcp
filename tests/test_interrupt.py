@@ -43,15 +43,15 @@ async def test_sigint_handler_callable():
 
 
 async def test_hol_interrupt_tool():
-    """Test the hol_interrupt tool sends SIGINT to session."""
+    """hol_interrupt on a session with no call running says it is idle."""
     # Start a session
     result = await hol_start(workdir="/tmp", name="test_interrupt_tool")
     assert "started" in result.lower() or "running" in result.lower()
-    
+
     try:
         # Call hol_interrupt
         result = await hol_interrupt(session="test_interrupt_tool")
-        assert "SIGINT" in result
+        assert "is idle" in result and "nothing to interrupt" in result, result
     finally:
         await hol_stop(session="test_interrupt_tool")
 

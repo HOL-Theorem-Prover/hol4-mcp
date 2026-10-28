@@ -176,7 +176,7 @@ hol4-mcp serve --transport http --port 8000
 |------|-------------|
 | `hol_send` | Send raw SML to HOL for small probes (a term, a type, a one-tactic check). Not for driving a proof: develop in the file and navigate with `hol_state_at`. |
 | `hol_search` | Search the theorem database by name and/or term pattern |
-| `hol_interrupt` | Send SIGINT to abort a runaway tactic |
+| `hol_interrupt` | Stop the call running on a session (a runaway tactic, a stuck load); that call returns `INTERRUPTED` |
 
 ### Build
 

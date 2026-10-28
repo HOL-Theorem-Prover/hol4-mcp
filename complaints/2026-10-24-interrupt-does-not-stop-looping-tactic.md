@@ -1,8 +1,12 @@
 # `hol_send` timeout "sent interrupt" does not stop a long-running tactic; later calls, including `hol_restart`, hang behind it
 
-**Status:** suspected; seen once, no minimal reproducer. There are two sub-issues:
-(A) SIGINT did not bring HOL back to the prompt; (B) `hol_restart` queued behind the
-hung call instead of replacing the session.
+**Status (2026-10-28):** (A) is reproduced and fixed by the P3 minimum; (B) waits for L2.
+- **(A):** code that ignores SIGINT keeps HOL busy. A timed-out `send` now checks with a
+  sentinel, says that HOL is still busy and names `hol_stop`. Later calls send nothing
+  until HOL answers.
+- **(B):** `hol_restart` still queues behind a running call; preempting it is L2.
+- Originally there were two sub-issues: (A) SIGINT did not bring HOL back to the prompt;
+  (B) `hol_restart` queued behind the hung call instead of replacing the session.
 **Component:** `hol4_mcp/hol_session.py` `HOLSession.send` (timeout branch), `HOLSession.interrupt`,
 `HOLSession.stop`; `hol4_mcp/hol_mcp_server.py` `_serialized_session`, `hol_restart`,
 `hol_goals`, `hol_stop`, `hol_interrupt`.

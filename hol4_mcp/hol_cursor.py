@@ -141,6 +141,15 @@ def _trace_reason(trace: list["TraceEntry"], limit: int = 120) -> str:
     return "proof failed"
 
 
+def _is_interrupt_reply(output: str) -> bool:
+    """A reply HOL gave because SIGINT stopped the command from outside —
+    hol_interrupt, a signal sent by hand — not the session's own timeout,
+    whose TIMEOUT reply carries the same exception line."""
+    return (not output.startswith("TIMEOUT")
+            and any(line.startswith("Exception- Interrupt raised")
+                    for line in output.split("\n")))
+
+
 def _is_hol_error(output: str) -> bool:
     """Check if HOL output indicates an actual error (not just a warning).
 
@@ -2314,6 +2323,12 @@ class FileProofCursor:
         result = await self.session.send(batch_cmds, timeout=batch_timeout)
         if not _is_hol_error(result):
             return len(cmds), None
+        if _is_interrupt_reply(result):
+            # Someone stopped this replay on purpose; replaying it step by
+            # step would run the very tactic they stopped.
+            self.mark_interrupted()
+            return 0, ("Tactic replay interrupted (SIGINT); it was not re-run. "
+                       "Navigate again to replay from a clean position.")
 
         # Batch failed: recover last good state by replaying step-by-step.
         setup_err = await self._setup_proof_goal(thm_name)
