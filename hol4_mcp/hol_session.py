@@ -60,6 +60,11 @@ _TACTICPARSE_PROBE = (
 class HOLSession:
     """Direct HOL subprocess management with clean interrupt support."""
 
+    # Lost-reply watch (`_await_reply`): seconds between checks, and idle
+    # checks in a row before HOL is probed.
+    LOST_REPLY_INTERVAL = 5.0
+    LOST_REPLY_CHECKS = 2
+
     def __init__(self, workdir: str = ".", strip_ansi: bool = True, env: dict | None = None):
         self.workdir = Path(workdir)
         self.strip_ansi = strip_ansi
@@ -74,6 +79,8 @@ class HOLSession:
         # A command timed out and HOL has not answered a sentinel since: it is
         # still running, so no new command may be written behind it.
         self.busy = False
+        # A lost-reply probe's sentinel whose own reply has not been read yet.
+        self._unclaimed_sentinel = False
         self.maxheap_mb: int | None = None  # effective limit of the live process
         self.failure_evidence = FailureEvidence()
         self.request_context: dict = {}
@@ -218,8 +225,23 @@ class HOLSession:
                 return False, "\n".join(swallowed)
             if marker in frame:
                 self.busy = False
+                self._unclaimed_sentinel = False
                 return True, "\n".join(swallowed)
             swallowed.append(frame)
+
+    async def interrupt_and_realign(self, waits=(5, 10)) -> bool:
+        """SIGINT HOL and wait for a sentinel's reply, once per entry of
+        `waits` (seconds). False, with the session marked busy, when HOL
+        never answered: it ignores SIGINT, and only stopping it ends that."""
+        if not self.is_running:
+            return False
+        async with self._lock:
+            for wait in waits:
+                self.interrupt()
+                if (await self._realign(wait))[0]:
+                    return True
+            self.busy = True
+            return False
 
     async def drain_stale(self):
         """Drop residual output, holding the send lock.
@@ -244,12 +266,14 @@ class HOLSession:
                 return (f"ERROR: {BUSY_TEXT} Nothing was sent. hol_interrupt "
                         f"may stop it; hol_stop ends the session (the next call "
                         f"restarts HOL and reloads the prefix).")
+            if self._unclaimed_sentinel:
+                await self._realign(timeout=5)
             await self._drain_pipe()
             await self._write_command(sml_code)
 
             try:
                 return self._note_diagnostics(
-                    sml_code, await self._read_response(timeout=timeout))
+                    sml_code, await self._await_reply(timeout))
             except asyncio.TimeoutError:
                 partial = self._buffer.decode("utf-8", errors="replace")
                 self.interrupt()
@@ -271,6 +295,46 @@ class HOLSession:
                     self._buffer.decode("utf-8", errors="replace") + "\n" + str(exc),
                     "cancelled" if isinstance(exc, asyncio.CancelledError) else "process failure")
                 raise
+
+    async def _await_reply(self, timeout: float) -> str:
+        """`_read_response`, watching for a reply that will never come.
+
+        HOL can finish a command without sending its reply frame (a SIGINT
+        from outside the server stops it that way). When no byte has arrived
+        and HOL has used no CPU for LOST_REPLY_CHECKS checks in a row, write a
+        sentinel: if its reply is the next frame, the command's own was lost.
+        A command that legitimately sleeps that long without CPU is reported
+        as lost too."""
+        reader = asyncio.ensure_future(self._read_response(timeout))
+        idle_checks, seen, sentinel = 0, 0, None
+        try:
+            while True:
+                done, _ = await asyncio.wait({reader}, timeout=self.LOST_REPLY_INTERVAL)
+                if done:
+                    frame = reader.result()
+                    if sentinel is None:
+                        return frame
+                    if sentinel in frame:
+                        return (f"ERROR: HOL finished this command without sending "
+                                f"its reply (idle for {idle_checks * self.LOST_REPLY_INTERVAL:g}s"
+                                f" with no output); its output is lost. The session "
+                                f"is aligned again: re-run the command.")
+                    self._unclaimed_sentinel = True
+                    return frame
+                if sentinel is not None:
+                    continue
+                if len(self._buffer) != seen or await self.is_computing() is not False:
+                    seen, idle_checks = len(self._buffer), 0
+                    continue
+                idle_checks += 1
+                if idle_checks >= self.LOST_REPLY_CHECKS:
+                    self._resync_seq += 1
+                    sentinel = f"HOL_MCP_RESYNC_{self._resync_seq}"
+                    await self._write_command(f'print "{sentinel}\\n";')
+        finally:
+            if not reader.done():
+                reader.cancel()
+                await asyncio.wait({reader})
 
     def _record_failure(self, command: str, response: str, kind: str) -> None:
         self.failure_evidence.record(command, response, kind,
@@ -401,6 +465,7 @@ class HOLSession:
         self.process = None
         self._buffer = b""
         self.busy = False
+        self._unclaimed_sentinel = False
 
     @property
     def is_running(self) -> bool:

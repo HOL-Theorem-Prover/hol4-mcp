@@ -64,17 +64,60 @@ class _SessionOperation:
     def __init__(self):
         self.lock = asyncio.Lock()
         self.owner = None
-        self.tool = None          # the holder's tool name
-        self.interrupted = False  # hol_interrupt cancelled the holder
+        self.tool = None    # the holder's tool name
+        # Why a control tool cancelled the holder: "interrupt", "stop" or
+        # "restart"; None for no cancel or a client's own.
+        self.intent = None
 
 
 class _Interrupted(Exception):
-    """A guarded call that hol_interrupt cancelled; ``recovered`` says whether
-    HOL came back to its prompt or the session had to be stopped."""
+    """A guarded call that a control tool cancelled. ``state`` is what its
+    recovery left: "recovered", "busy" or "stopped"."""
 
-    def __init__(self, recovered: bool):
-        super().__init__(recovered)
-        self.recovered = recovered
+    def __init__(self, state: str, intent: str):
+        super().__init__(state, intent)
+        self.state = state
+        self.intent = intent
+
+
+def _cancelled_call_text(tool: str, state: str, intent: str) -> str:
+    """What a call cancelled by hol_interrupt / hol_stop / hol_restart returns."""
+    rerun = "This is not a HOL verdict: re-run the call once the cause is fixed."
+    if intent in ("stop", "restart"):
+        return (f"STOPPED: hol_{intent} ended the session under this {tool} call; "
+                f"the next call restarts HOL and reloads the prefix. {rerun}")
+    if state == "busy":
+        return (f"INTERRUPTED: hol_interrupt cancelled this {tool} call, but HOL "
+                f"ignores SIGINT and is still running its command; nothing more "
+                f"is sent to it until it stops. hol_stop ends the session (the "
+                f"next call restarts HOL and reloads the prefix). {rerun}")
+    if state == "stopped":
+        return (f"INTERRUPTED: hol_interrupt cancelled this {tool} call; HOL did "
+                f"not answer, so the session was stopped and the next call "
+                f"restarts it and reloads the prefix. {rerun}")
+    return (f"INTERRUPTED: hol_interrupt cancelled this {tool} call before it "
+            f"finished; HOL is back at its prompt, and the next navigation "
+            f"replays from a clean position. {rerun}")
+
+
+async def _preempt(key, intent: str, wait: float):
+    """Cancel the call holding `key`'s guard, as `intent`, and wait up to
+    `wait` seconds for it to return. Its tool name, or None when no other
+    call holds the guard. A stop or restart overrides an interrupt already
+    under way; any cancel is sent once, since a second would outlive the
+    recovery's uncancel and end the call with no reply."""
+    operation = _session_operations.get(key)
+    holder = operation.owner if operation is not None else None
+    if holder is None or holder.done() or holder is asyncio.current_task():
+        return None
+    tool = operation.tool or "running"
+    if operation.intent is None:
+        operation.intent = intent
+        holder.cancel()
+    elif intent != "interrupt":
+        operation.intent = intent
+    await asyncio.wait({holder}, timeout=wait)
+    return tool
 
 
 # A strong reference lives with every holder/waiter. Idle names disappear,
@@ -104,43 +147,61 @@ async def _session_operation(key, tool=None):
             # the operation it was waiting for. Shield MCP cancel scopes so
             # pipe recovery finishes before another request takes the lock.
             with anyio.CancelScope(shield=True):
-                recovered = await _recover_cancelled_operation(key)
-            if operation.interrupted and task.cancelling():
-                # hol_interrupt's own cancel: the call answers instead of
+                state = await _recover_cancelled_operation(key, operation.intent)
+            if operation.intent and task.cancelling():
+                # A control tool's own cancel: the call answers instead of
                 # vanishing. Any other pending cancel still propagates.
                 task.uncancel()
                 if not task.cancelling():
-                    raise _Interrupted(recovered) from None
+                    raise _Interrupted(state, operation.intent) from None
             raise
         finally:
             operation.owner = None
             operation.tool = None
-            operation.interrupted = False
+            operation.intent = None
 
 
-async def _recover_cancelled_operation(key) -> bool:
-    """Interrupt HOL and re-align the pipe after a guarded call was cancelled;
-    stop the session when it does not answer. True when HOL is back at its
-    prompt (or no session was involved)."""
+async def _recover_cancelled_operation(key, intent=None) -> str:
+    """Bring HOL back after a guarded call was cancelled; "recovered",
+    "busy" or "stopped".
+
+    "interrupt" (hol_interrupt) never kills: HOL that ignores SIGINT is left
+    running and marked busy. "stop"/"restart" end the session. A client's
+    own cancel (None) stops the session when HOL does not answer in 30s,
+    since no caller is left to be told it is busy."""
     entry = _sessions.get(key)
     if entry is None:
-        return True
-    try:
-        entry.session.interrupt()
-        recovered = await entry.session.resync()
-    except Exception:
-        recovered = False
-    if not recovered:
-        # A pipe that could not be aligned must not serve another request.
+        return "recovered"
+    if intent in ("stop", "restart"):
+        state = "stopped"
         try:
             await entry.session.stop()
         except Exception:
             pass
+    elif intent == "interrupt":
+        try:
+            recovered = await entry.session.interrupt_and_realign()
+        except Exception:
+            recovered = False
+        state = "recovered" if recovered else "busy"
+    else:
+        try:
+            entry.session.interrupt()
+            recovered = await entry.session.resync()
+        except Exception:
+            recovered = False
+        state = "recovered" if recovered else "stopped"
+        if not recovered:
+            # A pipe that could not be aligned must not serve another request.
+            try:
+                await entry.session.stop()
+            except Exception:
+                pass
     if entry.cursor:
         entry.cursor.mark_interrupted()
-        if not recovered:
-            entry.cursor._schedule_full_reinit("cancelled request pipe recovery failed")
-    return recovered
+        if state == "stopped":
+            entry.cursor._schedule_full_reinit("cancelled request ended the session")
+    return state
 
 
 def _serialized_session(parameter="session"):
@@ -162,15 +223,9 @@ def _serialized_session(parameter="session"):
             try:
                 async with _session_operation(key, function.__name__):
                     return await function(*args, **kwargs)
-            except _Interrupted as interrupted:
-                state = ("HOL is back at its prompt, and the next navigation "
-                         "replays from a clean position" if interrupted.recovered
-                         else "HOL did not answer, so the session was stopped; "
-                              "the next call restarts it and reloads the prefix")
-                return (f"INTERRUPTED: hol_interrupt cancelled this "
-                        f"{function.__name__} call before it finished; {state}. "
-                        f"This is not a HOL verdict: re-run the call once the "
-                        f"cause is fixed.")
+            except _Interrupted as cancelled:
+                return _cancelled_call_text(function.__name__, cancelled.state,
+                                            cancelled.intent)
         return serialized
     return decorate
 
@@ -877,19 +932,40 @@ _sessions: dict[str, SessionEntry] = {}
 
 def _sigint_handler(signum, frame):
     """Handle SIGINT by interrupting all HOL sessions.
-    
+
     Called when pi sends SIGINT (e.g., user pressed ESC during tool execution).
-    Interrupts all running HOL sessions to abort runaway tactics.
-    
+    Runs hol_interrupt on every session with a call or a timed-out command in
+    progress, so the waiting call is cancelled and the pipe re-aligned; a
+    bare SIGINT would leave that call waiting for a reply that may never
+    come. Without a running event loop it falls back to a bare SIGINT.
+
     Note: Takes a snapshot of sessions to avoid RuntimeError if dict is modified
     concurrently (e.g., session being added/removed when signal arrives).
     """
+    try:
+        loop = asyncio.get_running_loop()
+    except RuntimeError:
+        loop = None
     # Snapshot to avoid "dictionary changed size during iteration"
-    for entry in list(_sessions.values()):
+    for name, entry in list(_sessions.items()):
         try:
-            entry.session.interrupt()
+            if loop is None:
+                entry.session.interrupt()
+                continue
+            operation = _session_operations.get(name)
+            if (operation is not None and operation.owner is not None) or entry.session.busy:
+                loop.call_soon_threadsafe(_schedule_interrupt, name)
         except Exception:
             pass  # Best effort - signal handlers must not raise
+
+
+_signal_interrupts: set[asyncio.Task] = set()
+
+
+def _schedule_interrupt(name: str) -> None:
+    task = asyncio.ensure_future(hol_interrupt(session=name))
+    _signal_interrupts.add(task)
+    task.add_done_callback(_signal_interrupts.discard)
 
 
 # Install SIGINT handler (replaces default KeyboardInterrupt behavior)
@@ -1712,11 +1788,13 @@ async def hol_interrupt(session: str = "default") -> str:
     """Stop the call running on a session (a runaway tactic, a stuck load).
 
     Cancels the call in progress — hol_state_at, hol_check_proof, hol_send,
-    ... — which sends SIGINT to HOL and re-aligns the pipe; that call then
-    returns "INTERRUPTED: ..." instead of a result. Returns once it has. Says
-    so when nothing was running, and when HOL was idle while the call waited
-    (its reply had been lost: the interrupt is the remedy). If HOL does not
-    answer, the session is stopped and the next call restarts it.
+    ... — which sends SIGINT to HOL (twice if needed) and re-aligns the pipe;
+    that call then returns "INTERRUPTED: ..." instead of a result. Returns
+    once it has. Says so when nothing was running, and when HOL was idle
+    while the call waited (its reply had been lost). Never kills: HOL that
+    ignores SIGINT is left running, marked busy, and nothing more is sent to
+    it; hol_stop ends the session (the next call restarts HOL and reloads
+    the prefix).
 
     Args:
         session: Session name (default: "default")
@@ -1731,30 +1809,29 @@ async def hol_interrupt(session: str = "default") -> str:
         del _sessions[session]
         return f"ERROR: Session '{session}' died."
 
+    still_busy = (f"HOL ignores SIGINT and is still running the command; nothing "
+                  f"more is sent to it until it stops. hol_stop ends the session "
+                  f"(the next call restarts HOL and reloads the prefix).")
     operation = _session_operations.get(session)
     holder = operation.owner if operation is not None else None
     if holder is None or holder.done():
         if not s.busy:
             return (f"Session '{session}' is idle: no call is running on it, so "
                     f"there was nothing to interrupt.")
-        s.interrupt()
-        if await s.resync(timeout=5):
+        if await s.interrupt_and_realign():
             return (f"Interrupted the command a timed-out call left running on "
                     f"session '{session}'; HOL is back at its prompt.")
-        return (f"ERROR: Session '{session}': {BUSY_TEXT} hol_stop ends the "
-                f"session (the next call restarts HOL and reloads the prefix).")
+        return f"Session '{session}': {still_busy}"
 
     computing = await s.is_computing()
-    tool = operation.tool or "running"
-    if not operation.interrupted:
-        # One cancel per holder: a second would outlive the recovery's
-        # uncancel and end the call with no reply at all.
-        operation.interrupted = True
-        holder.cancel()
-    await asyncio.wait({holder}, timeout=60)
+    tool = await _preempt(session, "interrupt", wait=60)
+    if tool is None:
+        return f"Session '{session}': the running call finished before the interrupt."
     if not holder.done():
         return (f"Sent the interrupt to the {tool} call on session '{session}', "
                 f"but it has not returned within 60s. hol_stop ends the session.")
+    if s.busy:
+        return f"Cancelled the {tool} call on session '{session}', but {still_busy}"
     idle = (" HOL was idle while that call waited: its reply had been lost, "
             "not delayed." if computing is False else "")
     return (f"Interrupted the {tool} call on session '{session}'; it returns "
@@ -1765,6 +1842,11 @@ async def hol_interrupt(session: str = "default") -> str:
 async def hol_stop(session: str = "default") -> str:
     """Terminate HOL session.
 
+    Works while a call is running on it: that call is cancelled and returns
+    "STOPPED: ...". Kills HOL (SIGTERM, then SIGKILL) without waiting for a
+    command to stop, so it also ends one that ignores hol_interrupt. The next
+    call on the session restarts HOL and reloads the prefix.
+
     Args:
         session: Session name (default: "default")
 
@@ -1772,18 +1854,22 @@ async def hol_stop(session: str = "default") -> str:
     """
     entry = _sessions.get(session)
     if entry:
+        tool = await _preempt(session, "stop", wait=15)
         if entry.cursor:
             _gc_cursor_checkpoints(entry.cursor)
         await entry.session.stop()
-        del _sessions[session]
-        return f"Session '{session}' stopped."
+        _sessions.pop(session, None)
+        ended = f" The {tool} call running on it returns STOPPED." if tool else ""
+        return f"Session '{session}' stopped.{ended}"
     return f"Session '{session}' not found."
 
 
 @mcp.tool()
-@_serialized_session()
 async def hol_restart(session: str = "default") -> str:
     """Restart HOL session (stop + start, preserves workdir).
+
+    Works while a call is running on it: that call is cancelled and returns
+    "STOPPED: ...", and the restart does not wait for it to finish.
 
     Nothing in the ordinary loop needs it: hol_state_at/hol_check_proof detect
     edits to the current file, reload the session when an ancestor theory has
@@ -1806,8 +1892,19 @@ async def hol_restart(session: str = "default") -> str:
 
     workdir = entry.workdir
     env = entry.env  # Preserve env through restart
-    await hol_stop(session)
-    return await hol_start(workdir=str(workdir), name=session, env=env)
+    tool = await _preempt(session, "restart", wait=15)
+    if tool:
+        # Its recovery stops HOL; make sure, so the guard is released.
+        await entry.session.stop()
+    # Hold the guard so no queued call runs between the stop and the start.
+    try:
+        async with _session_operation(session, "hol_restart"):
+            await hol_stop(session)
+            started = await hol_start(workdir=str(workdir), name=session, env=env)
+    except _Interrupted as cancelled:
+        return _cancelled_call_text("hol_restart", cancelled.state, cancelled.intent)
+    ended = f"\nThe {tool} call that was running returns STOPPED." if tool else ""
+    return f"{started}{ended}"
 
 
 @mcp.tool()
