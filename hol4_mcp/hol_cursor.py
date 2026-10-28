@@ -12,7 +12,7 @@ from .hol_file_parser import (
     TheoremInfo, parse_theorems, LocalBlock, parse_local_blocks,
     build_line_starts, line_col_to_offset, HOLParseError,
     parse_step_plan_output, StepPlan, step_text_start,
-    construct_start_line, _find_json_line, suspension_base,
+    construct_start_line, _find_json_line, suspension_base, step_plan_error,
 )
 from .hol_session import HOLSession, HOLDIR, escape_sml_string
 from .budgets import PER_THEOREM_TIMEOUT, PREFIX_LOAD_TIMEOUT, dep_load_timeout
@@ -1925,7 +1925,8 @@ class FileProofCursor:
         """
         goal_body = thm.goal.replace('\n', ' ').strip()
         tc_result = await self.session.send(
-            f'extract_tc_goal_json_q {definition_quotation(goal_body)};', timeout=30
+            f'extract_tc_goal_json_named "{escape_sml_string(thm.name)}" '
+            f'{definition_quotation(goal_body)};', timeout=30
         )
         tc_data = _try_find_json_line(tc_result)
         if 'ok' in tc_data and tc_data['ok']:
@@ -2356,7 +2357,7 @@ class FileProofCursor:
             try:
                 self._step_plan = parse_step_plan_output(step_result, thm.proof_body)
             except HOLParseError as e:
-                return {"error": f"Failed to parse step plan: {e}"}
+                return {"error": step_plan_error(e)}
         else:
             self._step_plan = []
         self._step_plan_hash = self._content_hash
@@ -2421,8 +2422,13 @@ class FileProofCursor:
                 self._pos = SessionPosition()
                 return f"Failed to set up Resume goal: {data['err']}"
         elif thm.kind == "Definition" and thm.name in self._tc_goals:
-            tc_goal = self._tc_goals[thm.name]
-            gt_result = await self.session.send(f'gf `{tc_goal}`;', timeout=30)
+            # From the extracted term; the printed form only when that term
+            # mentions a constant the extraction's rollback retired.
+            gt_result = await self.session.send(
+                f'set_tc_goalfrag_json "{escape_sml_string(thm.name)}";', timeout=30)
+            if 'ok' not in _try_find_json_line(gt_result):
+                tc_goal = self._tc_goals[thm.name]
+                gt_result = await self.session.send(f'gf `{tc_goal}`;', timeout=30)
         else:
             goal = thm.goal.replace('\n', ' ').strip()
             gt_result = await self.session.send(f'gf `{goal}`;', timeout=30)
@@ -2859,7 +2865,7 @@ class FileProofCursor:
                 return StateAtResult(
                     goals=[], tactic_idx=0, tactics_replayed=0, tactics_total=0,
                     file_hash=self._content_hash,
-                    error=f"Failed to parse step plan: {e}"
+                    error=step_plan_error(e)
                 )
         else:
             self._step_plan = []

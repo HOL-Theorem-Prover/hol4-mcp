@@ -347,7 +347,14 @@ fun fragEnd (TacticParse.FAtom a) =
    checks that at each such group's entry before replaying past it. *)
 val reexpand_positional_groups = ref false
 
-fun reexpand_group_atoms frags =
+fun reexpand_group_atoms frags = reexpand_group_atoms_in false frags
+
+(* `arm`: the first fragment is the arm of a `>-` / THEN1, so it receives
+   exactly one goal. A group with a goal-positional operator anywhere in its
+   body is re-expanded only there (or in flat mode): applied by THEN, or at
+   the proof start, it runs once per goal it receives, which a flat replay
+   cannot express. Mirrors `_is_then_group` in hol_cursor.py. *)
+and reexpand_group_atoms_in arm frags =
   let
     (* Only re-expand Group atoms containing compound expressions (Then, ThenLT, etc.)
        that produce useful navigable sub-steps. Single-step wrappers like Repeat,
@@ -444,7 +451,7 @@ fun reexpand_group_atoms frags =
                "rather than per-source-goal, diverging from Holmake — " ^
                "parenthesise the inner LT subexpression itself.\"}\n")
       end
-    fun reexpand f =
+    fun reexpand inArm f =
           let
             val expr = getGroupExpr f
             val _ = if exprHasGoalPositional expr
@@ -452,14 +459,19 @@ fun reexpand_group_atoms frags =
                     else ()
             fun isAtom e = Option.isSome (TacticParse.topSpan e)
             val subFrags = TacticParse.linearize isAtom expr
-          in reexpand_group_atoms (flatten_frags subFrags) end
-      | reexpand frag = [frag]
-    fun go [] acc = rev acc
-      | go (f :: rest) acc =
-          if isGroupAtom f
-          then go rest (rev (reexpand f) @ acc)
-          else go rest (f :: acc)
-  in go frags [] end
+          in reexpand_group_atoms_in inArm (flatten_frags subFrags) end
+    fun opensArm (TacticParse.FFOpen (TacticParse.FOpenThen1 _)) = true
+      | opensArm _ = false
+    fun reexpandable inArm f =
+          isGroupAtom f andalso
+          (inArm orelse !reexpand_positional_groups orelse
+           not (exprHasGoalPositional (getGroupExpr f)))
+    fun go [] _ acc = rev acc
+      | go (f :: rest) inArm acc =
+          if reexpandable inArm f
+          then go rest false (rev (reexpand inArm f) @ acc)
+          else go rest (opensArm f) (f :: acc)
+  in go frags arm [] end
 
 (* merge_select_steps: Post-process step list to merge LSelectGoal/LSelectGroups
    "select"/"selects" steps with their following bracket into a single "expand_list"
@@ -874,7 +886,11 @@ exception MCP_TC_Rollback;
    string that is reparsed in the file's grammar: with every variable and
    numeral typed, an unannotated `-` or `<` cannot resolve to another
    overload there (int, once integerTheory is open). *)
-fun extract_tc_goal_json_q (q : term frag list) =
+(* Each extracted termination goal, as a term, by the Definition's name: the
+   goal is set from it, not re-parsed from its printed form. *)
+val mcp_tc_goals : (string * term) list ref = ref [];
+
+fun extract_tc_goal_json_named name (q : term frag list) =
   let
     val result = ref ""
     fun inner () =
@@ -882,7 +898,13 @@ fun extract_tc_goal_json_q (q : term frag list) =
         val d = Defn.Hol_defn "mcp_tc_extract" q
         val _ = Defn.tgoal d
         val (_, t) = hd (top_goals())
-        val _ = result := Lib.with_flag (Globals.show_types, true) term_to_string t
+        val _ = mcp_tc_goals :=
+                  (name, t) :: List.filter (fn (n, _) => n <> name) (!mcp_tc_goals)
+        (* The printed form is the fallback when the term outlives a
+           constant the rollback below retires: no elision, every type. *)
+        val _ = result :=
+                  Lib.with_flag (Globals.max_print_depth, ~1)
+                    (Lib.with_flag (Globals.show_types, true) term_to_string) t
         val _ = ((drop_all(); ()) handle _ => ())
       in
         raise MCP_TC_Rollback
@@ -896,7 +918,24 @@ fun extract_tc_goal_json_q (q : term frag list) =
   end
   handle e => print (json_err (exnMessage e) ^ "\n");
 
+fun extract_tc_goal_json_q q = extract_tc_goal_json_named "" q;
+
 fun extract_tc_goal_json body_str = extract_tc_goal_json_q [QUOTE body_str];
+
+(* Set the goal from the term extract_tc_goal_json_named kept for `name`.
+   Refused when that term mentions a constant the extraction's rollback
+   retired (nested recursion through an auxiliary): the caller then parses
+   the printed form in the current context instead. *)
+fun set_tc_goalfrag_json name =
+  (case List.find (fn (n, _) => n = name) (!mcp_tc_goals) of
+     NONE => print (json_err ("no termination goal extracted for " ^ name) ^ "\n")
+   | SOME (_, t) =>
+       if Term.uptodate_term t then
+         (drop_all ();
+          proofManagerLib.set_goalfrag ([], t);
+          print (json_ok "true" ^ "\n"))
+       else print (json_err "termination goal mentions a retired constant" ^ "\n"))
+  handle e => print (json_err (exnMessage e) ^ "\n");
 
 (* =============================================================================
  * Resume Goal Extraction

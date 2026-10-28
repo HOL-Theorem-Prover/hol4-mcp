@@ -30,6 +30,19 @@ class HOLParseError(Exception):
     pass
 
 
+class StepPlanTimeout(HOLParseError):
+    """The step-plan request ran out of time: no plan, but nothing wrong
+    with the proof text either."""
+    pass
+
+
+def step_plan_error(error: HOLParseError) -> str:
+    """The message for a step plan that could not be computed."""
+    if isinstance(error, StepPlanTimeout):
+        return str(error)
+    return f"Failed to parse step plan: {error}"
+
+
 def _find_json_line(output: str, context: str) -> dict:
     """Find and parse a JSON object in HOL output.
 
@@ -447,8 +460,13 @@ def parse_step_plan_output(output: str, body: str | None = None) -> list[StepPla
     Tests that only inspect counts / structure may omit ``body``; their
     ``end`` values will be byte offsets (matching the SML side).
 
-    Raises: HOLParseError if HOL4 returned an error or output is malformed.
+    Raises: StepPlanTimeout if the request timed out; HOLParseError if HOL4
+    returned an error or output is malformed.
     """
+    if output.startswith("TIMEOUT"):
+        raise StepPlanTimeout(
+            f"TIMEOUT computing the step plan; the proof text was not parsed "
+            f"in time: {output.splitlines()[0]}")
     result = _find_json_line(output, "goalfrag_step_plan_json")
 
     if 'ok' in result:

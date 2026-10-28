@@ -78,3 +78,38 @@ async def test_termination_goal_resolves_sml_antiquotes(tmp_path):
         assert "PROOF BROKEN" not in r and "No goals" in r, r
     finally:
         await hol_stop(session)
+
+
+ELIDED_SCRIPT = """\
+open HolKernel Parse boolLib bossLib;
+
+val _ = new_theory "tcdeep";
+
+val _ = Globals.max_print_depth := 3;
+
+Definition walk_def:
+  walk (a:num, b:num, c:num, d:num) =
+    if a < b + c + d then walk (a + 1, b, c, d) else a
+Termination
+  WF_REL_TAC `measure (\\(a,b,c,d). b + c + d - a)` >> simp []
+End
+
+val _ = export_theory();
+"""
+
+
+async def test_termination_goal_is_set_from_its_term_not_its_print(tmp_path):
+    """With a low max_print_depth the printed goal is elided (`...`), which
+    does not parse back; the goal must come from the term itself."""
+    script = tmp_path / "tcdeepScript.sml"
+    script.write_text(ELIDED_SCRIPT)
+    session = "tc_elided"
+    try:
+        await _init_file_cursor(file=str(script), session=session)
+        state = await hol_state_at(line=11, col=3, session=session)
+        assert "Failed to set up goal" not in state and "parse" not in state.lower(), state
+        assert "=== Goal (1 of 1)" in state, state
+        done = await hol_state_at(line=12, col=1, session=session)
+        assert "No goals" in done, done
+    finally:
+        await hol_stop(session=session)
