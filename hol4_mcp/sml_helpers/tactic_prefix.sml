@@ -170,7 +170,7 @@ fun db_search_json query pattern thy limit =
  * ============================================================================= *)
 
 (* Flatten nested fragments from linearize into a flat step sequence.
-   FBracket(FOpenThen1, [inner], FClose, expr) -> FOpenThen1, inner..., FClose
+   FBracket(FOpenThen1 _, [inner], FClose, expr) -> FOpenThen1 _, inner..., FClose
    FMBracket(FOpenNullOk, mid, FClose, [arm1,arm2], expr)
      -> FOpenNullOk, arm1, FMid, arm2, FClose
    FGroup(span, [inner]) -> inner (unwrapped)
@@ -207,7 +207,7 @@ fun flatten_frags frags =
 
 (* Map a tac_frag_open to the goalFrag open function name *)
 fun openFragName TacticParse.FOpen = "open_paren"
-  | openFragName TacticParse.FOpenThen1 = "open_then1"
+  | openFragName (TacticParse.FOpenThen1 _) = "open_then1"
   | openFragName TacticParse.FOpenFirst = "open_first"
   | openFragName TacticParse.FOpenRepeat = "open_repeat"
   | openFragName TacticParse.FOpenTacsToLT = "open_tacs_to_lt"
@@ -310,9 +310,9 @@ fun frag_text proofBody (TacticParse.FAtom a) =
              if spanIsTactic a then raw else "Q.RENAME_TAC " ^ raw
          | _ => raw
       end
-  | frag_text proofBody (TacticParse.FFOpen (TacticParse.FOpenBy (s, e))) =
+  | frag_text proofBody (TacticParse.FFOpen (TacticParse.FOpenBy ((s, e), _))) =
       String.substring(proofBody, s, e - s)
-  | frag_text proofBody (TacticParse.FFOpen (TacticParse.FOpenSufficesBy (s, e))) =
+  | frag_text proofBody (TacticParse.FFOpen (TacticParse.FOpenSufficesBy ((s, e), _))) =
       String.substring(proofBody, s, e - s)
   | frag_text _ (TacticParse.FFOpen opn) = openFragName opn
   | frag_text _ (TacticParse.FFMid mid) = midFragName mid
@@ -708,8 +708,8 @@ fun goalfrag_step_plan proofBody =
             val (endPos, newLast) = case f of
                 TacticParse.FAtom _ =>
                   (let val e = fragEnd f in (e, e) end)
-              | TacticParse.FFOpen (TacticParse.FOpenBy (_, e)) => (e, e)
-              | TacticParse.FFOpen (TacticParse.FOpenSufficesBy (_, e)) => (e, e)
+              | TacticParse.FFOpen (TacticParse.FOpenBy ((_, e), _)) => (e, e)
+              | TacticParse.FFOpen (TacticParse.FOpenSufficesBy ((_, e), _)) => (e, e)
               | _ => (lastAtomEnd, lastAtomEnd)
           in
             if String.size x > 0
