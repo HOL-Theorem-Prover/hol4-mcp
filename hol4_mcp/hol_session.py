@@ -49,6 +49,35 @@ _FAILURE_RE = re.compile(
 BUSY_TEXT = ("HOL is still busy with an earlier command that did not stop on "
              "SIGINT.")
 
+MIN_DEFAULT_MAXHEAP_MB = 8192
+
+
+def default_maxheap_mb() -> int:
+    """The interactive heap limit when HOL4_MCP_MAXHEAP_MB is unset: half of
+    the machine's RAM, never below MIN_DEFAULT_MAXHEAP_MB."""
+    try:
+        with open("/proc/meminfo", encoding="ascii") as meminfo:
+            total_kb = next(int(line.split()[1]) for line in meminfo
+                            if line.startswith("MemTotal:"))
+    except (OSError, StopIteration, ValueError, IndexError):
+        return MIN_DEFAULT_MAXHEAP_MB
+    return max(MIN_DEFAULT_MAXHEAP_MB, total_kb // 1024 // 2)
+
+
+def _process_tree(pid: int) -> list[int]:
+    """`pid` and its descendants, as /proc lists them."""
+    pids, todo = [], [pid]
+    while todo:
+        current = todo.pop()
+        pids.append(current)
+        try:
+            for task in os.listdir(f"/proc/{current}/task"):
+                with open(f"/proc/{current}/task/{task}/children", encoding="ascii") as fh:
+                    todo.extend(int(child) for child in fh.read().split())
+        except OSError:
+            continue
+    return pids
+
 # Compiles only against a TacticParse whose combinator fragments carry spans,
 # the shapes sml_helpers/tactic_prefix.sml matches.
 _TACTICPARSE_PROBE = (
@@ -99,15 +128,17 @@ class HOLSession:
         if self.env:
             proc_env.update(self.env)
 
-        # Keep the historical default; large projects may opt in explicitly.
         # Validate before spawning so a typo cannot silently select a limit.
-        raw_heap = proc_env.get("HOL4_MCP_MAXHEAP_MB", "8192")
-        try:
-            heap_mb = int(raw_heap)
-        except (TypeError, ValueError):
-            raise ValueError("HOL4_MCP_MAXHEAP_MB must be an integer >= 256") from None
-        if heap_mb < 256:
-            raise ValueError("HOL4_MCP_MAXHEAP_MB must be an integer >= 256")
+        raw_heap = proc_env.get("HOL4_MCP_MAXHEAP_MB")
+        if raw_heap is None:
+            heap_mb = default_maxheap_mb()
+        else:
+            try:
+                heap_mb = int(raw_heap)
+            except (TypeError, ValueError):
+                raise ValueError("HOL4_MCP_MAXHEAP_MB must be an integer >= 256") from None
+            if heap_mb < 256:
+                raise ValueError("HOL4_MCP_MAXHEAP_MB must be an integer >= 256")
 
         self.process = await asyncio.create_subprocess_exec(
             str(HOLDIR / "bin" / "hol"), "--maxheap", str(heap_mb), "--zero",
@@ -434,6 +465,22 @@ class HOLSession:
             return ticks() > before
         except OSError:
             return None
+
+    def resident_mb(self) -> int | None:
+        """Resident memory of the HOL process tree's largest member (Poly/ML)
+        in MB; None when it cannot be read."""
+        if not self.is_running:
+            return None
+        largest = None
+        for pid in _process_tree(self.process.pid):
+            try:
+                with open(f"/proc/{pid}/status", encoding="ascii", errors="replace") as fh:
+                    kb = next(int(line.split()[1]) for line in fh
+                              if line.startswith("VmRSS:"))
+            except (OSError, StopIteration, ValueError, IndexError):
+                continue
+            largest = kb if largest is None else max(largest, kb)
+        return None if largest is None else largest // 1024
 
     def interrupt(self):
         """Send SIGINT to entire process group."""

@@ -28,7 +28,9 @@ blocked once, then an identical retry passes with an override note and is
 logged (hook_payload.soft_block); a newly stale theory blocks again. The
 literal phrase `stale ok` anywhere in the session's user turns pre-grants
 the deferral. Fail-open on any internal error, unknown target file,
-unreadable transcript, or closure larger than the cap.
+unreadable transcript, or closure larger than the cap. A refusal is recorded
+(`last_stale_block` in the session's hook state) for H29, which lets the stop
+that frees memory for the rebuild through.
 """
 
 HOOK_EVENT = "PreToolUse"
@@ -385,10 +387,26 @@ def main():
     lines += ["(Long builds: detach=True + hol_build_status. The block clears itself",
               "once artifacts are newer than their sources.)"]
     fingerprint = target + "|" + "|".join(sorted(p for p, _ in roots))
-    return soft_block(payload, "H30", fingerprint, lines,
+    code = soft_block(payload, "H30", fingerprint, lines,
                       f"navigating {os.path.basename(target)} against STALE ancestors "
                       f"{', '.join(stale_names)}; nothing checked here is trustworthy "
                       f"until they are rebuilt")
+    if code == 2:
+        record_block(payload, target, roots)
+    return code
+
+
+def record_block(payload, target, roots):
+    """Note the refusal for H29: a stop right after it frees the session's
+    memory for the rebuild it asks for."""
+    d = os.path.join(STATE, payload.get("session_id") or "nosession")
+    try:
+        os.makedirs(d, exist_ok=True)
+        with open(os.path.join(d, "last_stale_block"), "w", encoding="utf-8") as fh:
+            json.dump({"ts": time.time(), "target": target,
+                       "stale_dirs": sorted({os.path.dirname(p) for p, _ in roots})}, fh)
+    except OSError:
+        pass
 
 
 if __name__ == "__main__":

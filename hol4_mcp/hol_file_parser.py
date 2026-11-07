@@ -544,6 +544,68 @@ def suspension_base(name: str) -> str:
     return name.split('[', 1)[0]
 
 
+# Any `Resume` header, stacked brackets included (which the Resume pattern in
+# parse_theorems does not register).
+_ANY_RESUME_HEADER_RE = re.compile(
+    r"^Resume[ \t]+([A-Za-z][A-Za-z0-9_']*)[ \t]*((?:\[[^\]\n]*\][ \t]*)+):", re.M)
+
+
+@dataclass
+class ResumeHeaderProblem:
+    """A Resume header HOL does not read as the agent wrote it."""
+    line: int          # the header's line
+    end_line: int      # its block's QED line
+    name: str          # the composite name the MCP registers, `thm[label]`
+    message: str
+
+
+def resume_header_problems(content: str) -> list[ResumeHeaderProblem]:
+    """Resume headers HOL reads differently from a label path: entries after
+    the first are proof attributes (`key=value`; a bare `b` compiles as the
+    attribute `b []`, a build error), stacked `thm[a][b]` is a parse error,
+    and a label resumed by an earlier block is resumed again. Labels are one
+    flat namespace on the base theorem (HOL tools/parsing/HOLSourceExpand)."""
+    stripped = _strip_comments(content)
+    first_block: dict[tuple[str, str], int] = {}
+    problems = []
+    for m in _ANY_RESUME_HEADER_RE.finditer(stripped):
+        line = content.count('\n', 0, m.start()) + 1
+        qed = re.search(r'^[^\S\n]*QED[^\S\n]*$', stripped[m.end():], re.M)
+        end_line = line + stripped[m.start():m.end() + (qed.end() if qed else 0)].count('\n')
+        base = m.group(1)
+        groups = re.findall(r"\[([^\]]*)\]", m.group(2))
+        entries = [e.strip() for e in groups[0].split(',')]
+        label = entries[0]
+        written = f"Resume {base}{''.join(f'[{g}]' for g in groups)}:"
+        earlier = first_block.get((base, label))
+        bare = [e for e in entries[1:] if e and '=' not in e]
+        if len(groups) > 1:
+            last = groups[-1].split(',')[0].strip()
+            message = (f"The Resume header at line {line} (`{written}`) stacks "
+                       f"labels, which HOL does not parse, so this block is not "
+                       f"registered. Labels are one flat namespace on the base "
+                       f"theorem: write `Resume {suspension_base(base)}[{last}]:`.")
+        elif bare:
+            also = (f", which the block at line {earlier} already resumes"
+                    if earlier is not None else "")
+            message = (f"The Resume header at line {line} (`{written}`) is not a "
+                       f"label path: HOL reads the entries after the first as "
+                       f"proof attributes, so `{bare[0]}` is an unknown attribute "
+                       f"(a build error), and the block resumes label "
+                       f"`{label}`{also}. Labels are one flat namespace on the "
+                       f"base theorem: write `Resume {suspension_base(base)}[{bare[-1]}]:`.")
+        elif earlier is not None:
+            message = (f"The Resume header at line {line} resumes `{base}[{label}]`, "
+                       f"which the block at line {earlier} already resumes: each "
+                       f"label is resumed by one block.")
+        else:
+            message = ""
+        first_block.setdefault((base, label), line)
+        if message:
+            problems.append(ResumeHeaderProblem(line, end_line, f"{base}[{label}]", message))
+    return problems
+
+
 def _string_end(content: str, start: int) -> int:
     """End offset of an SML string, including escaped characters/string gaps."""
     i = start + 1

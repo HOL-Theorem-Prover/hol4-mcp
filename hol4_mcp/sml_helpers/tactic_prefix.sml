@@ -786,6 +786,10 @@ fun timed_step_json cmd =
   end
   handle e => print (json_err (exnMessage e) ^ "\n");
 
+(* The theorem the last successful verify_core proved, kept whether or not it
+   was stored, so the cursor can bind it with the file's own header. *)
+val hol4mcp_checked_thm : thm option ref = ref NONE;
+
 (* Core verification - goal must already be set on proof manager.
    Runs tactics with per-tactic timing, optionally stores theorem.
    Checks oracle tags on stored theorems for cheat detection. *)
@@ -848,6 +852,8 @@ fun verify_core name tactics store timeout_sec =
         handle _ => []
       else []
 
+    val _ = hol4mcp_checked_thm :=
+              (if proof_ok then (SOME (top_thm ()) handle _ => NONE) else NONE)
     val stored = proof_ok andalso store
     val _ = if stored
             then (smlExecute.quse_string ("val " ^ name ^ " = save_thm(\"" ^ name ^ "\", top_thm());"); ())

@@ -47,7 +47,7 @@ Status legend: ✅ shipped · 🚧 in progress · 📝 proposed (not yet impleme
 | H14 | ✅     | PreToolUse            | `Bash`                  | HARD. Block destructive git ops without literal `git ok` in the latest user message (transcript-aware; fail-open if transcript unreadable). Quoted strings are blanked first; `merge-base`, `stash list/show` and `clean -n/--dry-run` are read-only and pass. A `git commit` also reports the soft hooks the session overrode |
 | H15 | ⏭     | PreToolUse            | `Write`                 | ~~On `~/.claude/plans/` writes, advise if "Operating principles" section is missing~~ — skipped (high FP on non-proof plans; marker regex fragile; plan template is the better forcing function) |
 | H16 | ✅     | PostToolUse           | `mcp__hol4__hol_state_at\|mcp__hol4__hol_send\|mcp__hol4__hol_check_proof` | Inject advisory when goal display contains `⅋ᵣ` / `resconj` — the canonical indicator that multiple subgoals were bundled into one Resume body via a shared `suspend` label (hol4-proving skill "one label = one goal" violation) |
-| H17 | ✅     | PreToolUse            | `Edit\|Write\|MultiEdit` | Block newly-authored non-canonical `suspend` in `*Script.sml` edits: THEN-form (`>>` / `\\` / `THEN` then `suspend "..."`) and the `by (suspend "...")` justification form — must be `>-` (THEN1) per "one label = one goal" (edit-time guard for the runtime failure H16 detects) |
+| H17 | ✅     | PreToolUse            | `Edit\|Write\|MultiEdit` | Block newly-authored non-canonical `suspend` in `*Script.sml` edits: THEN-form (`>>` / `\\` / `THEN` then `suspend "..."`) and the `by (suspend "...")` justification form — must be `>-` (THEN1) per "one label = one goal" (edit-time guard for the runtime failure H16 detects). SOFT: a newly added Resume header that is not a label path (`t[a, b]` with a bare later entry, stacked `t[a][b]`) is refused once; `key=value` entries pass |
 | H18 | ✅     | PreToolUse            | `mcp__hol4__hol_send\|Edit\|Write\|MultiEdit` | Block the `markerLib` suspension-lookup query (the `(string*thm) option` one — returns NONE in a bare session, tempts guessing the suspended goal); point to `set_suspended_goal` to actually load it |
 | H19 | ⏭     | PreToolUse            | `mcp__hol4__hol_restart` | ~~Advise (never block) on `hol_restart` without the user asking~~ — superseded by H29 (repeat-keyed block covering `hol_stop` + `hol_restart`); file and wiring removed |
 | H20 | ✅     | PreToolUse            | `mcp__hol4__hol_send`   | Block sending a massive tactic chain through `hol_send` (≥6 THEN-combinators, or ≥8 non-blank lines with ≥2 combinators) — RULE I: flush to the file, jump with `hol_state_at`; small probes pass |
@@ -58,8 +58,8 @@ Status legend: ✅ shipped · 🚧 in progress · 📝 proposed (not yet impleme
 | H26 | ✅     | —                     | —                      | **Implemented inside H6**, not as its own hook: it fires on the same event with the same payload, so a separate hook would mean two messages on one failure. See "The symptom table" under H6 |
 | H27 | ✅     | PreToolUse            | `Bash`                  | HARD. Audit the `*Script.sml` content a `git commit` would record (index blobs, or the selected worktree files for `-a`/`--only`/`--include`; `--amend` against HEAD), never mutating the index. Blocks newly introduced findings — Gates 1/2/3/5 on added lines plus `proof_sweep` per touched theorem, minus the lone-`>-` and trailing-`>-` prompts (H25's advisories) — not inherited debt, including a finding that stood on a line the commit merely retouched; a deleted `Finalise` counts. In a repository that tracks `*Script.sml`, a command form it cannot model (compound, substitution, shell wrapper, unknown option) is refused with the reason; elsewhere every form passes. Override with `wip ok` |
 | H28 | ✅     | PreToolUse            | `Bash`                  | SOFT. Block shell invocations of `Holmake` / raw `poly`\|`hol` once, redirecting to `mcp__hol4__holmake` / `hol_start` (`detach=True` for long builds); an identical retry passes with an override note. Command-position match only, after quoted strings and heredoc bodies are blanked (`hook_payload.visible_command`), so prose, log paths, grep patterns, `hol=...` assignments and `--help`/`-v` queries pass. Pre-grant: `shell holmake ok` |
-| H29 | ✅     | PreToolUse            | `mcp__hol4__hol_stop\|mcp__hol4__hol_restart` | SOFT. Block a REPEAT `hol_stop`/`hol_restart` within 30 min while the cached working file (H25's `hol4_file`) is still in the same directory once — the ritual-stop signature; stop/restart is never part of the edit-check loop (`hol_state_at` auto-detects edits, reloads after an ancestor rebuild and moves the session across workdirs itself; every stop costs a cold prefix reload). First stop, any stop once the working file is in another directory, and a stop within 10 min of a budget TIMEOUT (recorded by H6) pass; an identical retry passes with an override note. Pre-grant: `restart ok` |
-| H30 | ✅     | PreToolUse            | `mcp__hol4__hol_state_at\|hol_goals\|hol_check_proof\|hol_send\|hol_start` | Block HOL navigation of a file whose ANCESTOR theories are stale — script newer than its built artifacts, artifacts missing (mid-rebuild), or built before their own ancestors' artifacts. Forecloses "edited upstream, kept working downstream": sessions and fresh loads read the built `.dat`, so downstream checks silently run against the pre-edit upstream with no native symptom. Make-style check over the `Ancestors`/`open` closure (comment-stripped, duplicate names resolved nearest-first, mtime-memoized under `~/.claude/hook-state/h30/`); self-clears on rebuild; target file itself exempt; also keeps H25's `hol4_file` cache current for `hol_goals`/`hol_start`. SOFT: a given (file, stale set) is blocked once with rebuild commands from each ancestor's own directory; an identical retry passes with an override note; a newly stale theory blocks again. Pre-grant: `stale ok` |
+| H29 | ✅     | PreToolUse            | `mcp__hol4__hol_stop\|mcp__hol4__hol_restart` | SOFT. Block a REPEAT `hol_stop`/`hol_restart` within 30 min while the cached working file (H25's `hol4_file`) is still in the same directory once — the ritual-stop signature; stop/restart is never part of the edit-check loop (`hol_state_at` auto-detects edits, reloads after an ancestor rebuild and moves the session across workdirs itself; every stop costs a HOL restart and a prefix reload). First stop, any stop once the working file is in another directory, a stop within 10 min of a budget TIMEOUT (recorded by H6), and a stop within 10 min of an H30 refusal covering the working directory (recorded by H30; it frees memory for the rebuild) pass; an identical retry passes with an override note. Pre-grant: `restart ok` |
+| H30 | ✅     | PreToolUse            | `mcp__hol4__hol_state_at\|hol_goals\|hol_check_proof\|hol_send\|hol_start` | Block HOL navigation of a file whose ANCESTOR theories are stale — script newer than its built artifacts, artifacts missing (mid-rebuild), or built before their own ancestors' artifacts. Forecloses "edited upstream, kept working downstream": sessions and fresh loads read the built `.dat`, so downstream checks silently run against the pre-edit upstream with no native symptom. Make-style check over the `Ancestors`/`open` closure (comment-stripped, duplicate names resolved nearest-first, mtime-memoized under `~/.claude/hook-state/h30/`); self-clears on rebuild; target file itself exempt; also keeps H25's `hol4_file` cache current for `hol_goals`/`hol_start`. SOFT: a given (file, stale set) is blocked once with rebuild commands from each ancestor's own directory; an identical retry passes with an override note; a newly stale theory blocks again. Each refusal is recorded (`last_stale_block`) for H29. Pre-grant: `stale ok` |
 | H31 | ✅     | PreToolUse            | `mcp__hol4__hol_state_at\|mcp__hol4__hol_goals` | SOFT. Block `skip_prefix: true` once per file with the RULE K caveat (prefix-skip binds every earlier theorem by `cheat`); an identical retry passes with an override note and is logged. `false`/absent never fires. Pre-grant: `skip prefix ok` |
 | H32 | ✅     | PreToolUse            | `mcp__hol4__holmake`    | SOFT. Build ownership (RULE A): block a `holmake` with no `target` (whole-directory build) once per workdir; an identical retry passes with an override note. Targeted builds always pass — rebuilding stale ancestors in other directories is what H30 asks for. Pre-grant: `build ok` |
 | H33 | ✅     | PreToolUse            | `Bash`                  | SOFT. Block a self-defeating background waiter once — `pgrep -f` with no bracket-escape or `-x` (it matches its own command line, so the loop never ends), an `until`/`while … do … sleep` poll loop, or `sleep N` followed by a log read — redirecting to one read of the job's log, to `hol_build_status(job, wait=…)` for a detached MCP build, or to backgrounding the command itself; an identical retry passes with an override note. Matched on the raw command (these loops sit inside `bash -c '…'`). General shell policy, not HOL4: Claude-only like H14. Pre-grant: `waiter ok` |
@@ -456,6 +456,13 @@ merged `resconj` goal directly. Exact text lives in the hook.
 subtracted, so inherited debt cannot block an unrelated change. A `Write`
 checks the complete new file.
 
+SOFT part (`hook_payload.soft_block`): an edit that adds a Resume header HOL
+does not read as a label path is refused once, with its flat form — a bare
+entry after the label (`Resume t[a, b]:`; HOL reads later entries as proof
+attributes, so `b` is an unknown one) or stacked labels (`Resume t[a][b]:`, a
+parse error). An identical retry passes and is logged. `key=value` entries
+(`Resume t[a,smlname=x]:`) and headers already in the replaced text pass.
+
 ### Why
 
 `suspend "L"` is a single-goal tactic; THEN distributes its right operand across
@@ -655,8 +662,9 @@ not HOL4 policy, so like H14 it is Claude-only and absent from the Codex
 
 ## Soft hooks — block once, pass on a deliberate retry
 
-H28, H29, H30, H31, H32 and H33 guard situations the hook cannot judge but the
-agent must not miss. They share one protocol (`hook_payload.soft_block`):
+H28, H29, H30, H31, H32 and H33, and H17's Resume-header check, guard
+situations the hook cannot judge but the agent must not miss. They share one
+protocol (`hook_payload.soft_block`):
 
 1. The first occurrence of a situation (a per-hook fingerprint: the command,
    the directory, the file plus its stale set, …) is blocked with the full
@@ -676,8 +684,9 @@ agent must not miss. They share one protocol (`hook_payload.soft_block`):
    decisions surface where the work is recorded.
 
 The hard hooks are unchanged: H14 (`git ok`) and H27 (`wip ok`) read the
-latest user message only and never pass on a retry; H1, H17, H18, H20 and
-H23 block a wrong tactic form or query outright, with no override.
+latest user message only and never pass on a retry; H1, H17 (its suspend
+forms), H18, H20 and H23 block a wrong tactic form or query outright, with no
+override.
 
 ## Installing the full suite
 

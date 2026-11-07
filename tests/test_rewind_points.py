@@ -14,7 +14,7 @@ open HolKernel Parse boolLib bossLib;
 
 val _ = new_theory "rwp";
 
-val counter = ref 0;
+val counter = ref 0; fun bump () = counter := !counter + 1;
 
 Theorem a_thm:
   T
@@ -22,7 +22,7 @@ Proof
   simp[]
 QED
 
-val _ = counter := !counter + 1;{marker}
+val _ = bump ();{marker}
 
 Theorem b_thm:
   T /\\ T
@@ -70,6 +70,22 @@ async def test_rewind_uses_a_point_and_unbinds_later_names(tmp_path):
         assert "=== Goal" in state and "Session reinit" not in state, state
         # c_thm ran after the point and has not run since the rewind.
         assert "unit" in await hol_send("c_thm;", session=session)
+        # The rewind went to b_thm's start point, after the counter span,
+        # which therefore did not run again.
+        assert "val it = 1" in await hol_send("!counter;", session=session)
+    finally:
+        await hol_stop(session=session)
+
+
+async def test_a_rewind_before_a_plain_span_runs_it_again(tmp_path):
+    script = _script(tmp_path)
+    session = "rwp_plain_span"
+    try:
+        await _init_file_cursor(file=str(script), session=session)
+        await hol_state_at(line=30, col=3, session=session)   # inside d_thm
+        script.write_text(script.read_text().replace("  T\nProof", "  T /\\ T\nProof", 1))
+        state = await hol_state_at(line=24, col=3, session=session)   # into c_thm
+        assert "=== Goal" in state and "Session reinit" not in state, state
         # A plain ref outside the opaque list is not rewound: the span ran
         # twice. (The opaque list exists for the libraries where it matters.)
         assert "val it = 2" in await hol_send("!counter;", session=session)
@@ -105,10 +121,28 @@ async def test_rewind_across_an_opaque_span_loads_a_file(tmp_path):
         await hol_state_at(line=24, col=3, session=session)
         cursor = _sessions[session].cursor
         assert cursor._opaque_points, "the marked span was not seen as opaque"
-        assert cursor._checkpoints["b_thm"].context_path is not None
-        state = await _edit_b_and_return(script, session)
+        assert cursor._checkpoints["a_thm"].context_path is not None
+        # An edit to a_thm puts the rewind before the span.
+        script.write_text(script.read_text().replace("  T\nProof", "  T /\\ T\nProof", 1))
+        state = await hol_state_at(line=24, col=3, session=session)
         assert "=== Goal" in state, state
         # The SaveState file holds the ref as it was: the span ran once since.
+        assert "val it = 1" in await hol_send("!counter;", session=session)
+    finally:
+        await hol_stop(session=session)
+
+
+async def test_a_rewind_into_a_theorem_after_an_opaque_span_stays_in_memory(tmp_path):
+    script = _script(tmp_path, OPAQUE_MARKER)
+    session = "rwp_opaque_after"
+    try:
+        await _init_file_cursor(file=str(script), session=session)
+        await hol_state_at(line=30, col=3, session=session)   # inside d_thm
+        cursor = _sessions[session].cursor
+        rewinds = cursor._memory_rewinds
+        state = await _edit_b_and_return(script, session)      # into c_thm
+        assert "=== Goal" in state, state
+        assert cursor._memory_rewinds == rewinds + 1
         assert "val it = 1" in await hol_send("!counter;", session=session)
     finally:
         await hol_stop(session=session)

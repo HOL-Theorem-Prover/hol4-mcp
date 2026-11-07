@@ -33,11 +33,14 @@ async def test_server_applies_and_restarts_with_explicit_heap_configuration(tmp_
 
 
 @pytest.mark.parametrize("inherited,explicit,expected", [
-    (None, None, 8192), ("10240", None, 10240),
+    (None, None, None), ("10240", None, 10240),
     ("10240", "12288", 12288), (None, "256", 256),
 ])
 async def test_interactive_heap_configuration(monkeypatch, tmp_path,
                                               inherited, explicit, expected):
+    from hol4_mcp.hol_session import default_maxheap_mb
+    expected = default_maxheap_mb() if expected is None else expected
+    assert default_maxheap_mb() >= 8192
     monkeypatch.delenv("HOL4_MCP_MAXHEAP_MB", raising=False)
     if inherited is not None:
         monkeypatch.setenv("HOL4_MCP_MAXHEAP_MB", inherited)

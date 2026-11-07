@@ -24,7 +24,7 @@ async def test_effectful_prefix_reuse_and_backward_context(tmp_path):
         live = srv._sessions[session].session
         pid = live.process.pid
         assert log.read_text().splitlines() == ["loaded"]
-        assert "val it = 1" in await live.send("!prefix_marker;")
+        assert "val it = 1:" in await live.send("!prefix_marker;")
         checked = await srv.hol_check_proof("target", session=session)
         assert "Status: OK" in checked
         source = source.replace('Theorem target:\n T\nProof\n simp[]',
@@ -35,16 +35,16 @@ async def test_effectful_prefix_reuse_and_backward_context(tmp_path):
         assert live.process.pid == pid
         assert log.read_text().splitlines() == ["loaded"], "ordinary target edit replayed the prefix"
         await srv.hol_check_proof("later", session=session)
-        assert "val it = 99" in await live.send("!prefix_marker;")
+        assert "val it = 99:" in await live.send("!prefix_marker;")
         cursor = srv._sessions[session].cursor
         target = cursor._get_theorem("target")
         result = await srv.hol_state_at(line=target.proof_end_line - 1, session=session)
         assert "ERROR" not in result and "PROOF BROKEN" not in result, result
-        assert "val it = 1" in await live.send("!prefix_marker;"), "later imperative state leaked backward"
+        assert "val it = 1:" in await live.send("!prefix_marker;"), "later imperative state leaked backward"
         # Editing a top-level effect must invalidate its prior interpretation.
         script.write_text(source.replace("!prefix_marker + 1", "!prefix_marker + 2"))
         result = await srv.hol_state_at(line=target.proof_end_line - 1, session=session)
         assert "ERROR" not in result and "PROOF BROKEN" not in result, result
-        assert "val it = 2" in await live.send("!prefix_marker;"), "stale/repeated translator state survived edit"
+        assert "val it = 2:" in await live.send("!prefix_marker;"), "stale/repeated translator state survived edit"
     finally:
         await srv.hol_stop(session)

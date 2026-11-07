@@ -34,7 +34,7 @@ from .hol_session import HOLSession, HOLDIR, escape_sml_string
 from .hol_cursor import FileProofCursor, StateAtResult, _try_find_json_line
 from .hol_file_parser import (
     step_line_numbers, format_steps, format_step_context,
-    step_text_start, elide_long_text, suspension_base,
+    step_text_start, elide_long_text, suspension_base, resume_header_problems,
 )
 from .quote_check import quote_diagnosis_lines
 from .build_evidence import traced_build, build_failure_heading
@@ -246,6 +246,12 @@ def _serialized_session(parameter="session"):
             except _Interrupted as cancelled:
                 return _cancelled_call_text(function.__name__, cancelled.state,
                                             cancelled.intent)
+            finally:
+                # A session is idle from the END of its last call: a long
+                # call is activity, not idleness (_prune_idle_sessions).
+                entry = _sessions.get(key)
+                if entry is not None:
+                    entry.last_used = time.time()
         return serialized
     return decorate
 
@@ -1027,20 +1033,80 @@ _SESSION_IDLE_TIMEOUT = 1800  # 30 minutes
 _PRUNE_INTERVAL = 300  # Check every 5 minutes at most
 _last_prune_time = 0.0
 
+# Per session NAME, not per process: the HOL environment every start of the
+# session uses (set by hol_start(env=...) and hol_setenv), and why its last
+# process ended, for the notice of the next automatic start.
+_session_envs: dict[str, dict[str, str]] = {}
+_session_ended: dict[str, str] = {}
+
+
+def _session_env(env) -> dict[str, str] | str:
+    """`env` with every value a string, or an error text. Checked before
+    anything is stopped, so a bad value never costs the running session."""
+    if not isinstance(env, dict):
+        return "ERROR: env must map variable names to values."
+    clean = {}
+    for key, value in env.items():
+        if (not isinstance(key, str) or isinstance(value, bool)
+                or not isinstance(value, (str, int))):
+            return (f"ERROR: env {key!r} must have a string or integer value, "
+                    f"got {value!r}. Nothing was changed.")
+        clean[key] = str(value)
+    heap = clean.get("HOL4_MCP_MAXHEAP_MB")
+    if heap is not None and not (heap.strip().isdigit() and int(heap) >= 256):
+        return ("ERROR: HOL4_MCP_MAXHEAP_MB must be an integer >= 256 (MB). "
+                "Nothing was changed.")
+    return clean
+
+
+def _drop_dead_session(name: str) -> None:
+    """Forget a session whose HOL process is gone; the next start says so."""
+    _sessions.pop(name, None)
+    _session_ended[name] = "ended because its HOL process died"
+
+
+def _heap_pressure_lines(session: HOLSession) -> list[str]:
+    """A line when HOL's resident memory is at its heap limit, where Poly/ML
+    spends nearly all its time collecting garbage."""
+    limit = session.maxheap_mb
+    resident = session.resident_mb()
+    if not limit or resident is None or resident < 0.9 * limit:
+        return []
+    return ["", f"[Heap pressure: HOL holds {resident} MB against its {limit} MB "
+            f"heap limit. At the limit Poly/ML spends nearly all its time "
+            f"collecting garbage: steps slow down by orders of magnitude and "
+            f"SIGINT is answered late or not at all. Raise HOL4_MCP_MAXHEAP_MB "
+            f"with hol_setenv (it restarts the session).]"]
+
+
+def _indexed_saves(ckpt_dir: Path) -> set[str]:
+    """The saves a later session may start from, as the reuse indexes of
+    the directory's scripts name them (FileProofCursor.persist_reusable_state)."""
+    keep: set[str] = set()
+    for index in ckpt_dir.glob("reuse-*.json"):
+        try:
+            keep.update(node for node, _ in json.loads(index.read_text()).get("chain", []))
+        except (OSError, ValueError, TypeError, AttributeError):
+            continue
+    return keep
+
 
 def _gc_cursor_checkpoints(cursor: FileProofCursor):
     """Delete orphaned per-theorem checkpoint .save files from a dying cursor.
 
-    Keeps base_deps.save and deps_only.save (expensive ~200MB rebuilds).
-    Removes per-theorem context/end_of_proof saves (cheap to rebuild via replay).
+    Keeps base_deps.save and deps_only.save (expensive ~200MB rebuilds), and
+    the context saves a later session of a script may start from (one
+    chain per script). Removes the other per-theorem context/end_of_proof
+    saves (cheap to rebuild via replay).
     """
     ckpt_dir = cursor._checkpoint_dir
     if not ckpt_dir or not ckpt_dir.exists():
         return
-    for f in ckpt_dir.glob("*_context.save"):
-        f.unlink(missing_ok=True)
-    for f in ckpt_dir.glob("*_end_of_proof.save"):
-        f.unlink(missing_ok=True)
+    cursor.persist_reusable_state()
+    keep = _indexed_saves(ckpt_dir)
+    for f in [*ckpt_dir.glob("*_context.save"), *ckpt_dir.glob("*_end_of_proof.save")]:
+        if str(f) not in keep:
+            f.unlink(missing_ok=True)
     try:
         ckpt_dir.rmdir()  # only removes if empty
     except OSError:
@@ -1052,8 +1118,9 @@ def _gc_workdir_orphans(workdir: Path):
 
     Called on hol_start. Deletes *_context.save and *_end_of_proof.save
     (cheap replay rebuilds) across the cursor_checkpoints/ dirs under the
-    workdir, except those of this server's live cursors.
-    Keeps base_deps.save and deps_only.save (expensive ~200MB rebuilds).
+    workdir, except those of this server's live cursors and those a reuse
+    index names. Keeps base_deps.save and deps_only.save (expensive ~200MB
+    rebuilds).
     """
     live = {
         Path(e.cursor._checkpoint_dir).resolve()
@@ -1062,10 +1129,10 @@ def _gc_workdir_orphans(workdir: Path):
     for ckpt_dir in workdir.glob("**/cursor_checkpoints"):
         if not ckpt_dir.is_dir() or ckpt_dir.resolve() in live:
             continue
-        for f in ckpt_dir.glob("*_context.save"):
-            f.unlink(missing_ok=True)
-        for f in ckpt_dir.glob("*_end_of_proof.save"):
-            f.unlink(missing_ok=True)
+        keep = _indexed_saves(ckpt_dir)
+        for f in [*ckpt_dir.glob("*_context.save"), *ckpt_dir.glob("*_end_of_proof.save")]:
+            if str(f) not in keep:
+                f.unlink(missing_ok=True)
         try:
             ckpt_dir.rmdir()
         except OSError:
@@ -1099,9 +1166,11 @@ async def _prune_idle_sessions():
         if operation is not None and operation.lock.locked():
             continue
         # Re-check: session may have been touched during a prior await
-        if time.time() - entry.last_used <= _SESSION_IDLE_TIMEOUT:
+        idle = time.time() - entry.last_used
+        if idle <= _SESSION_IDLE_TIMEOUT:
             continue
         _sessions.pop(name, None)
+        _session_ended[name] = f"was stopped after {idle / 60:.0f} min idle"
         if entry.cursor:
             _gc_cursor_checkpoints(entry.cursor)
         await entry.session.stop()
@@ -1198,21 +1267,36 @@ async def hol_start(workdir: str, name: str = "default", env: dict = None,
         name: Session identifier (e.g., "main")
         env: Optional environment variables (e.g. {"VFMDIR": "/path/to/vfm"}).
              HOL4_MCP_MAXHEAP_MB sets the interactive Poly/ML heap limit in MB
-             (integer >= 256; default 8192). Applied at session startup only;
-             holmake's heap_size is independent.
+             (integer >= 256; default half of the machine's RAM, at least
+             8192); holmake's heap_size is independent. The env belongs to
+             the session name: every later start of it, automatic restarts
+             included, uses it until hol_setenv or another hol_start(env=...)
+             replaces it. Not applied to a session already running (the
+             reply says so; hol_setenv applies it).
         force: Allow a second concurrent session despite RULE J (default False)
 
     Returns: Session status
     """
+    if env is not None:
+        env = _session_env(env)
+        if isinstance(env, str):
+            return env
     await _prune_idle_sessions()
     # If session exists and is running, return its state
     if name in _sessions:
         session = _sessions[name].session
         if session.is_running:
             goals = await session.send("top_goals();", timeout=10)
-            return f"Session '{name}' already running.\n\n=== Goals ===\n{goals}"
-        # Dead session - clean up
-        del _sessions[name]
+            current = _sessions[name].env or {}
+            unapplied = ""
+            if env and any(current.get(k) != v for k, v in env.items()):
+                unapplied = (f"\nThe env passed was NOT applied ({env}); the running "
+                             f"process has {current or 'no extra env'}. hol_setenv "
+                             f"applies it (it restarts the session).")
+            return f"Session '{name}' already running.{unapplied}\n\n=== Goals ===\n{goals}"
+        _drop_dead_session(name)
+    if env is None:
+        env = _session_envs.get(name)
 
     # RULE J: one HOL session at a time. A second concurrent session resolves
     # bare theorem names against stale built ancestors and can falsely pass.
@@ -1265,6 +1349,9 @@ async def hol_start(workdir: str, name: str = "default", env: dict = None,
         return f"Session '{name}' already running.\n\n=== Goals ===\n{goals}"
 
     _sessions[name] = SessionEntry(session, datetime.now(), workdir_path, env=env)
+    if env is not None:
+        _session_envs[name] = env
+    _session_ended.pop(name, None)
 
     # Clean orphaned per-theorem checkpoints left by previous server lifetimes
     _gc_workdir_orphans(workdir_path)
@@ -1569,7 +1656,7 @@ async def hol_send(command: str, timeout: int = 5, max_output: int = DEFAULT_MAX
         return f"ERROR: Session '{session}' not found. Use hol_sessions() to list available sessions."
 
     if not s.is_running:
-        del _sessions[session]
+        _drop_dead_session(session)
         return f"ERROR: Session '{session}' died. Use hol_start() to create a new session."
 
     # Validate timeout
@@ -1631,7 +1718,7 @@ async def hol_search(
     if not s:
         return f"ERROR: Session '{session}' not found. Use hol_sessions() to list available sessions."
     if not s.is_running:
-        del _sessions[session]
+        _drop_dead_session(session)
         return f"ERROR: Session '{session}' died. Use hol_start() to create a new session."
 
     cmd = (
@@ -1757,7 +1844,7 @@ async def hol_goals(
         if not s:
             return f"ERROR: Session '{session}' not found. Use hol_sessions() to list available sessions."
         if not s.is_running:
-            del _sessions[session]
+            _drop_dead_session(session)
             return f"ERROR: Session '{session}' died. Use hol_start() to create a new session."
         output = await s.send('goals_json();', timeout=10)
         data = _try_find_json_line(output)
@@ -1847,12 +1934,13 @@ async def hol_interrupt(session: str = "default") -> str:
         return f"ERROR: Session '{session}' not found."
 
     if not s.is_running:
-        del _sessions[session]
+        _drop_dead_session(session)
         return f"ERROR: Session '{session}' died."
 
     still_busy = (f"HOL ignores SIGINT and is still running the command; nothing "
                   f"more is sent to it until it stops. hol_stop ends the session "
-                  f"(the next call restarts HOL and reloads the prefix).")
+                  f"(the next call restarts HOL and reloads the prefix)."
+                  + "".join(f"\n{line}" for line in _heap_pressure_lines(s) if line))
     operation = _session_operations.get(session)
     holder = operation.owner if operation is not None else None
     if holder is None or holder.done():
@@ -1887,7 +1975,9 @@ async def hol_stop(session: str = "default") -> str:
     Works while a call is running on it: that call is cancelled and returns
     "STOPPED: ...". Kills HOL (SIGTERM, then SIGKILL) without waiting for a
     command to stop, so it also ends one that ignores hol_interrupt. The next
-    call on the session restarts HOL and reloads the prefix.
+    call on the session restarts HOL, with the session's env (hol_setenv),
+    and reloads the prefix: from the script's last saved state when nothing
+    it depends on changed (no dependency reload), else cold.
 
     Args:
         session: Session name (default: "default")
@@ -1910,6 +2000,7 @@ async def hol_stop(session: str = "default") -> str:
         await stale.session.stop()
     if _sessions.get(session) is current:
         del _sessions[session]
+        _session_ended[session] = "was stopped by hol_stop"
     ended = f" The {tool} call running on it returns STOPPED." if tool else ""
     return f"Session '{session}' stopped.{ended}"
 
@@ -1926,8 +2017,10 @@ async def hol_restart(session: str = "default") -> str:
     been rebuilt ("[Session reloaded: ancestor ...]"), and move it to another
     workdir when file= points there ("[Session restarted: workdir ...]"). Hook
     H29 blocks a REPEAT stop/restart in the same theory directory within 30 min
-    once (first stop, directory switches and a stop right after a budget TIMEOUT
-    pass; a deliberate repeat passes and is logged for the user). "Corrupted state" is essentially never the cause: a weird replay
+    once (first stop, directory switches, and a stop right after a budget
+    TIMEOUT or an H30 stale-ancestor refusal pass; a deliberate repeat passes
+    and is logged for the user). The next call starts from the script's
+    saved state when nothing it depends on changed, else reloads cold. "Corrupted state" is essentially never the cause: a weird replay
     is a proof or navigation error (RULE D) that restarting hides, and the
     restart also wipes the state that would have localised it.
 
@@ -1951,7 +2044,7 @@ async def hol_restart(session: str = "default") -> str:
             # A queued call (a workdir switch, hol_setenv) may have replaced
             # the entry meanwhile: restart what is there now.
             entry = _sessions.get(session) or entry
-            workdir, env = entry.workdir, entry.env  # Preserve env through restart
+            workdir, env = entry.workdir, _session_envs.get(session, entry.env)
             await hol_stop(session)
             # Replacing this session is not a second one: RULE J does not apply.
             started = await hol_start(workdir=str(workdir), name=session, env=env,
@@ -1967,7 +2060,10 @@ async def hol_restart(session: str = "default") -> str:
 async def hol_setenv(env: dict, session: str = "default") -> str:
     """Set environment variables for a HOL session and auto-restart to apply.
 
-    These are passed to the HOL process and affect Holmakefile INCLUDES expansion.
+    These are passed to the HOL process and affect Holmakefile INCLUDES
+    expansion; HOL4_MCP_MAXHEAP_MB sets the heap limit (see hol_start). They
+    belong to the session name: every later start uses them, automatic
+    restarts included.
 
     Example: hol_setenv({"VFMDIR": "/home/user/verifereum"})
 
@@ -1977,15 +2073,16 @@ async def hol_setenv(env: dict, session: str = "default") -> str:
 
     Returns: Confirmation message (includes restart output if session was running)
     """
+    env = _session_env(env)
+    if isinstance(env, str):
+        return env
+    merged = {**_session_envs.get(session, {}), **env}
+    _session_envs[session] = merged
     entry = _sessions.get(session)
     if not entry:
-        return f"Session '{session}' not found. Use hol_start first."
-
-    # Merge with existing env
-    if entry.env:
-        entry.env.update(env)
-    else:
-        entry.env = env
+        return (f"Environment set for session '{session}': {env}; it applies "
+                f"when the session next starts.")
+    entry.env = merged
 
     # Auto-restart to apply new env to running process
     if entry.session.is_running:
@@ -2058,10 +2155,6 @@ async def _kill_reaped_process_group(proc):
     except asyncio.CancelledError:
         pass
     _signal_process_group(proc, signal.SIGKILL)
-
-
-# Progress reporting interval for long builds (resets MCP client timeout)
-_PROGRESS_INTERVAL = 10  # seconds
 
 
 def _project_root(workdir: Path) -> Path | None:
@@ -2162,10 +2255,6 @@ _HOLMAKE_OOS_RETRIES_RE = re.compile(
     r"(\d+) job\(s\) were re-run after Poly/ML reported\s+running out of store")
 _SEQUENTIAL_OOS_RETRY = ("[hol4-mcp: Poly/ML ran out of store; re-running this "
                          "sequential build once]")
-
-
-def _ran_out_of_store(output: str) -> bool:
-    return any(marker in output for marker in _OOS_MARKERS)
 
 
 def _build_summary(output: str) -> str:
@@ -2363,86 +2452,33 @@ async def holmake(workdir: str, target: str = None, env: dict = None, log_limit:
                                trace_discovery, detach)
     if isinstance(claim, str):
         return claim
-    if detach:
-        try:
-            return await _start_detached_build(cmd, workdir_path, proc_env, target, trace_note,
-                                               claim, retry_out_of_store=jobs == 1)
-        except BaseException:
-            build_claims.finish(claim)
-            raise
-
-    proc = None
-    stdout_chunks = []
+    if not detach and time.monotonic() - start_time >= timeout:
+        # Discovery used the whole budget: a build spawned now would be
+        # killed a moment into a recipe.
+        build_claims.finish(claim)
+        return f"ERROR: Build timed out after {timeout}s.\n{trace_note}"
+    # A synchronous build is a detached job the call waits for: its job
+    # record and exit status outlive this server, so a later one can adopt it.
     try:
-        # Poll stdout. Progress notifications were removed: a notification
-        # in flight when the response is emitted races on the wire and the
-        # client tears down the stdio transport on the late progressToken.
-        stdout_chunks = [claim.preflight_output.encode("utf-8")]
-        timed_out = False
-        # Holmake's --retry-oos re-runs only parallel jobs; a sequential
-        # build that runs out of store is re-run once here.
-        attempts = 2 if jobs == 1 else 1
+        started = await _start_detached_build(cmd, workdir_path, proc_env, target, trace_note,
+                                              claim, retry_out_of_store=jobs == 1)
+    except BaseException:
+        build_claims.finish(claim)
+        raise
+    if detach:
+        return started
 
-        for attempt in range(1, attempts + 1):
-            attempt_start = len(stdout_chunks)
-            # Discovery shares the budget: a build spawned with none left
-            # would be killed a moment into a recipe.
-            if time.monotonic() - start_time >= timeout:
-                timed_out = True
-                break
-            proc = await asyncio.create_subprocess_exec(
-                *cmd,
-                cwd=workdir_path,
-                env=proc_env,
-                stdout=asyncio.subprocess.PIPE,
-                stderr=asyncio.subprocess.STDOUT,
-                start_new_session=True,
-                pass_fds=tuple(claim.lock_fds),
-            )
-            claim.proc = proc
-
-            while True:
-                elapsed = time.monotonic() - start_time
-                if elapsed >= timeout:
-                    timed_out = True
-                    break
-
-                try:
-                    chunk = await asyncio.wait_for(
-                        proc.stdout.read(4096),
-                        timeout=min(_PROGRESS_INTERVAL, timeout - elapsed)
-                    )
-                    if chunk:
-                        stdout_chunks.append(chunk)
-                    else:
-                        # EOF - wait for process to finish
-                        try:
-                            await asyncio.wait_for(proc.wait(), timeout=5)
-                        except asyncio.TimeoutError:
-                            pass
-                        break
-                except asyncio.TimeoutError:
-                    # Check if process finished
-                    if proc.returncode is not None:
-                        break
-                    continue  # Keep polling
-
-            this_run = b''.join(stdout_chunks[attempt_start:]).decode("utf-8", errors="replace")
-            if (timed_out or attempt == attempts or proc.returncode == 0
-                    or not _ran_out_of_store(this_run)):
-                break
-            await _kill_process_group(proc)
-            stdout_chunks.append(f"\n{_SEQUENTIAL_OOS_RETRY}\n".encode("utf-8"))
-
-        wall = time.monotonic() - start_time
-
-        if timed_out:
+    job = _build_jobs[claim.token]
+    try:
+        try:
+            await asyncio.wait_for(asyncio.shield(job.done.wait()),
+                                   max(0.0, timeout - (time.monotonic() - start_time)))
+        except asyncio.TimeoutError:
             return f"ERROR: Build timed out after {timeout}s.\n{trace_note}"
-
-        output = b''.join(stdout_chunks).decode("utf-8", errors="replace")
-
-        output = _condense_discovery(output)
-        if proc.returncode == 0:
+        wall = time.monotonic() - start_time
+        returncode = job.proc.returncode
+        output = _condense_discovery(_read_log_tail(job.log, 0)[0])
+        if returncode == 0:
             result = f"Build succeeded.{_build_summary(output)}\n\n{output}"
             if env:
                 # Store env in matching session entries for auto-holmake at startup
@@ -2455,7 +2491,7 @@ async def holmake(workdir: str, target: str = None, env: dict = None, log_limit:
 
         # Shared-directory logs may also have changed in a peer build. Label
         # this honestly; the command's own output above is authoritative.
-        result = (build_failure_heading(proc.returncode, output, bool(trace_note))
+        result = (build_failure_heading(returncode, output, bool(trace_note))
                   + _build_summary(output) + f"\n\n{output}")
 
         if logs_dir.exists():
@@ -2484,12 +2520,10 @@ async def holmake(workdir: str, target: str = None, env: dict = None, log_limit:
     except Exception as e:
         return f"ERROR: build in {workdir_path}: {type(e).__name__}: {e}\n{trace_note}".rstrip()
     finally:
-        try:
-            await _kill_process_group(proc)
-        finally:
-            # Whatever interrupted the call — a client abort included — the
-            # reservation is released here, never left to block this server.
-            build_claims.finish(claim, b''.join(stdout_chunks).decode("utf-8", errors="replace"))
+        # Whatever ended the call — a timeout or a client abort included —
+        # the build stops, and its reaper releases the reservation.
+        if not job.done.is_set():
+            await asyncio.shield(_stop_build_job(job))
 
 
 @dataclass
@@ -2510,6 +2544,21 @@ class _BuildJob:
 
 
 _build_jobs: dict[str, _BuildJob] = {}
+
+
+async def _stop_build_job(job: _BuildJob) -> None:
+    """Kill a job's process group (SIGTERM, then SIGKILL) and wait briefly
+    for its reaper to release the reservation."""
+    job.cancel_requested = True
+    _signal_process_group(job.proc, signal.SIGTERM)
+    try:
+        await asyncio.wait_for(job.done.wait(), timeout=2.5)
+    except asyncio.TimeoutError:
+        _signal_process_group(job.proc, signal.SIGKILL)
+        try:
+            await asyncio.wait_for(job.done.wait(), timeout=1.0)
+        except asyncio.TimeoutError:
+            pass
 
 
 async def _start_detached_build(cmd: list[str], workdir_path: Path, proc_env: dict,
@@ -2680,12 +2729,17 @@ async def _adopted_build_status(job: str, cancel: bool, tail: int, wait: int = 0
 
 @mcp.tool()
 async def hol_build_status(job: str, cancel: bool = False, tail: int = 2000,
-                           wait: int = 0) -> str:
+                           wait: int = 0, retire: bool = False) -> str:
     """Status of a detached holmake job (holmake(detach=True)).
 
     Args:
         job: Job id from the detached holmake call
         cancel: Kill the build's process group (default False)
+        retire: Move the coordination records of a LOST build (one a build
+                refusal names as lost) aside, so its files are no longer
+                suspect and are trusted as they are. Refused while the build
+                may still be running. Ask the user first: only they know
+                whether the files were rebuilt since.
         tail: Bytes of log to include (default 2000, 0 to omit the log)
         wait: Seconds to block for the job to end before reporting (0–100;
               default 0). One call then covers up to 100 s of a long build
@@ -2703,6 +2757,18 @@ async def hol_build_status(job: str, cancel: bool = False, tail: int = 2000,
              outputs), cancelled or lost; the token of one of this server's
              synchronous builds is reported as active.
     """
+    if retire:
+        running = _build_jobs.get(job)
+        if job in build_claims.active or (running is not None and not running.done.is_set()):
+            return f"ERROR: build={job} is running in this server: nothing was retired."
+        try:
+            count, where = coordination.retire_build(job)
+        except (OSError, ValueError) as exc:
+            return f"ERROR: {exc}"
+        if not count:
+            return f"No coordination records of build={job} remain: nothing to retire."
+        return (f"retired build={job}: moved {count} coordination records to {where}. "
+                f"Its files are no longer suspect; builds trust them as they are.")
     wait = max(0, min(int(wait or 0), 100))
     entry = _build_jobs.get(job)
     if entry is None:
@@ -2714,16 +2780,7 @@ async def hol_build_status(job: str, cancel: bool = False, tail: int = 2000,
         except asyncio.TimeoutError:
             pass
     if cancel and not entry.done.is_set() and proc.returncode is None:
-        entry.cancel_requested = True
-        _signal_process_group(proc, signal.SIGTERM)
-        try:
-            await asyncio.wait_for(entry.done.wait(), timeout=2.5)
-        except asyncio.TimeoutError:
-            _signal_process_group(proc, signal.SIGKILL)
-            try:
-                await asyncio.wait_for(entry.done.wait(), timeout=1.0)
-            except asyncio.TimeoutError:
-                pass
+        await _stop_build_job(entry)
     if entry.done.is_set():
         state = "cancelled" if entry.cancel_requested else "done"
     elif entry.cancel_requested:
@@ -2897,9 +2954,11 @@ async def _init_file_cursor(
                 await hol_stop(session)
                 s = None
 
+    ended = None
     if not s or not s.is_running:
-        # Preserve per-session HOL env (e.g., VFMDIR) across auto-restarts.
-        start_env = entry.env if entry else None
+        # The session's env (hol_start/hol_setenv) applies to every start.
+        start_env = _session_envs.get(session) or (entry.env if entry else None)
+        ended = _session_ended.get(session) if entry is None else None
         # Replacing an existing session is not a second one (RULE J).
         start_result = await hol_start(workdir=str(target_workdir), name=session,
                                        env=start_env, force=entry is not None)
@@ -2915,7 +2974,7 @@ async def _init_file_cursor(
     
     cursor = FileProofCursor(file_path, s, tactic_timeout=TACTIC_TIMEOUT)
     try:
-        result = await cursor.init()
+        result = await cursor.init(reuse=True)
     except BaseException:
         # The process may now hold this cursor's deps and base saves in its
         # SaveState hierarchy, which no later cursor can save over: keep
@@ -2927,7 +2986,15 @@ async def _init_file_cursor(
 
     init_time = time.perf_counter() - t0
     cursor._startup_seconds = time.perf_counter() - t_begin
-    cursor._startup_cause = "cold init: HOL start and dependency load"
+    cursor._startup_cause = ("warm start: HOL start and a previous session's saved state"
+                             if cursor._reused_state else
+                             "cold init: HOL start and dependency load")
+    if ended:
+        notices.append(
+            f"[Session started: the previous '{session}' session {ended}; "
+            f"HOL heap {s.maxheap_mb} MB; "
+            + ("the prefix resumes from the reused state]" if cursor._reused_state
+               else "the prefix reloads from line 1]"))
     cursor._session_notices.extend(notices)
 
     _sessions[session].cursor = cursor
@@ -3166,6 +3233,8 @@ async def hol_state_at(
     if is_structural:
         lines.append(f"ERROR: {result.error}")
         lines.extend(_quote_diagnosis_if_parse_error(cursor.file, result.error))
+        if "TIMEOUT" in (result.error or ""):
+            lines.extend(_heap_pressure_lines(cursor.session))
         return "\n".join(lines)
 
     # Show theorem name (useful for hol_check_proof after edits). A state that
@@ -3442,6 +3511,9 @@ async def hol_state_at(
                                      cause=result.timings.get('startup_cause'),
                                      revision=(hashlib.sha256(thm.proof_body.encode()).hexdigest()
                                                if thm and thm.proof_body is not None else None)))
+    if ("TIMEOUT" in (result.error or "")
+            or (result.timings or {}).get('total', 0) >= _SLOW_NAV_SECS):
+        lines.extend(_heap_pressure_lines(cursor.session))
 
     _schedule_gc(session)
     return _truncate_output("\n".join(lines), max_output, footer=error_footer)
@@ -3492,6 +3564,7 @@ async def hol_check_proof(
     earlier in the session. A timeout adds "TIMEOUT: step k spans lines A-B" naming
     the span to split with `>- suspend`.
     """
+    t_call = time.perf_counter()
     cursor = await _get_cursor(session)
 
     # Auto-init if file provided
@@ -3513,6 +3586,11 @@ async def hol_check_proof(
         cursor._reparse_if_changed()
     except FileNotFoundError:
         return f"ERROR: File not found: {cursor.file}"
+
+    header_problem = next((p for p in resume_header_problems(cursor._content)
+                           if p.name == theorem), None)
+    if header_problem is not None:
+        return f"ERROR: {header_problem.message}"
 
     if fresh:
         # Validate the request before discarding a useful session. Merely
@@ -3605,12 +3683,20 @@ async def hol_check_proof(
     total_ms = sum(e.real_ms for e in trace_data)
     total_steps = len(trace_data)
 
+    # The setup this call paid for (a cold init, a fresh restart) is its own:
+    # consumed here, it is not charged to the next navigation.
+    elapsed = time.perf_counter() - t_call
+    cause, cursor._startup_cause = cursor._startup_cause, None
+    cursor._startup_seconds = 0.0
     # Emitted before the verdict so it survives every early return below.
     lines.extend(_slow_nav_lines(
-        session, cursor.file, theorem, total_ms / 1000.0,
+        session, cursor.file, theorem, max(elapsed, total_ms / 1000.0),
+        max(0.0, elapsed - total_ms / 1000.0), cause=cause,
         revision=(hashlib.sha256(thm.proof_body.encode()).hexdigest()
                   if thm.proof_body is not None else None),
     ))
+    if total_ms / 1000.0 >= _SLOW_NAV_SECS or "TIMEOUT" in (final.error or "").upper():
+        lines.extend(_heap_pressure_lines(cursor.session))
 
     if final.error:
         lines.append(f"Status: FAILED at step {failed_idx + 1}/{total_steps} ({total_ms}ms)")

@@ -767,6 +767,66 @@ def _left_by_observed_failure(path, record):
             and _stamp(path) == _record_stamp(record))
 
 
+def _unit_written(path):
+    """Whether some process holds the exclusive (writer's) lock of the unit
+    `path` belongs to."""
+    try:
+        fd = os.open(_unit_lock(artifact_unit(path)), os.O_RDWR | os.O_NOFOLLOW)
+    except FileNotFoundError:
+        return False
+    try:
+        fcntl.flock(fd, fcntl.LOCK_SH | fcntl.LOCK_NB)
+        return False
+    except BlockingIOError:
+        return True
+    finally:
+        os.close(fd)
+
+
+def lost_build(token, paths):
+    """Why the build `token` is lost — no exit status, no live process, no
+    writer's lock on `paths` — or None while anything says it may still be
+    running or it ended observably."""
+    record = read_job(token)
+    if record is not None:
+        if job_exit_status(record) is not None or process_alive(record):
+            return None
+        evidence = "its job record has no exit status and its process is gone"
+    else:
+        evidence = ("it left no job record, so this is inferred from its lock "
+                    "alone (a build of an older server, or a synchronous one)")
+    if any(_unit_written(path) for path in paths):
+        return None
+    return evidence
+
+
+def retire_build(token):
+    """Move every coordination record of the lost build `token` aside, under
+    storage_root()/retired/. Returns (count, directory); ValueError while the
+    build may still be running."""
+    if not _TOKEN_RE.match(token or ""):
+        raise ValueError(f"not a build token: {token!r}")
+    found = []
+    for path in _storage("state").glob("*/*.json"):
+        try:
+            data = json.loads(path.read_text())
+        except (OSError, ValueError):
+            continue
+        if isinstance(data, dict) and data.get("token") == token:
+            found.append((path, Path(data["path"])))
+    if not found:
+        return 0, None
+    if lost_build(token, [artifact for _, artifact in found]) is None:
+        raise ValueError(f"build={token} may still be running, or it ended with a "
+                         f"recorded exit status: nothing was retired")
+    destination = storage_root() / "retired" / f"{token}-{time.strftime('%Y%m%d-%H%M%S')}"
+    for path, _ in found:
+        target = destination / path.parent.name / path.name
+        target.parent.mkdir(parents=True, mode=0o700, exist_ok=True)
+        os.replace(path, target)
+    return len(found), destination
+
+
 def _suspect_refusal(suspects):
     """The refusal for reads that a build left possibly unfinished. Holmake
     takes an existing file for up to date, so no build is accepted while one
@@ -778,6 +838,15 @@ def _suspect_refusal(suspects):
     lines.append("No build was started. Holmake treats an existing file as up to date, "
                  "so no build is accepted while these exist: inspect/remove them, then "
                  "retry this build, which rebuilds them.")
+    for token in sorted({record["token"] for _, record in suspects
+                         if "returncode" not in record}):
+        why = lost_build(token, [p for p, r in suspects if r["token"] == token])
+        if why is not None:
+            lines.append(
+                f"build={token} is lost: {why}. If its files were rebuilt since (a "
+                f"terminal Holmake, say), ask the user, then retire its records with "
+                f'hol_build_status(job="{token}", retire=True); the files are then '
+                f"trusted as they are.")
     holdir = HOLDIR.resolve()
     for path, record in suspects[:8]:
         if not path.resolve().is_relative_to(holdir):

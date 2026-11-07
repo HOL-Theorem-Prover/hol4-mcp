@@ -5,7 +5,7 @@ description: HOL4 proof-work ruleset (RULES A–K, audit gates, iteration loop, 
 
 # HOL4 proving rules
 
-You are an expert HOL4 theorem prover. Justify decisions, understand WHY a tactic applies, distinguish wrong proof structure from a missing step. Per the global meta-rule, these rules apply on the FIRST attempt — don't "try the shortcut and fix if it breaks". Hooks enforce several rules. A HARD block (H1, H14, H17, H18, H20, H23, H27) is not an error to retry. A SOFT block (H28–H33) fires once: fix what it names, or — if you still judge the call right — repeat it unchanged; it passes with an override note logged for the user. Never ask the user for a consent phrase.
+You are an expert HOL4 theorem prover. Justify decisions, understand WHY a tactic applies, distinguish wrong proof structure from a missing step. Per the global meta-rule, these rules apply on the FIRST attempt — don't "try the shortcut and fix if it breaks". Hooks enforce several rules. A HARD block (H1, H14, H17's suspend forms, H18, H20, H23, H27) is not an error to retry. A SOFT block (H28–H33, H17's Resume headers) fires once: fix what it names, or — if you still judge the call right — repeat it unchanged; it passes with an override note logged for the user. Never ask the user for a consent phrase.
 
 **Trigger moments** — "I think I'm done", "ready for holmake", a tactic that won't close, the SECOND failed inline tactic attempt on the same goal, an MCP output that looks wrong, about to write a proof plan, ANY symptom in the index below → STOP and consult the named section before acting.
 
@@ -35,7 +35,7 @@ You are an expert HOL4 theorem prover. Justify decisions, understand WHY a tacti
 | a probe took >2 min and it is NOT a cold start (server prints `SLOW NAVIGATION #n`) | this skill, *HOL4 — suspend/Resume/Finalise* — shrink the replayed unit BEFORE the next edit |
 | a green check that may rest on a cheated dependency | [[feedback_replay_discipline]] §auto-cheat |
 | navigation errors with `Missing dependency: <thy>` / `Failed to load dependency`, or you just edited a Script.sml other theories depend on | [[feedback_replay_discipline]] §Upstream Script.sml edits stale ALL downstream results |
-| "No such label" / a lost suspension / a duplicate-label dispatcher / a Resume block reported as "not within any theorem" | first check the Resume header's label is UNQUOTED (§Syntax and structural forms) and SINGLE-level — a nested `thm[a][b]` header is not parsed at all — then [[feedback_suspend_resume]] |
+| "No such label" / a lost suspension / a duplicate-label dispatcher / a Resume block reported as "not within any theorem" | first check the Resume header's label is UNQUOTED (§Syntax and structural forms) and SINGLE-level — `thm[b]`, never `thm[a][b]` or `thm[a,b]` — then [[feedback_suspend_resume]] |
 | a term parsed differently than you read it — a "trivially true" `by simp[]` that fails, a `qmatch` that raises | §Syntax and structural forms |
 | a `hol_check_proof` trace or status you are not sure how to read | §`hol_check_proof` semantics |
 

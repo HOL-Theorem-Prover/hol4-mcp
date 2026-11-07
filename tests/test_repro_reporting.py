@@ -108,6 +108,7 @@ class _StubCursor:
         self._thm = thm
         self._step_plan = []
         self._failed_proofs = {}
+        self._content = ""
 
     def _reparse_if_changed(self):
         return False

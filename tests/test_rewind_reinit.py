@@ -43,6 +43,7 @@ async def test_unrestorable_rewind_restarts_hol(cursor: FileProofCursor):
     cursor._deps_checkpoint_path.unlink()
     for ck in cursor._checkpoints.values():   # no in-memory point either
         ck.point_id = None
+    cursor._start_points.clear()
 
     bound = await cursor.session.send('DB.fetch "-" "zero_add";', timeout=10)
     assert "HOL_ERR" not in bound and "Exception" not in bound, bound

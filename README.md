@@ -19,12 +19,14 @@ An [MCP](https://modelcontextprotocol.io/) server that gives LLM agents interact
 
 ### Interactive memory limit
 
-HOL sessions default to an 8192 MB Poly/ML maximum heap. For heavier theories,
-set `HOL4_MCP_MAXHEAP_MB=12288` in the server environment or pass
-`env={"HOL4_MCP_MAXHEAP_MB": "12288"}` to `hol_start`. Values must be integers
-of at least 256 MB. Startup reports the effective limit; changing the setting
-does not resize an already running session. Session restarts preserve its
-explicit environment. This option is independent of `holmake(heap_size=...)`.
+HOL sessions default to a Poly/ML maximum heap of half the machine's RAM, at
+least 8192 MB. To choose another, set `HOL4_MCP_MAXHEAP_MB=12288` in the server
+environment or pass `env={"HOL4_MCP_MAXHEAP_MB": "12288"}` to `hol_start` or
+`hol_setenv`. Values must be integers of at least 256 MB. Startup reports the
+effective limit; changing the setting does not resize an already running
+session (`hol_setenv` restarts it to apply). The environment belongs to the
+session name: every later start of it uses it, automatic restarts included.
+This option is independent of `holmake(heap_size=...)`.
 
 ### Time budgets
 

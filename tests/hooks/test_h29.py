@@ -56,3 +56,38 @@ def test_consent_allows(run_hook):
     seed(run_hook.home, "/w/thy/fooScript.sml", last="/w/thy/fooScript.sml")
     code, _, _ = stop(run_hook, user_msg="restart ok")
     assert code == 0
+
+
+def stale_block(home, target, stale_dirs, age=60):
+    d = home / ".claude" / "hook-state" / SESSION
+    d.mkdir(parents=True, exist_ok=True)
+    (d / "last_stale_block").write_text(json.dumps(
+        {"ts": time.time() - age, "target": target, "stale_dirs": stale_dirs}))
+
+
+def test_repeat_stop_right_after_a_stale_ancestor_block_passes(run_hook):
+    seed(run_hook.home, "/w/thy/downScript.sml", last="/w/thy/fooScript.sml")
+    stale_block(run_hook.home, "/w/thy/downScript.sml", ["/w/thy"])
+    code, err, out = stop(run_hook)
+    assert code == 0, err
+    note = json.loads(out)["hookSpecificOutput"]["additionalContext"]
+    assert "H30" in note and "build" in note, note
+
+
+@pytest.mark.parametrize("block", [
+    None,
+    {"target": "/w/thy/downScript.sml", "stale_dirs": ["/w/thy"], "age": 3600},
+    {"target": "/w/other/xScript.sml", "stale_dirs": ["/w/other"]},
+])
+def test_repeat_stop_without_a_matching_recent_block_is_blocked(run_hook, block):
+    seed(run_hook.home, "/w/thy/downScript.sml", last="/w/thy/fooScript.sml")
+    if block is not None:
+        stale_block(run_hook.home, **block)
+    code, err, _ = stop(run_hook)
+    assert code == 2, err
+
+
+def test_the_block_message_names_the_stop_before_a_rebuild(run_hook):
+    seed(run_hook.home, "/w/thy/fooScript.sml", last="/w/thy/fooScript.sml")
+    code, err, _ = stop(run_hook)
+    assert code == 2 and "stale ancestor" in err, err
