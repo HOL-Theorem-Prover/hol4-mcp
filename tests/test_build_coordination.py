@@ -1,6 +1,7 @@
 """Exercise shared build behavior with the installed Holmake, not a mock lock."""
 import asyncio
 import json
+import os
 from pathlib import Path
 import re
 import shlex
@@ -107,6 +108,62 @@ def test_signalled_sequential_build_in_a_script_certifies_in_process_compiles():
     # A monitored build runs nodes in parallel: the rule does not apply.
     monitored = "Starting work on aaTheory\n" + SEQUENTIAL_CANCELLED_IN_SCRIPT
     assert not compiled & completed_outputs(tags, compiled, monitored, -15)
+
+
+def _two_theory_graph(workdir):
+    """`Holmake --json --dirs .` for aScript.sml and bScript.sml, b an
+    ancestor-child of a, with the HOL nodes reduced to one."""
+    def node(i, name, command, deps):
+        return {"node_id": i, "target": str(workdir / name), "command": command,
+                "needs_rebuild": bool(command), "dependencies": deps}
+    build_a, build_b = f"BIC_Build {workdir}/aScript", f"BIC_Build {workdir}/bScript"
+    return json.dumps([
+        node(0, "aScript.sml", "", []), node(1, "hol.state", "", []),
+        node(2, "aTheory.sml", build_a, [1, 0]), node(3, "aTheory.dat", build_a, [1, 0]),
+        node(4, "aTheory.sig", build_a, [1, 0]),
+        node(5, "aTheory.ui", "BIC_Compile", [1, 4]),
+        node(6, "aTheory.uo", "BIC_Compile", [5, 3, 1, 2]),
+        node(7, "bScript.sml", "", []),
+        node(8, "bTheory.sml", build_b, [6, 1, 7]), node(9, "bTheory.dat", build_b, [6, 1, 7]),
+        node(10, "bTheory.sig", build_b, [6, 1, 7]),
+        node(11, "bTheory.ui", "BIC_Compile", [1, 10]),
+        node(12, "bTheory.uo", "BIC_Compile", [11, 9, 1, 8]),
+    ])
+
+
+def test_signalled_monitored_build_certifies_compiles_a_started_job_needed(tmp_path):
+    """Holmake starts a job only once its dependencies are built, so a killed
+    parallel build has finished every in-process compile a started job needs."""
+    claim = coordination.claim_from_graph(_two_theory_graph(tmp_path), tmp_path, "bTheory")
+    a_compiled = {path for name in ("aTheory.ui", "aTheory.uo")
+                  for path in coordination._artifact_paths(tmp_path / name)}
+    b_compiled = claim.in_process - a_compiled
+    assert a_compiled < claim.in_process and len(b_compiled) == 4
+    assert {path: claim.witnesses[path] for path in a_compiled} == {
+        path: {"bTheory"} for path in a_compiled}
+    assert not b_compiled & claim.witnesses.keys()
+
+    log = ("Starting work on aTheory\naTheory   (3s)   [1/2]     OK\n"
+           "Starting work on bTheory\n")
+    for path in claim.outputs:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text("written by the build")
+    claim.before = {path: None for path in claim.outputs}
+    record = coordination.job_record(claim, pid=os.getpid(), target="bTheory",
+                                     log=tmp_path / "log", exit_file=tmp_path / "exit",
+                                     trace_note="", started=time.time())
+    record = json.loads(json.dumps(record))
+    job_file = coordination.jobs_directory() / f"{record['token']}.json"
+    try:
+        coordination.finalize_job(record, -15, log)
+        assert all(coordination._suspect(path, adopt=False) is None
+                   for path in a_compiled | claim.tags["aTheory"])
+        assert all(coordination._suspect(path, adopt=False) is not None
+                   for path in b_compiled | claim.tags["bTheory"])
+    finally:
+        job_file.unlink(missing_ok=True)
+        for path in claim.outputs:
+            coordination._unlink_state(path, "failed")
 
 
 @pytest.mark.parametrize("returncode", [None, -15, 0])

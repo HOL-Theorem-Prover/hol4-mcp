@@ -74,9 +74,12 @@ class BuildClaim:
     clean: bool = False
     # Outputs by the name Holmake's monitor prints for the job writing them,
     # the outputs Holmake compiles in its own process (no job line), and each
-    # job's first command line as a sequential build echoes it.
+    # job's first command line as a sequential build echoes it. `witnesses`
+    # maps each in-process output to the tags of its nearest dependent jobs:
+    # Holmake starts a node only once its dependencies are built.
     tags: dict = field(default_factory=dict)
     in_process: set = field(default_factory=set)
+    witnesses: dict = field(default_factory=dict)
     commands: dict = field(default_factory=dict)
     read_units: set = field(default_factory=set)
     write_units: set = field(default_factory=set)
@@ -140,6 +143,8 @@ def claim_from_graph(output: str, workdir: Path, target: str | None) -> BuildCla
     claim.clean = clean
     claim.preflight_output = output[:start]
     tag_dirs = {}
+    node_tags = {}
+    compiled = []
     for key in selected:
         node = graph[key]
         if not (node["command"] and node["needs_rebuild"]):
@@ -149,7 +154,9 @@ def claim_from_graph(output: str, workdir: Path, target: str | None) -> BuildCla
         paths = set(_artifact_paths(nominal[key]))
         if tag is None:
             claim.in_process |= paths
+            compiled.append(key)
         else:
+            node_tags[key] = tag
             claim.tags.setdefault(tag, set()).update(paths)
             tag_dirs.setdefault(tag, set()).add(paths_dir(nominal[key]))
             if not command.startswith("BIC_"):
@@ -159,6 +166,25 @@ def claim_from_graph(output: str, workdir: Path, target: str | None) -> BuildCla
         if len(dirs) > 1:
             del claim.tags[tag]   # the printed name alone cannot tell them apart
             claim.commands.pop(tag, None)
+    dependents = {}
+    for key in selected:
+        for dependency in graph[key]["dependencies"]:
+            dependents.setdefault(dependency, set()).add(key)
+    for key in compiled:
+        found, seen, pending = set(), {key}, [key]
+        while pending:
+            for dependent in dependents.get(pending.pop(), ()):
+                if dependent in seen:
+                    continue
+                seen.add(dependent)
+                tag = node_tags.get(dependent)
+                if tag in claim.tags:
+                    found.add(tag)
+                else:
+                    pending.append(dependent)
+        if found:
+            for path in _artifact_paths(nominal[key]):
+                claim.witnesses.setdefault(path, set()).update(found)
     return claim
 
 
@@ -264,7 +290,8 @@ def _sequential_script_was_running(output):
     return last == "script"
 
 
-def completed_outputs(tags, in_process, output, returncode, commands=None):
+def completed_outputs(tags, in_process, output, returncode, commands=None,
+                      witnesses=None):
     """Outputs a build that did not succeed as a whole nevertheless finished.
 
     A monitored job's outputs are complete when its last line is a success
@@ -275,7 +302,9 @@ def completed_outputs(tags, in_process, output, returncode, commands=None):
     writes them one at a time and nothing interrupted it. They are also
     complete when a sequential build stopped while a theory script ran. A
     signal — cancellation, a timeout kill, a vanished controller — otherwise
-    certifies nothing beyond the verdict lines.
+    certifies an in-process compile only once the log shows one of its
+    ``witnesses`` (a job depending on it) started: Holmake starts a node only
+    after its dependencies are built.
     """
     state = job_verdicts(output, commands)
     done = set()
@@ -285,6 +314,9 @@ def completed_outputs(tags, in_process, output, returncode, commands=None):
     if ((returncode is not None and 0 < returncode < 128)
             or _sequential_script_was_running(output)):
         done.update(in_process)
+    elif witnesses:
+        done.update(path for path in in_process
+                    if not witnesses.get(path, set()).isdisjoint(state))
     return done
 
 
@@ -458,6 +490,7 @@ def job_record(claim, *, pid, target, log, exit_file, trace_note, started):
         "before": {str(p): s for p, s in claim.before.items()},
         "tags": {t: sorted(str(p) for p in ps) for t, ps in claim.tags.items()},
         "in_process": sorted(str(p) for p in claim.in_process),
+        "witnesses": {str(p): sorted(ts) for p, ts in claim.witnesses.items()},
         "commands": dict(claim.commands),
     }
 
@@ -523,8 +556,9 @@ def finalize_job(record, returncode, output):
               for p, s in record["before"].items()}
     tags = {t: {Path(p) for p in ps} for t, ps in record["tags"].items()}
     in_process = {Path(p) for p in record["in_process"]}
+    witnesses = {Path(p): set(ts) for p, ts in record.get("witnesses", {}).items()}
     completed = completed_outputs(tags, in_process, output, returncode,
-                                  record.get("commands"))
+                                  record.get("commands"), witnesses)
     finalize(outputs, before, returncode, owner, completed)
     record["finalized"] = {"returncode": returncode, "at": time.time()}
     write_job(record)
@@ -665,7 +699,7 @@ class BuildClaims:
         try:
             returncode = claim.proc.returncode if claim.proc is not None else None
             completed = completed_outputs(claim.tags, claim.in_process, output, returncode,
-                                          claim.commands)
+                                          claim.commands, claim.witnesses)
             finalize(claim.outputs, claim.before, returncode, claim, completed)
         except (OSError, ValueError) as exc:
             # Keep any unfinalized intent conservative, and always release
