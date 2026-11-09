@@ -39,9 +39,9 @@ class TestArmDecomposition:
         result = await call_step_plan(hol_session, "conj_tac >- simp[]")
         cmds = [s.cmd for s in result]
         assert len(cmds) == 4
-        assert "ef(goalFrag.expand(conj_tac));" in cmds
+        assert "ef(goalFrag.expand(conj_tac)(Context.snapshot()));" in cmds
         assert "ef(goalFrag.open_then1);" in cmds
-        assert "ef(goalFrag.expand(simp[]));" in cmds
+        assert "ef(goalFrag.expand(simp[])(Context.snapshot()));" in cmds
         assert "ef(goalFrag.close_paren);" in cmds
 
     async def test_two_arms(self, hol_session):
@@ -81,10 +81,10 @@ class TestArmDecomposition:
         result = await call_step_plan(hol_session, "conj_tac >- (simp[] >> fs[])")
         cmds = [s.cmd for s in result]
         # expand(conj_tac), open_then1, expand(simp[]), expand(fs[]), close_paren
-        assert "ef(goalFrag.expand(conj_tac));" in cmds
+        assert "ef(goalFrag.expand(conj_tac)(Context.snapshot()));" in cmds
         assert "ef(goalFrag.open_then1);" in cmds
         # Inside arm: simp[] and fs[] as separate expands
-        assert "ef(goalFrag.expand(simp[]));" in cmds or "ef(goalFrag.expand((simp[] >> fs[])));" in cmds
+        assert "ef(goalFrag.expand(simp[])(Context.snapshot()));" in cmds or "ef(goalFrag.expand((simp[] >> fs[]))(Context.snapshot()));" in cmds
         assert "ef(goalFrag.close_paren);" in cmds
 
     async def test_backup_inside_arm(self, hol_session):

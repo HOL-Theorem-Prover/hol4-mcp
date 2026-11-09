@@ -1,4 +1,4 @@
-"""Tests for proof verification (hol_file_status, verify_all_proofs)."""
+"""Tests for proof verification (cursor status, verify_all_proofs)."""
 
 import pytest
 from pathlib import Path
@@ -283,10 +283,7 @@ QED
 
 @pytest.mark.asyncio
 async def test_fatal_pre_theorem_load_error(hol_session_tmpdir: HOLSession, tmp_path: Path):
-    """Regression: fatal pre-theorem load errors must be reported (not silently advance loaded_to_line).
-
-    With lazy loading, init() succeeds but the error surfaces when entering a theorem.
-    """
+    """A required missing theory fails init, before any file prefix executes."""
     script = tmp_path / "testScript.sml"
     script.write_text("""\
 open definitelyMissingTheory;
@@ -305,12 +302,11 @@ QED
     cursor = FileProofCursor(script, hol_session_tmpdir)
     result = await cursor.init()
 
-    # init() succeeds with lazy loading — error surfaces on enter_theorem
-    assert "error" not in result
-
-    result = await cursor.enter_theorem("uses_pre_def")
     assert "error" in result
-    assert "Missing dependency:" in result["error"]
+    assert "Missing compiled dependency definitelyMissingTheory" in result["error"]
+    assert "definitelyMissingTheory.uo" in result["error"]
+    assert cursor._loaded_to_line == 0
+    assert cursor._needs_session_reinit
 
 
 @pytest.mark.asyncio
@@ -360,7 +356,7 @@ Exception- Fail "Cannot find file $(VFMDIR)/spec/prop/vfmComputeTheory.ui" raise
     assert "$(VFMDIR)" in msg
     assert "holmake(workdir=..., env={\"VFMDIR\": \"/abs/path\"})" in msg
     assert "hol_setenv(env={\"VFMDIR\": \"/abs/path\"})" in msg
-    assert "hol_restart(session=...)" in msg
+    assert "hol_restart" not in msg          # hol_setenv restarts the session itself
 
 
 def test_format_context_error_structure_fallback_mentions_env_vars():
@@ -383,6 +379,21 @@ def test_format_context_error_value_constructor_forward_ref_hint():
     assert "line 11" in msg
     assert "forward reference" in msg
     assert "hol_check_proof" in msg
+
+
+def test_format_context_error_generic_fallback_preserves_trailing_error():
+    output = (
+        "val earlier_definition = |- T\n"
+        + "successful prefix output\n" * 200
+        + "poly: /tmp/testScript.sml:42: error: Type error in function application\n"
+    )
+
+    msg = _format_context_error(output)
+
+    assert "earlier_definition" in msg
+    assert "characters omitted; showing final diagnostics" in msg
+    assert "testScript.sml:42: error: Type error" in msg
+    assert len(msg) <= 2100
 
 
 # =============================================================================
@@ -708,7 +719,9 @@ val _ = export_theory();
     enter_result = await cursor.enter_theorem("ok2")
     assert "error" not in enter_result
 
-    assert cursor._failed_proofs == {"fail1", "fail2"}
+    assert set(cursor._failed_proofs) == {"fail1", "fail2"}
+    # Reasons are recorded for each auto-cheated proof
+    assert all(cursor._failed_proofs[n] for n in ("fail1", "fail2"))
 
     # ok2 references fail1 (cheated to TRUTH) — should still load
     status = cursor.status
@@ -1111,3 +1124,282 @@ val _ = export_theory();
     result2 = await cursor.state_at(thm.proof_start_line, 1)
     assert not result2.error or "no goals" in result2.error.lower(), \
         f"state_at after edit failed: {result2.error}"
+
+
+@pytest.mark.asyncio
+async def test_resume_goal_matches_marker_canonical(hol_session_tmpdir: HOLSession, tmp_path: Path):
+    """Regression: cursor must set up the Resume goal directly from the suspension
+    store (markerLib.set_suspended_goal), not via a term_to_string/Parse.Term
+    round-trip. The round-trip can rename bound variables under a clashing
+    parse context, so tactics in the Resume body see a goal with different
+    bound names than what Holmake actually runs them against.
+
+    Strong invariant: after cursor.state_at enters a Resume block, the goal
+    on the proof manager must be byte-identical (under term_to_string) to
+    the goal markerLib.set_suspended_goal would produce. Alpha-equivalence
+    isn't enough — bound names must match.
+    """
+    script = tmp_path / "testResumeCanonicalScript.sml"
+    script.write_text("""\
+open HolKernel Parse boolLib bossLib markerLib;
+val _ = new_theory "testResumeCanonical";
+
+Theorem foo:
+  (!n. n + 0 = n) /\\ (!n. 0 + n = n)
+Proof
+  conj_tac >- suspend "case1"
+  >> simp[]
+QED
+
+Resume foo[case1]:
+  simp[]
+QED
+
+Finalise foo
+
+val _ = export_theory();
+""")
+
+    cursor = FileProofCursor(script, hol_session_tmpdir)
+    await cursor.init()
+
+    # Drive the cursor to enter the Resume block (calls _setup_proof_goal).
+    thm = cursor._get_theorem("foo[case1]")
+    assert thm is not None
+    result = await cursor.state_at(thm.proof_start_line, 1)
+    assert not result.error or "no goals" in result.error.lower(), \
+        f"state_at failed: {result.error}"
+
+    # Capture the goal currently on the proof manager (set up by _setup_proof_goal).
+    cursor_goal_out = await hol_session_tmpdir.send(
+        'print ("CURSOR_GOAL=" ^ term_to_string (#2 (proofManagerLib.top_goal())) ^ "==END\\n");',
+        timeout=10,
+    )
+    cursor_goal = _extract_marker(cursor_goal_out, "CURSOR_GOAL=", "==END")
+
+    # Now compute the canonical goal via markerLib.set_suspended_goal directly.
+    await hol_session_tmpdir.send('proofManagerLib.drop_all();', timeout=5)
+    marker_goal_out = await hol_session_tmpdir.send(
+        'markerLib.set_suspended_goal {suspension_name = "foo", label_name = "case1"};'
+        'print ("MARKER_GOAL=" ^ term_to_string (#2 (proofManagerLib.top_goal())) ^ "==END\\n");',
+        timeout=10,
+    )
+    marker_goal = _extract_marker(marker_goal_out, "MARKER_GOAL=", "==END")
+
+    assert cursor_goal == marker_goal, (
+        "Resume goal-setup path is not canonical: cursor view diverges from "
+        "markerLib.set_suspended_goal view. This indicates a term_to_string/"
+        f"Parse.Term round-trip is renaming bound vars.\n"
+        f"  cursor: {cursor_goal!r}\n"
+        f"  marker: {marker_goal!r}"
+    )
+
+
+def _extract_marker(output: str, start: str, end: str) -> str:
+    """Pull out the substring between `start` and `end` markers from raw HOL output."""
+    i = output.find(start)
+    assert i >= 0, f"Marker {start!r} not found in output:\n{output[-500:]}"
+    i += len(start)
+    j = output.find(end, i)
+    assert j >= 0, f"End marker {end!r} not found after {start!r}:\n{output[-500:]}"
+    return output[i:j].strip()
+
+
+@pytest.mark.asyncio
+async def test_resume_state_at_with_free_var_constant_clash(
+    hol_session_tmpdir: HOLSession, tmp_path: Path
+):
+    """Regression: cursor must enter a Resume body whose stored goal has a free
+    variable later shadowed by a constant of *different type*.
+
+    Concrete bug class: the OLD code path serialised the suspended goal via
+    term_to_string (with show_types=true), then re-parsed via Parse.Term.
+    When the parse context contains a constant whose name matches a free
+    variable in the goal — but with a different type — the re-parse crashes
+    with a Type constraint failure. The fix passes the term directly to
+    proofManagerLib.set_goalfrag, bypassing the parse round-trip entirely.
+
+    Demonstrates the bug fix concretely: under the OLD path, this test would
+    fail at state_at with a "Type constraint failure" error. Under the new
+    path it succeeds.
+    """
+    script = tmp_path / "testRenameClashScript.sml"
+    script.write_text("""\
+open HolKernel Parse boolLib bossLib markerLib;
+val _ = new_theory "testRenameClash";
+
+Theorem bar:
+  !w:num. w + 1 > 0
+Proof
+  gen_tac >>
+  Q.SPEC_THEN `v + w` MP_TAC arithmeticTheory.LESS_EQ_REFL >>
+  strip_tac >>
+  suspend "case_v"
+QED
+
+Definition v_def:
+  v = (T:bool)
+End
+
+Resume bar[case_v]:
+  decide_tac
+QED
+
+Finalise bar
+
+val _ = export_theory();
+""")
+
+    cursor = FileProofCursor(script, hol_session_tmpdir)
+    init = await cursor.init()
+    assert "error" not in init, f"init failed: {init.get('error')}"
+
+    thm = cursor._get_theorem("bar[case_v]")
+    assert thm is not None, "Resume block bar[case_v] should be detected"
+
+    # Navigate into the Resume block. _setup_proof_goal must use the direct
+    # suspension-store path; the term-to-string + Parse.Term round-trip would
+    # crash here because v is now a :bool constant in the parse context but
+    # the stored term has v as a :num Var.
+    result = await cursor.state_at(thm.proof_start_line, 1)
+    assert result.error is None or "no goals" in (result.error or "").lower(), (
+        f"state_at into Resume body failed; this indicates a regression to "
+        f"the string-roundtrip goal-setup path: {result.error}"
+    )
+
+    # The captured goal should match what markerLib.set_suspended_goal produces.
+    cursor_goal_out = await hol_session_tmpdir.send(
+        'print ("CURSOR_GOAL=" ^ term_to_string (#2 (proofManagerLib.top_goal())) ^ "==END\\n");',
+        timeout=10,
+    )
+    cursor_goal = _extract_marker(cursor_goal_out, "CURSOR_GOAL=", "==END")
+
+    await hol_session_tmpdir.send('proofManagerLib.drop_all();', timeout=5)
+    marker_goal_out = await hol_session_tmpdir.send(
+        'markerLib.set_suspended_goal {suspension_name = "bar", label_name = "case_v"};'
+        'print ("MARKER_GOAL=" ^ term_to_string (#2 (proofManagerLib.top_goal())) ^ "==END\\n");',
+        timeout=10,
+    )
+    marker_goal = _extract_marker(marker_goal_out, "MARKER_GOAL=", "==END")
+
+    assert cursor_goal == marker_goal, (
+        f"Resume goal-setup diverged from markerLib.set_suspended_goal:\n"
+        f"  cursor: {cursor_goal!r}\n"
+        f"  marker: {marker_goal!r}"
+    )
+
+
+# --- Oracle/cheat-dependency detection in single checks (store=false) ---
+# Regression: hol_check_proof / verify_all_proofs read oracle tags from the
+# proved theorem (top_thm() / the resume thm) BEFORE dropping it, not via
+# DB.fetch on a stored theorem. Previously oracles were gated behind
+# `stored = proof_ok andalso store`, so store=false paths (single
+# hol_check_proof; Resume blocks in verify_all_proofs) silently failed to
+# report that a checked theorem depended on an auto-cheated lemma.
+
+@pytest.mark.asyncio
+async def test_check_proof_reports_cheat_dependency(
+    hol_session_tmpdir: HOLSession, tmp_path: Path
+):
+    """execute_proof_traced (store=false) must report a cheat oracle when the
+    checked theorem depends on a cheated lemma (verify_core / top_thm fix)."""
+    script = tmp_path / "testScript.sml"
+    script.write_text("""
+Theorem cheated_lemma:
+  (5:num) = 6
+Proof
+  cheat
+QED
+
+Theorem uses_cheat:
+  (5:num) = 6
+Proof
+  ACCEPT_TAC cheated_lemma
+QED
+""")
+    cursor = FileProofCursor(script, hol_session_tmpdir)
+    res = await cursor.init()
+    assert not res.get("error"), f"init failed: {res.get('error')}"
+
+    trace = await cursor.execute_proof_traced("uses_cheat")
+    assert trace and trace[-1].goals_after == 0 and trace[-1].error is None, (
+        f"uses_cheat did not close: {trace!r}"
+    )
+    oracles = cursor._theorem_oracles.get("uses_cheat", [])
+    assert any("cheat" in o for o in oracles), (
+        f"expected depends-on-cheat oracle for uses_cheat (store=false), "
+        f"got {oracles!r}"
+    )
+
+
+@pytest.mark.asyncio
+async def test_check_proof_clean_theorem_no_cheat_oracle(
+    hol_session_tmpdir: HOLSession, tmp_path: Path
+):
+    """A cheat-free theorem must NOT report a cheat oracle (no false positive
+    from reading top_thm()'s tag)."""
+    script = tmp_path / "testScript.sml"
+    script.write_text("""
+Theorem clean_thm:
+  !a b:bool. a /\\ b ==> b /\\ a
+Proof
+  rpt strip_tac >> fs[]
+QED
+""")
+    cursor = FileProofCursor(script, hol_session_tmpdir)
+    res = await cursor.init()
+    assert not res.get("error"), f"init failed: {res.get('error')}"
+
+    trace = await cursor.execute_proof_traced("clean_thm")
+    assert trace and trace[-1].goals_after == 0 and trace[-1].error is None, (
+        f"clean_thm did not close: {trace!r}"
+    )
+    assert not cursor._theorem_oracles.get("clean_thm"), (
+        f"clean theorem falsely reported oracles: "
+        f"{cursor._theorem_oracles.get('clean_thm')!r}"
+    )
+
+
+@pytest.mark.asyncio
+async def test_verify_all_proofs_resume_reports_cheat_dependency(
+    hol_session_tmpdir: HOLSession, tmp_path: Path
+):
+    """Resume blocks run via run_resume_canonical_json with store=false in
+    verify_all_proofs; the cheat oracle must still be reported (read from the
+    resume thm via a ref, not via DB.fetch on a stored theorem)."""
+    script = tmp_path / "testScript.sml"
+    script.write_text("""
+open markerLib;
+
+Theorem cheated_lemma:
+  p ==> p /\\ p
+Proof
+  cheat
+QED
+
+Theorem disp:
+  p ==> p /\\ p
+Proof
+  suspend "only"
+QED
+
+Resume disp[only]:
+  ACCEPT_TAC cheated_lemma
+QED
+
+Finalise disp
+""")
+    cursor = FileProofCursor(script, hol_session_tmpdir)
+    res = await cursor.init()
+    assert not res.get("error"), f"init failed: {res.get('error')}"
+
+    await cursor.verify_all_proofs()
+
+    resume_names = [t.name for t in cursor._theorems if t.kind == "Resume"]
+    assert resume_names, "no Resume theorem was parsed"
+    rn = resume_names[0]
+    oracles = cursor._theorem_oracles.get(rn, [])
+    assert any("cheat" in o for o in oracles), (
+        f"resume {rn} (store=false) did not report cheat oracle; "
+        f"all oracles={cursor._theorem_oracles!r}"
+    )

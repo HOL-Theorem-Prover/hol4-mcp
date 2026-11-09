@@ -1,0 +1,45 @@
+{
+  "name": "hol4-mcp",
+  "version": "0.1.0+codex.20261003",
+  "description": "Interactive HOL4 proof development for Codex through MCP tools, workflow guidance, and proof-policy hooks.",
+  "author": {
+    "name": "HOL4 MCP contributors"
+  },
+  "homepage": "https://github.com/HOL-Theorem-Prover/hol4-mcp",
+  "repository": "https://github.com/HOL-Theorem-Prover/hol4-mcp",
+  "license": "MIT",
+  "keywords": [
+    "hol4",
+    "theorem-proving",
+    "mcp",
+    "formal-verification"
+  ],
+  "skills": "./skills/",
+  "mcpServers": {
+    "hol4": {
+      "command": "hol4-mcp",
+      "args": [
+        "--transport",
+        "stdio"
+      ],
+      "env_vars": [
+        "HOLDIR"
+      ],
+      "startup_timeout_sec": 30,
+      "tool_timeout_sec": 1800
+    }
+  },
+  "interface": {
+    "displayName": "HOL4 MCP",
+    "shortDescription": "Develop and check HOL4 proofs from Codex.",
+    "longDescription": "Connects Codex to a local HOL4 process and bundles the proof workflow, safety checks, and replay guidance needed for reliable Script.sml development.",
+    "developerName": "HOL4 MCP contributors",
+    "category": "Developer Tools",
+    "capabilities": [
+      "Interactive",
+      "Read",
+      "Write"
+    ],
+    "defaultPrompt": "Use HOL4 MCP to inspect the current proof state and help complete this theorem."
+  }
+}

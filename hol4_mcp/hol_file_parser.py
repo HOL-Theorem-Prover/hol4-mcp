@@ -1,18 +1,8 @@
 """Parse HOL4 script files for theorem structure."""
 
-import bisect
 import re
 from dataclasses import dataclass, field
 from pathlib import Path
-
-
-@dataclass
-class TacticSpan:
-    """A tactic with its source position."""
-    text: str
-    start: tuple[int, int]  # (line, col), 1-indexed
-    end: tuple[int, int]    # (line, col), 1-indexed
-    use_eall: bool = False  # True if tactic should apply to ALL goals (for >> chains)
 
 
 def build_line_starts(content: str) -> list[int]:
@@ -28,14 +18,6 @@ def build_line_starts(content: str) -> list[int]:
     return starts
 
 
-def offset_to_line_col(offset: int, line_starts: list[int]) -> tuple[int, int]:
-    """Convert char offset to (line, col), both 1-indexed."""
-    # Find the line: largest line_starts[i] <= offset
-    line = bisect.bisect_right(line_starts, offset)
-    col = offset - line_starts[line - 1] + 1
-    return (line, col)
-
-
 def line_col_to_offset(line: int, col: int, line_starts: list[int]) -> int:
     """Convert (line, col) to char offset. Line and col are 1-indexed."""
     if line < 1 or line > len(line_starts):
@@ -46,6 +28,24 @@ def line_col_to_offset(line: int, col: int, line_starts: list[int]) -> int:
 class HOLParseError(Exception):
     """Error parsing HOL4 output."""
     pass
+
+
+class StepPlanUnavailable(HOLParseError):
+    """No step plan, for a reason that is not the proof text's: the request
+    timed out, or the session refused it (busy, not running, reply lost)."""
+    pass
+
+
+class StepPlanTimeout(StepPlanUnavailable):
+    """The step-plan request ran out of time."""
+    pass
+
+
+def step_plan_error(error: HOLParseError) -> str:
+    """The message for a step plan that could not be computed."""
+    if isinstance(error, StepPlanUnavailable):
+        return str(error)
+    return f"Failed to parse step plan: {error}"
 
 
 def _find_json_line(output: str, context: str) -> dict:
@@ -75,7 +75,13 @@ def _find_json_line(output: str, context: str) -> dict:
         # Try exact line match first (most common case)
         if stripped.startswith('{'):
             try:
-                return json.loads(stripped)
+                parsed = json.loads(stripped)
+                # Skip warning lines (e.g. {"warning":"..."} from
+                # tactic_prefix.sml's reexpand_group_atoms). Only return
+                # ok/err results.
+                if isinstance(parsed, dict) and ('ok' in parsed or 'err' in parsed):
+                    return parsed
+                # Otherwise (warning, etc.) keep scanning for the real result.
             except json.JSONDecodeError:
                 pass
         # Then look for embedded JSON after other output
@@ -127,15 +133,17 @@ def _needs_infix_parens(text: str) -> bool:
 def _frag_to_cmd(kind: str, text: str) -> str:
     """Wrap a fragment (type, text) into an SML ef() command string.
 
-    - expand: ef(goalFrag.expand(<text>));  (parens added if text starts with >-)
-    - expand_list: ef(goalFrag.expand_list(<text>));  (for >~ pattern selectors)
+    - expand: ef(goalFrag.expand(<text>)(Context.snapshot()));  (parens added if text starts with >-)
+    - expand_list: ef(goalFrag.expand_list(<text>)(Context.snapshot()));  (for >~ pattern selectors)
     - open/mid/close: ef(goalFrag.<text>);
+
+    goalFrag.expand/expand_list take the Context.t to run the tactic against.
     """
     if kind == "expand":
         inner = f"({text})" if _needs_infix_parens(text) else text
-        return f"ef(goalFrag.expand({inner}));"
+        return f"ef(goalFrag.expand({inner})(Context.snapshot()));"
     elif kind == "expand_list":
-        return f"ef(goalFrag.expand_list({text}));"
+        return f"ef(goalFrag.expand_list({text})(Context.snapshot()));"
     else:
         return f"ef(goalFrag.{text});"
 
@@ -176,6 +184,25 @@ def _offset_to_line(offset: int, content: str) -> int:
     return content[:offset].count('\n') + 1
 
 
+def step_text_start(
+    step_plan: list[StepPlan], idx: int, proof_body: str
+) -> int:
+    """Offset of step idx's own tactic text within proof_body.
+
+    A step's span [prev.end, step.end) includes the combinator and
+    whitespace that follow the previous tactic; this returns where the
+    step's own text begins (falling back to the span start when the raw
+    text cannot be located, e.g. structural goalFrag steps).
+    """
+    span_start = step_plan[idx - 1].end if idx > 0 else 0
+    step = step_plan[idx]
+    if step.kind in ("expand", "expand_list") and step.text:
+        found = proof_body.find(step.text, span_start, step.end)
+        if found >= 0:
+            return found
+    return span_start
+
+
 # Display names for structural step kinds (hide SML plumbing)
 _STEP_DISPLAY = {
     "open": ">-",
@@ -191,6 +218,7 @@ def format_steps(
     step_lines: list[int] | None = None,
     context_before: int = 0,
     context_after: int = 0,
+    fail_marker: str = "  <-- FAILED",
 ) -> list[str]:
     """Format step plan with indentation for >- arm nesting.
 
@@ -257,7 +285,7 @@ def format_steps(
             continue
 
         indent = "  " * depth
-        marker = "  <-- FAILED" if i == fail_idx else ""
+        marker = fail_marker if i == fail_idx else ""
         if k == "expand_list":
             # >~[pat] >- tac shown as single indented step
             display = step.text
@@ -284,16 +312,55 @@ def format_steps(
     return out
 
 
+ELIDE_KEEP_HEAD = 8
+ELIDE_KEEP_TAIL = 2
+
+
+def elide_long_text(
+    text: str,
+    keep_head: int = ELIDE_KEEP_HEAD,
+    keep_tail: int = ELIDE_KEEP_TAIL,
+) -> str:
+    """Bound an echoed tactic/error so a huge body cannot swamp the report.
+
+    A preserved multi-hundred-line arm carries no more diagnostic signal in its
+    middle than in its opening lines — when the step is opaque the failure is
+    somewhere inside it either way — so keep the head (which tactic starts the
+    chain) and the tail, and count what was dropped.
+    """
+    lines = text.split("\n")
+    if len(lines) <= keep_head + keep_tail + 1:
+        return text
+    dropped = len(lines) - keep_head - keep_tail
+    return "\n".join(
+        lines[:keep_head]
+        + [f"    ... {dropped} lines elided ..."]
+        + lines[-keep_tail:]
+    )
+
+
 def format_step_context(
     step_plan: list[StepPlan],
     fail_idx: int,
     step_lines: list[int],
     context_before: int = 0,
     context_after: int = 0,
+    fail_marker: str = "  <-- FAILED",
+    failing_header: str = "=== Failing tactic ===",
+    opaque_remedy: str | None = "Use Suspend/Resume or extract as a lemma.",
 ) -> list[str]:
     """Format step plan context around a failing step.
 
     Thin wrapper around format_steps for backward compatibility.
+
+    ``fail_marker``/``failing_header`` are softened by callers when the failure
+    is a RAISED EXCEPTION (e.g. a qpat/qmatch no-match HOL_ERR): the step the
+    replay stopped at is then only an upper bound on the fault location, not a
+    confident pin, so the marker must not read as 'this tactic failed'.
+
+    ``opaque_remedy`` follows the "cannot inspect inside" note on an opaque
+    step; None drops the note (the step's SML did not compile, so there is
+    nothing inside to inspect).
     """
     if fail_idx < 0 or fail_idx >= len(step_plan):
         return []
@@ -302,9 +369,14 @@ def format_step_context(
     failing_kind = step_plan[fail_idx].kind
     # Use structural display name if it's an open/mid step
     failing_display = _STEP_DISPLAY.get(failing_kind, failing_text)
-    out = ["", "=== Failing tactic ===", failing_display]
-    if failing_kind in ("expand", "expand_list"):
-        out.append(f"Opaque tactic — cannot inspect inside of {failing_display}. Use Suspend/Resume or extract as a lemma.")
+    shown = elide_long_text(failing_display)
+    out = ["", failing_header, shown]
+    if failing_kind in ("expand", "expand_list") and opaque_remedy is not None:
+        # Naming the tactic again is only useful while it is short enough to
+        # read; for an elided body it would repeat what was just printed.
+        target = (f"inside of {failing_display}"
+                  if shown == failing_display else "inside it")
+        out.append(f"Opaque tactic — cannot inspect {target}. {opaque_remedy}")
 
     if context_before <= 0 and context_after <= 0:
         return out
@@ -313,6 +385,7 @@ def format_step_context(
         step_plan, fail_idx=fail_idx,
         step_lines=step_lines,
         context_before=context_before, context_after=context_after,
+        fail_marker=fail_marker,
     )
     if steps:
         out.append("")
@@ -321,23 +394,118 @@ def format_step_context(
     return out
 
 
-def parse_step_plan_output(output: str) -> list[StepPlan]:
+def _byte_to_char_offset(body_bytes: bytes, byte_offset: int) -> int:
+    """Convert a UTF-8 byte offset into ``body_bytes`` to a character offset.
+
+    HOL4's TacticParse / HOLSourceParser uses BYTE positions internally
+    (SML strings are byte arrays under Poly/ML; multibyte UTF-8 chars
+    like ``‘`` (U+2018, 3 bytes) advance the parser position by 3).
+    Python comparisons against ``len(body)`` and ``content`` use CHAR
+    positions, so we must convert at the parse boundary.
+
+    If ``byte_offset`` falls in the middle of a multibyte sequence (which
+    should not happen for parser-emitted positions), decode is permissive
+    and the partial sequence is dropped — same effect as clamping to the
+    nearest preceding char boundary.
+    """
+    if byte_offset <= 0:
+        return 0
+    if byte_offset >= len(body_bytes):
+        # Beyond body — return full char length (which is what callers
+        # treat as "past end").
+        return len(body_bytes.decode('utf-8', errors='replace'))
+    return len(body_bytes[:byte_offset].decode('utf-8', errors='replace'))
+
+
+def _plan_coverage_end(body: str) -> int:
+    """Offset just past the last character a step plan must account for.
+
+    Trailing whitespace and trailing SML comments (nesting allowed) sit
+    outside the plan legitimately; everything before them is executable text.
+    """
+    i = len(body)
+    while True:
+        while i > 0 and body[i - 1].isspace():
+            i -= 1
+        if i < 2 or body[i - 2:i] != '*)':
+            return i
+        # Walk back over a (possibly nested) trailing comment.
+        depth = 0
+        k = i
+        while k >= 2:
+            pair = body[k - 2:k]
+            if pair == '*)':
+                depth += 1
+                k -= 2
+            elif pair == '(*':
+                depth -= 1
+                k -= 2
+                if depth == 0:
+                    break
+            else:
+                k -= 1
+        if depth != 0:
+            return i          # unterminated: not a trailing comment
+        i = k
+
+
+def parse_step_plan_output(output: str, body: str | None = None) -> list[StepPlan]:
     """Parse JSON output from step_plan_json.
 
     Expects: {"ok":[{"end":N,"type":"expand","text":"..."}, ...]} or {"err":"message"}
     Returns: list of StepPlan objects, one per executable step.
-    Raises: HOLParseError if HOL4 returned an error or output is malformed.
+
+    When ``body`` is provided, ``end`` offsets are converted from the
+    SML/UTF-8 BYTE positions emitted by the HOL4 parser to Python
+    CHARACTER positions in ``body``. Callers that compare ``step.end``
+    against ``len(body)`` or use it as an offset into ``content`` (a
+    Python str) must pass ``body`` to get correct positions on inputs
+    containing non-ASCII characters like ``‘`` / ``’``.
+
+    Tests that only inspect counts / structure may omit ``body``; their
+    ``end`` values will be byte offsets (matching the SML side).
+
+    Raises: StepPlanTimeout if the request timed out; HOLParseError if HOL4
+    returned an error or output is malformed.
     """
+    if output.startswith("TIMEOUT"):
+        raise StepPlanTimeout(
+            f"TIMEOUT computing the step plan; the proof text was not parsed "
+            f"in time: {output.splitlines()[0]}")
+    if output.lstrip().startswith("ERROR:"):
+        raise StepPlanUnavailable(
+            f"The step plan could not be computed: {output.strip()}")
     result = _find_json_line(output, "goalfrag_step_plan_json")
 
     if 'ok' in result:
         try:
+            body_bytes = body.encode('utf-8') if body is not None else None
             steps = []
             for item in result['ok']:
                 end = int(item['end'])
+                if body_bytes is not None:
+                    end = _byte_to_char_offset(body_bytes, end)
                 kind = str(item['type'])
                 text = str(item['text'])
                 steps.append(StepPlan(end=end, kind=kind, text=text))
+            if body is not None:
+                # The SML parser takes the FIRST declaration it can read and
+                # reports nothing about the rest, so a stray delimiter ends the
+                # expression early and every tactic after it vanishes from the
+                # plan. A plan that stops short of the body is not a plan.
+                covered = max((s.end for s in steps), default=0)
+                needed = _plan_coverage_end(body)
+                uncovered = body[covered:needed]
+                # A step's `end` legitimately stops before the closing
+                # delimiters of the construct it sits in, so only EXECUTABLE
+                # text left outside the plan means tactics were dropped.
+                if uncovered.strip(" \t\r\n)]},;"):
+                    raise HOLParseError(
+                        f"step plan covers only {covered} of {needed} chars of "
+                        f"the proof body: the parse stopped early and the "
+                        f"remaining tactics were dropped. Uncovered text: "
+                        f"{uncovered[:200]!r}"
+                    )
             return steps
         except (TypeError, ValueError, KeyError) as e:
             raise HOLParseError(f"Malformed step plan in output: {e}") from e
@@ -345,32 +513,6 @@ def parse_step_plan_output(output: str) -> list[StepPlan]:
         raise HOLParseError(f"goalfrag_step_plan_json: {result['err']}")
     else:
         raise HOLParseError(f"Unexpected JSON structure: {result}")
-
-
-def make_tactic_spans(
-    raw_spans: list[tuple[str, int, int, bool]],
-    proof_body_offset: int,
-    line_starts: list[int],
-) -> list[TacticSpan]:
-    """Convert raw (text, start, end, use_eall) tuples to TacticSpan with line/col.
-
-    Args:
-        raw_spans: Output from parse_linearize_with_spans_output (offsets relative to proof body)
-        proof_body_offset: Char offset where proof body starts in the file
-        line_starts: Line start table for the entire file
-
-    Returns:
-        List of TacticSpan with absolute line/col positions in the file.
-    """
-    result = []
-    for text, start, end, use_eall in raw_spans:
-        # Convert relative offsets to absolute
-        abs_start = proof_body_offset + start
-        abs_end = proof_body_offset + end
-        start_lc = offset_to_line_col(abs_start, line_starts)
-        end_lc = offset_to_line_col(abs_end, line_starts)
-        result.append(TacticSpan(text=text, start=start_lc, end=end_lc, use_eall=use_eall))
-    return result
 
 
 @dataclass
@@ -389,10 +531,98 @@ class TheoremInfo:
     suspension_name: str | None = None  # For Resume: base theorem name
     label_name: str | None = None       # For Resume: first attribute = label
 
-    @property
-    def line_before_qed(self) -> int:
-        """Line number of QED - 1 (last line of proof body)."""
-        return self.proof_end_line - 2
+
+def suspension_base(name: str) -> str:
+    """Base theorem name to use in a `Resume <base>[<label>]:` header.
+
+    A Resume block's own name is the composite `thm[label]`, but the header
+    syntax takes exactly ONE label level, so suspension labels live in a flat
+    namespace per theorem: a sub-suspend created INSIDE `thm[a]` is resumed by
+    `Resume thm[b]:`, never `Resume thm[a][b]:` — that does not match the
+    Resume pattern, and yields a block the parser does not see at all.
+    """
+    return name.split('[', 1)[0]
+
+
+# Any `Resume` header, stacked brackets included (which the Resume pattern in
+# parse_theorems does not register).
+_ANY_RESUME_HEADER_RE = re.compile(
+    r"^Resume[ \t]+([A-Za-z][A-Za-z0-9_']*)[ \t]*((?:\[[^\]\n]*\][ \t]*)+):", re.M)
+
+
+@dataclass
+class ResumeHeaderProblem:
+    """A Resume header HOL does not read as the agent wrote it."""
+    line: int          # the header's line
+    end_line: int      # its block's QED line
+    name: str          # the composite name the MCP registers, `thm[label]`
+    message: str
+
+
+def resume_header_problems(content: str) -> list[ResumeHeaderProblem]:
+    """Resume headers HOL reads differently from a label path: entries after
+    the first are proof attributes (`key=value`; a bare `b` compiles as the
+    attribute `b []`, a build error), stacked `thm[a][b]` is a parse error,
+    and a label resumed by an earlier block is resumed again. Labels are one
+    flat namespace on the base theorem (HOL tools/parsing/HOLSourceExpand)."""
+    stripped = _strip_comments(content)
+    first_block: dict[tuple[str, str], int] = {}
+    problems = []
+    for m in _ANY_RESUME_HEADER_RE.finditer(stripped):
+        line = content.count('\n', 0, m.start()) + 1
+        qed = re.search(r'^[^\S\n]*QED[^\S\n]*$', stripped[m.end():], re.M)
+        end_line = line + stripped[m.start():m.end() + (qed.end() if qed else 0)].count('\n')
+        base = m.group(1)
+        groups = re.findall(r"\[([^\]]*)\]", m.group(2))
+        entries = [e.strip() for e in groups[0].split(',')]
+        label = entries[0]
+        written = f"Resume {base}{''.join(f'[{g}]' for g in groups)}:"
+        earlier = first_block.get((base, label))
+        bare = [e for e in entries[1:] if e and '=' not in e]
+        if len(groups) > 1:
+            last = groups[-1].split(',')[0].strip()
+            message = (f"The Resume header at line {line} (`{written}`) stacks "
+                       f"labels, which HOL does not parse, so this block is not "
+                       f"registered. Labels are one flat namespace on the base "
+                       f"theorem: write `Resume {suspension_base(base)}[{last}]:`.")
+        elif bare:
+            also = (f", which the block at line {earlier} already resumes"
+                    if earlier is not None else "")
+            message = (f"The Resume header at line {line} (`{written}`) is not a "
+                       f"label path: HOL reads the entries after the first as "
+                       f"proof attributes, so `{bare[0]}` is an unknown attribute "
+                       f"(a build error), and the block resumes label "
+                       f"`{label}`{also}. Labels are one flat namespace on the "
+                       f"base theorem: write `Resume {suspension_base(base)}[{bare[-1]}]:`.")
+        elif earlier is not None:
+            message = (f"The Resume header at line {line} resumes `{base}[{label}]`, "
+                       f"which the block at line {earlier} already resumes: each "
+                       f"label is resumed by one block.")
+        else:
+            message = ""
+        first_block.setdefault((base, label), line)
+        if message:
+            problems.append(ResumeHeaderProblem(line, end_line, f"{base}[{label}]", message))
+    return problems
+
+
+def _string_end(content: str, start: int) -> int:
+    """End offset of an SML string, including escaped characters/string gaps."""
+    i = start + 1
+    while i < len(content):
+        if content[i] == '"':
+            return i + 1
+        if content[i] == '\\':
+            i += 1
+            if i < len(content) and content[i].isspace():
+                while i < len(content) and content[i].isspace():
+                    i += 1
+            i += 1
+        elif content[i] == '\n':
+            return i
+        else:
+            i += 1
+    return len(content)
 
 
 def _strip_comments(content: str) -> str:
@@ -405,7 +635,9 @@ def _strip_comments(content: str) -> str:
     i = 0
     n = len(content)
     while i < n - 1:
-        if content[i] == '(' and content[i + 1] == '*':
+        if content[i] == '"':
+            i = _string_end(content, i)
+        elif content[i] == '(' and content[i + 1] == '*':
             # Found comment start - track nesting
             depth = 1
             j = i + 2
@@ -439,11 +671,17 @@ class LocalBlock:
 def parse_local_blocks(content: str) -> list[LocalBlock]:
     """Parse SML local ... in ... end blocks from file content.
 
-    Uses comment-stripped and string-stripped content to avoid false matches.
-    Returns blocks sorted by local_line.
+    The keyword scan runs on content with comments, string literals, HOL
+    quotations, attribute brackets and holscript statements blanked out:
+    a HOL term's ``let ... in`` has no ``end``, and a ``[local]`` attribute
+    is not an opener, so either would pair the block's ``in``/``end`` with
+    the wrong entry. Returns blocks sorted by local_line.
     """
     stripped = _strip_comments(content)
     stripped = _strip_strings(stripped)
+    stripped = _strip_quotations(stripped)
+    stripped = _strip_attributes(stripped)
+    stripped = _strip_holscript_statements(stripped)
 
     blocks = []
     # Stack entries: ('local', local_line, in_line) or ('let',) etc.
@@ -454,34 +692,15 @@ def parse_local_blocks(content: str) -> list[LocalBlock]:
 
     # Word-boundary patterns — match anywhere in line, not just at start.
     # SML 'let' commonly appears mid-line (e.g. "fun f x = let ...").
-    local_re = re.compile(r'\blocal\b')
-    in_re = re.compile(r'\bin\b')
-    let_re = re.compile(r'\blet\b')
-    end_re = re.compile(r'\bend\b')
+    keyword_re = re.compile(r"(?<![\w'])(local|in|let|struct|sig|abstype|end)(?![\w'])")
 
     for line_num, line in enumerate(lines, start=1):
-        # Find all keywords in order of appearance on this line.
-        # Sort by position to handle cases like "let ... in ... end" on one line
-        # or "local ... in" on one line.
-        keywords = []
-        for m in local_re.finditer(line):
-            keywords.append((m.start(), 'local'))
-        for m in in_re.finditer(line):
-            keywords.append((m.start(), 'in'))
-        for m in let_re.finditer(line):
-            keywords.append((m.start(), 'let'))
-        for m in end_re.finditer(line):
-            keywords.append((m.start(), 'end'))
-        keywords.sort()
-
-        if not keywords:
-            continue
-
-        for _, kw in keywords:
+        for match in keyword_re.finditer(line):
+            kw = match.group(1)
             if kw == 'local':
                 stack.append(('local', line_num, 0))
-            elif kw == 'let':
-                stack.append(('let',))
+            elif kw in ('let', 'struct', 'sig', 'abstype'):
+                stack.append((kw,))
             elif kw == 'in':
                 # 'in' closes the most recent opener (local or let)
                 # For 'local', we record the in_line; for 'let', we just
@@ -503,7 +722,7 @@ def parse_local_blocks(content: str) -> list[LocalBlock]:
                         ))
                     # 'let' entries are just discarded — inner block closed
 
-    return blocks
+    return sorted(blocks, key=lambda block: (block.local_line, -block.end_line))
 
 
 def _has_in(entry: tuple) -> bool:
@@ -526,19 +745,7 @@ def _strip_strings(content: str) -> str:
     n = len(content)
     while i < n:
         if content[i] == '"':
-            # Found string start
-            j = i + 1
-            while j < n:
-                if content[j] == '\\' and j + 1 < n:
-                    j += 2  # Skip escaped character
-                elif content[j] == '"':
-                    j += 1  # Include closing quote
-                    break
-                elif content[j] == '\n':
-                    # SML strings can't span lines without \  at end
-                    break
-                else:
-                    j += 1
+            j = _string_end(content, i)
             # Blank out i..j, keeping newlines
             for k in range(i, min(j, n)):
                 if result[k] != '\n':
@@ -547,6 +754,121 @@ def _strip_strings(content: str) -> str:
         else:
             i += 1
     return ''.join(result)
+
+
+def _blank_span(result: list[str], start: int, end: int) -> None:
+    """Replace result[start:end] with spaces, keeping newlines."""
+    for k in range(start, min(end, len(result))):
+        if result[k] != '\n':
+            result[k] = ' '
+
+
+def _strip_quotations(content: str) -> str:
+    """Replace HOL quotations with spaces, preserving newlines.
+
+    Handles backquote quotations (single and double) and the Unicode
+    forms ‘...’ and “...”. Preserves character offsets. Run after
+    _strip_strings so a quote character inside a string literal is gone.
+    """
+    result = list(content)
+    i = 0
+    n = len(content)
+    while i < n:
+        c = content[i]
+        if c == '`':
+            close = '``' if i + 1 < n and content[i + 1] == '`' else '`'
+            k = content.find(close, i + len(close))
+            j = n if k < 0 else k + len(close)
+        elif c in '‘“':
+            close = '’' if c == '‘' else '”'
+            depth = 1
+            j = i + 1
+            while j < n and depth > 0:
+                if content[j] == c:
+                    depth += 1
+                elif content[j] == close:
+                    depth -= 1
+                j += 1
+        else:
+            i += 1
+            continue
+        _blank_span(result, i, j)
+        i = j
+    return ''.join(result)
+
+
+_ATTR_RE = re.compile(r'\[[A-Za-z0-9_, \t]*\]')
+
+
+def _strip_attributes(content: str) -> str:
+    """Replace attribute brackets such as ``[local,simp]`` with spaces.
+
+    The pattern only matches a bracket holding bare identifiers, so an SML
+    list expression with an operator or a keyword sequence is untouched.
+    """
+    result = list(content)
+    for m in _ATTR_RE.finditer(content):
+        _blank_span(result, m.start(), m.end())
+    return ''.join(result)
+
+
+# A Resume header has no statement (its tactics follow the colon), so it
+# opens no region; with no `Proof` of its own it would run to the next one.
+_STMT_OPEN_RE = re.compile(r'^(Theorem|Triviality)\b[^=\n]*?:', re.M)
+_DEF_OPEN_RE = re.compile(
+    r'^(Definition|Inductive|CoInductive|Datatype)\b[^=\n]*?:', re.M
+)
+_PROOF_KW_RE = re.compile(r'\bProof\b')
+_DEF_CLOSE_KW_RE = re.compile(r'\b(End|Termination)\b')
+
+
+def _strip_holscript_statements(content: str) -> str:
+    """Replace holscript statement regions with spaces, preserving newlines.
+
+    A ``Theorem name:`` statement runs to ``Proof``; a ``Definition``,
+    ``Inductive``, ``CoInductive`` or ``Datatype`` body runs to ``End`` or
+    ``Termination``. Both hold HOL syntax, not SML. The ``Theorem name =``
+    form is SML and is left alone. A region with no closer is left alone.
+    """
+    result = list(content)
+    for open_re, close_re in ((_STMT_OPEN_RE, _PROOF_KW_RE),
+                              (_DEF_OPEN_RE, _DEF_CLOSE_KW_RE)):
+        for m in open_re.finditer(content):
+            close = close_re.search(content, m.end())
+            if close:
+                _blank_span(result, m.start(), close.start())
+    return ''.join(result)
+
+
+_BLOCK_OPEN_RE = re.compile(
+    r'^(Theorem|Triviality|Definition|Inductive|CoInductive|Datatype|Resume)\b'
+)
+_BLOCK_CLOSE_RE = re.compile(r'^[^\S\n]*(QED|End)[^\S\n]*$')
+
+
+def construct_start_line(content: str, line: int) -> int:
+    """First line of the block containing ``line``, or ``line`` itself.
+
+    Only some blocks are parsed into TheoremInfo (a plain ``Definition ... End``
+    and a ``Datatype`` are not), yet truncating a loaded prefix inside ANY of
+    them hands HOL a fragment.
+
+    The gap BETWEEN two blocks needs the same care: it can hold a multi-line
+    comment or a ``val``/``fun`` declaration spanning lines, and resending from
+    the middle of one hands HOL a fragment just the same. A fragment of a
+    comment is the nastiest, since its words then parse as terms and surface as
+    ``Unknown identifier: <word>`` pointing nowhere near the edit.
+    """
+    lines = content.split('\n')
+    if not lines:
+        return line
+    idx = min(max(line, 1), len(lines)) - 1
+    for i in range(idx, -1, -1):
+        if i < idx and _BLOCK_CLOSE_RE.match(lines[i]):
+            return i + 2         # start of the gap after the block that closed
+        if _BLOCK_OPEN_RE.match(lines[i]):
+            return i + 1
+    return line
 
 
 def parse_theorems(content: str) -> list[TheoremInfo]:
@@ -605,7 +927,7 @@ def parse_theorems(content: str) -> list[TheoremInfo]:
         proof_body_offset = match.end() + proof_match.end() + leading_ws
 
         # Check for cheat (strip comments first to avoid false positives)
-        proof_no_comments = re.sub(r'\(\*.*?\*\)', '', proof_body_raw, flags=re.DOTALL)
+        proof_no_comments = _strip_comments(proof_body_raw)
         has_cheat = bool(re.search(r'\bcheat\b', proof_no_comments, re.IGNORECASE))
 
         theorems.append(TheoremInfo(
@@ -667,7 +989,7 @@ def parse_theorems(content: str) -> list[TheoremInfo]:
         leading_ws = len(proof_body_raw) - len(proof_body_raw.lstrip())
         proof_body_offset = match.end() + term_match.end() + leading_ws
 
-        proof_no_comments = re.sub(r'\(\*.*?\*\)', '', proof_body_raw, flags=re.DOTALL)
+        proof_no_comments = _strip_comments(proof_body_raw)
         has_cheat = bool(re.search(r'\bcheat\b', proof_no_comments, re.IGNORECASE))
 
         theorems.append(TheoremInfo(
@@ -724,7 +1046,7 @@ def parse_theorems(content: str) -> list[TheoremInfo]:
         proof_body_offset = match.end() + leading_ws
 
         # Check for cheat
-        proof_no_comments = re.sub(r'\(\*.*?\*\)', '', proof_body_raw, flags=re.DOTALL)
+        proof_no_comments = _strip_comments(proof_body_raw)
         has_cheat = bool(re.search(r'\bcheat\b', proof_no_comments, re.IGNORECASE))
 
         theorems.append(TheoremInfo(
@@ -750,7 +1072,7 @@ def parse_theorems(content: str) -> list[TheoremInfo]:
 
 def parse_file(path: Path) -> list[TheoremInfo]:
     """Parse .sml file, return all theorems."""
-    content = path.read_text()
+    content = path.read_text(encoding="utf-8")
     return parse_theorems(content)
 
 

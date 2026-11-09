@@ -1,12 +1,148 @@
 """Tests for HOL session subprocess wrapper."""
 
+import asyncio
+import sys
+
 import pytest
 from pathlib import Path
+from types import SimpleNamespace
+from unittest.mock import AsyncMock, Mock
 
 from hol4_mcp.hol_session import HOLSession, escape_sml_string
 from hol4_mcp.hol_cursor import _is_hol_error
 
 FIXTURES_DIR = Path(__file__).parent / "fixtures"
+
+
+async def test_server_applies_and_restarts_with_explicit_heap_configuration(tmp_path):
+    from hol4_mcp import hol_mcp_server as srv
+    name = "heap_configuration"
+    try:
+        result = await srv.hol_start(str(tmp_path), name=name,
+                                     env={"HOL4_MCP_MAXHEAP_MB": "12288"})
+        assert "maxheap=12288 MB" in result, result
+        original_pid = srv._sessions[name].session.process.pid
+        assert srv._sessions[name].session.maxheap_mb == 12288
+        result = await srv.hol_setenv({"HOL4_MCP_MAXHEAP_MB": "10240"}, session=name)
+        assert "maxheap=10240 MB" in result, result
+        assert srv._sessions[name].session.process.pid != original_pid
+        assert srv._sessions[name].session.maxheap_mb == 10240
+        assert "2" in await srv.hol_send("1 + 1;", session=name)
+    finally:
+        await srv.hol_stop(session=name)
+
+
+@pytest.mark.parametrize("inherited,explicit,expected", [
+    (None, None, None), ("10240", None, 10240),
+    ("10240", "12288", 12288), (None, "256", 256),
+])
+async def test_interactive_heap_configuration(monkeypatch, tmp_path,
+                                              inherited, explicit, expected):
+    from hol4_mcp.hol_session import default_maxheap_mb
+    expected = default_maxheap_mb() if expected is None else expected
+    assert default_maxheap_mb() >= 8192
+    monkeypatch.delenv("HOL4_MCP_MAXHEAP_MB", raising=False)
+    if inherited is not None:
+        monkeypatch.setenv("HOL4_MCP_MAXHEAP_MB", inherited)
+    env = {"HOL4_MCP_MAXHEAP_MB": explicit} if explicit is not None else None
+    session = HOLSession(str(tmp_path), env=env)
+    spawn = AsyncMock(return_value=SimpleNamespace(pid=123, returncode=None))
+    monkeypatch.setattr("asyncio.create_subprocess_exec", spawn)
+    monkeypatch.setattr(session, "_read_response", AsyncMock(return_value=""))
+    monkeypatch.setattr(session, "send", AsyncMock(return_value=""))
+    result = await session.start()
+    args = spawn.call_args.args
+    assert args[args.index("--maxheap") + 1] == str(expected)
+    assert session.maxheap_mb == expected and f"maxheap={expected} MB" in result
+
+
+@pytest.mark.parametrize("value", ["", "0", "255", "-1", "12GiB", "8192.0"])
+async def test_bad_interactive_heap_does_not_spawn(monkeypatch, tmp_path, value):
+    spawn = AsyncMock()
+    monkeypatch.setattr("asyncio.create_subprocess_exec", spawn)
+    session = HOLSession(str(tmp_path), env={"HOL4_MCP_MAXHEAP_MB": value})
+    with pytest.raises(ValueError, match="HOL4_MCP_MAXHEAP_MB"):
+        await session.start()
+    spawn.assert_not_called()
+
+
+@pytest.mark.parametrize("phase", ["prompt", "helpers"])
+@pytest.mark.parametrize("failure", [TimeoutError, asyncio.CancelledError])
+async def test_startup_failure_reaps_process_and_allows_retry(monkeypatch, tmp_path, phase, failure):
+    # A real child pins process cleanup without waiting for a real HOL timeout.
+    spawn = asyncio.create_subprocess_exec
+    children = []
+
+    async def spawn_idle(*args, **kwargs):
+        child = await spawn(sys.executable, "-c", "import time; time.sleep(60)", **kwargs)
+        children.append(child)
+        return child
+
+    monkeypatch.setattr(asyncio, "create_subprocess_exec", spawn_idle)
+    session = HOLSession(str(tmp_path))
+    reader = AsyncMock(return_value="")
+    sender = AsyncMock(return_value="")
+    (reader if phase == "prompt" else sender).side_effect = failure("startup failed")
+    monkeypatch.setattr(session, "_read_response", reader)
+    monkeypatch.setattr(session, "send", sender)
+    try:
+        with pytest.raises(failure, match="startup failed"):
+            async with session:
+                pytest.fail("failed startup must not enter the context")
+        assert children[0].returncode is not None, "startup leaked its child"
+        assert session.process is None
+        reader.side_effect = sender.side_effect = None
+        assert "HOL started" in await session.start()
+        assert len(children) == 2
+        assert session.process is children[1]
+    finally:
+        await session.stop()
+        for child in children:
+            if child.returncode is None:
+                child.kill()
+                await child.wait()
+
+
+async def test_startup_reports_init_errors_and_reaps_process(tmp_path):
+    (tmp_path / ".hol_init.sml").write_text('raise Fail "broken startup file";\n')
+    session = HOLSession(str(tmp_path))
+    try:
+        with pytest.raises(RuntimeError, match="broken startup file"):
+            await session.start()
+        assert session.process is None
+    finally:
+        await session.stop()
+
+
+async def test_too_old_hol_is_reported_plainly(monkeypatch, tmp_path):
+    from hol4_mcp import hol_mcp_server as srv
+    # The probe as an older TacticParse, with span-less combinators, would
+    # accept it; against the current one it fails like the real probe there.
+    monkeypatch.setattr("hol4_mcp.hol_session._TACTICPARSE_PROBE",
+                        "val _ = TacticParse.FOpenBy (0, 0);")
+    name = "too_old_hol"
+    try:
+        result = await srv.hol_start(str(tmp_path), name=name)
+        assert result.startswith("ERROR starting HOL: the HOL at "), result
+        assert "too old for hol4-mcp" in result and "current master" in result, result
+        assert "tactic_prefix" not in result and "Type error" not in result, result
+        assert name not in srv._sessions
+    finally:
+        await srv.hol_stop(session=name)
+
+
+async def test_stop_handles_process_group_lookup_failure(monkeypatch, tmp_path):
+    session = HOLSession(str(tmp_path))
+    process = SimpleNamespace(pid=123, returncode=None,
+                              wait=AsyncMock(side_effect=[TimeoutError, 0]))
+    session.process = process
+    monkeypatch.setattr("hol4_mcp.hol_session.os.getpgid", Mock(side_effect=PermissionError))
+    kill = Mock()
+    monkeypatch.setattr("hol4_mcp.hol_session.os.killpg", kill)
+    await session.stop()
+    assert session.process is None
+    assert process.wait.await_count == 2
+    kill.assert_not_called()
 
 
 async def test_hol_session():

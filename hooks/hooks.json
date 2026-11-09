@@ -1,0 +1,82 @@
+{
+  "description": "Codex lifecycle hooks for the HOL4 MCP proof workflow.",
+  "hooks": {
+    "SessionStart": [
+      {
+        "matcher": "startup|resume|clear|compact",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "python3 \"${PLUGIN_ROOT}/integrations/codex/session_context.py\"",
+            "statusMessage": "Checking for a HOL4 project",
+            "timeout": 10,
+            "additionalContextLimit": 1000
+          }
+        ]
+      }
+    ],
+    "UserPromptSubmit": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "python3 \"${PLUGIN_ROOT}/integrations/codex/prompt_capture.py\"",
+            "timeout": 10
+          }
+        ]
+      }
+    ],
+    "PreToolUse": [
+      {
+        "matcher": "^apply_patch$",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "python3 \"${PLUGIN_ROOT}/integrations/codex/hook_adapter.py\" h1_banned_tactics.py h10_resume_needs_finalise.py h17_then_suspend.py h18_ban_lookup_suspension.py h24_custom_tactic_advisory.py",
+            "statusMessage": "Checking HOL4 proof edit",
+            "timeout": 120,
+            "additionalContextLimit": 3000
+          }
+        ]
+      },
+      {
+        "matcher": "^Bash$",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "python3 \"${PLUGIN_ROOT}/integrations/codex/hook_adapter.py\" h27_commit_audit_gate.py h28_shell_hol_build.py",
+            "statusMessage": "Checking HOL4 shell workflow",
+            "timeout": 120,
+            "additionalContextLimit": 3000
+          }
+        ]
+      },
+      {
+        "matcher": "^mcp__hol4__",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "python3 \"${PLUGIN_ROOT}/integrations/codex/hook_adapter.py\" h18_ban_lookup_suspension.py h20_hol_send_massive_tactic.py h23_hol_send_prove_workflow.py h29_hol_stop_repeat.py h30_stale_ancestors.py h31_skip_prefix_consent.py h32_holmake_preflight.py",
+            "statusMessage": "Checking HOL4 tool workflow",
+            "timeout": 120,
+            "additionalContextLimit": 3000
+          }
+        ]
+      }
+    ],
+    "PostToolUse": [
+      {
+        "matcher": "^mcp__hol4__",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "python3 \"${PLUGIN_ROOT}/integrations/codex/hook_adapter.py\" h6_check_proof_failure.py h7_holmake_advisory.py h8_state_at_replay_cost.py h16_bundled_suspend_goals.py h25_proof_text_sweep.py",
+            "statusMessage": "Reviewing HOL4 tool result",
+            "timeout": 120,
+            "additionalContextLimit": 3000
+          }
+        ]
+      }
+    ]
+  }
+}

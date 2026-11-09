@@ -1,6 +1,6 @@
 [project]
 name = "hol4-mcp"
-version = "0.1.0"
+version = "0.1.0+codex.20261003"
 description = "MCP server and tools for HOL4 theorem prover"
 requires-python = ">=3.11"
 dependencies = [
@@ -20,6 +20,7 @@ packages = ["hol4_mcp"]
 [tool.hatch.build.targets.sdist]
 include = [
     "hol4_mcp/**/*.py",
+    "hol4_mcp/**/*.sml",
     "hol4_mcp/**/*.ts",
     "pyproject.toml",
     "LICENSE",
@@ -32,11 +33,10 @@ include = [
 testpaths = ["tests"]
 asyncio_mode = "auto"
 asyncio_default_fixture_loop_scope = "function"
-addopts = "-n auto"
 
 [dependency-groups]
 dev = [
+    "hatchling>=1.26.0",
     "pytest>=8.0.0",
     "pytest-asyncio>=0.24.0",
-    "pytest-xdist>=3.8.0",
 ]

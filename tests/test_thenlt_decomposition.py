@@ -63,10 +63,10 @@ class TestThen1StepPlan:
         """`a >> b >- c` → 4 steps: expand(a), expand(b), open, expand(c), close."""
         result = await call_step_plan(hol_session, "strip_tac >> conj_tac >- simp[]")
         cmds = [s.cmd for s in result]
-        assert "ef(goalFrag.expand(strip_tac));" in cmds
-        assert "ef(goalFrag.expand(conj_tac));" in cmds
+        assert "ef(goalFrag.expand(strip_tac)(Context.snapshot()));" in cmds
+        assert "ef(goalFrag.expand(conj_tac)(Context.snapshot()));" in cmds
         assert "ef(goalFrag.open_then1);" in cmds
-        assert "ef(goalFrag.expand(simp[]));" in cmds
+        assert "ef(goalFrag.expand(simp[])(Context.snapshot()));" in cmds
         assert "ef(goalFrag.close_paren);" in cmds
 
     async def test_by_same_as_then1(self, hol_session):

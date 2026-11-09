@@ -46,15 +46,15 @@ class TestGoalfragStepPlanBasic:
         """Single tactic returns one step."""
         result = await call_step_plan(hol_session, "simp[]")
         assert len(result) == 1
-        assert "ef(goalFrag.expand(simp[]))" in result[0].cmd
+        assert "ef(goalFrag.expand(simp[])(Context.snapshot()))" in result[0].cmd
 
     async def test_then_chain(self, hol_session):
         """>> chain returns one step per tactic."""
         result = await call_step_plan(hol_session, "a >> b >> c")
         assert len(result) == 3
-        assert "ef(goalFrag.expand(a))" in result[0].cmd
-        assert "ef(goalFrag.expand(b))" in result[1].cmd
-        assert "ef(goalFrag.expand(c))" in result[2].cmd
+        assert "ef(goalFrag.expand(a)(Context.snapshot()))" in result[0].cmd
+        assert "ef(goalFrag.expand(b)(Context.snapshot()))" in result[1].cmd
+        assert "ef(goalFrag.expand(c)(Context.snapshot()))" in result[2].cmd
 
     async def test_ends_are_monotonic(self, hol_session):
         """End offsets should be monotonically non-decreasing."""
@@ -87,14 +87,14 @@ class TestGoalfragThen1Decomposition:
         """`a >- b` → expand(a), open_then1, expand(b), close_paren."""
         result = await call_step_plan(hol_session, "conj_tac >- simp[]")
         cmds = [s.cmd for s in result]
-        assert "ef(goalFrag.expand(conj_tac));" in cmds
+        assert "ef(goalFrag.expand(conj_tac)(Context.snapshot()));" in cmds
         assert "ef(goalFrag.open_then1);" in cmds
-        assert "ef(goalFrag.expand(simp[]));" in cmds
+        assert "ef(goalFrag.expand(simp[])(Context.snapshot()));" in cmds
         assert "ef(goalFrag.close_paren);" in cmds
         # Order: expand base, open, expand arm, close
-        assert cmds.index("ef(goalFrag.expand(conj_tac));") < cmds.index("ef(goalFrag.open_then1);")
-        assert cmds.index("ef(goalFrag.open_then1);") < cmds.index("ef(goalFrag.expand(simp[]));")
-        assert cmds.index("ef(goalFrag.expand(simp[]));") < cmds.index("ef(goalFrag.close_paren);")
+        assert cmds.index("ef(goalFrag.expand(conj_tac)(Context.snapshot()));") < cmds.index("ef(goalFrag.open_then1);")
+        assert cmds.index("ef(goalFrag.open_then1);") < cmds.index("ef(goalFrag.expand(simp[])(Context.snapshot()));")
+        assert cmds.index("ef(goalFrag.expand(simp[])(Context.snapshot()));") < cmds.index("ef(goalFrag.close_paren);")
 
     async def test_nested_then1(self, hol_session):
         """Chained >- decomposes each arm."""
@@ -111,9 +111,9 @@ class TestGoalfragThen1Decomposition:
         """`by` (sugar for >-) decomposes the same way."""
         result = await call_step_plan(hol_session, "strip_tac by simp[]")
         cmds = [s.cmd for s in result]
-        assert "ef(goalFrag.expand(strip_tac));" in cmds
+        assert "ef(goalFrag.expand(strip_tac)(Context.snapshot()));" in cmds
         assert "ef(goalFrag.open_then1);" in cmds
-        assert "ef(goalFrag.expand(simp[]));" in cmds
+        assert "ef(goalFrag.expand(simp[])(Context.snapshot()));" in cmds
         assert "ef(goalFrag.close_paren);" in cmds
 
 
@@ -238,27 +238,33 @@ class TestBackupN:
 # =============================================================================
 
 class TestThenLTReexpand:
-    """ThenLT inside >> chains: reexpand to get open/close decomposition.
+    """ThenLT inside >> chains: KEPT OPAQUE so per-goal vs global semantics
+    of the inner `>-` are preserved.
 
-    linearize's `asTac` skips bracketing when `one=true` (inside Then list),
-    collapsing >- into a single FAtom. reexpand_group_atoms detects these
-    and re-linearizes the ThenLT AST at the top level to get proper decomposition.
+    The parser emits `Group(true, ..., ThenLT(_, [LThen1 _]))` for any
+    precedence-grouped `tac1 >- tac2` sub-expression — including cases
+    without source parens (left-associative grouping is implicit). My
+    isComposable check excludes these Groups from re-expansion because
+    re-expanding them would emit `[expand tac1, open_then1, expand tac2,
+    close_paren]` fragments where `open_then1` runs GLOBALLY across the
+    goalstate, diverging from Holmake's per-goal semantics whenever the
+    Group sits inside an outer per-goal-distributing context.
 
-    Subgoal-based ThenLT (by/sg) is NOT re-expanded because `Subgoal \`Q\``
-    is not a standalone tactic — only the full `\`Q\` by tac` expression is valid.
-    For by inside >> chains, navigation stays at the atomic step level.
+    Trade-off: lose mid-arm navigation between `tac1` and `tac2`. The
+    whole `tac1 >- tac2` runs as one atomic expand step.
+
+    Subgoal-based ThenLT (by/sg) is similarly atomic — the merged form
+    `\`Q\` by tac` runs per-goal correctly via goalFrag.expand.
     """
 
     async def test_thenlt_in_then_chain(self, hol_session):
-        """>- inside >> chain decomposes into expand/open/expand/close steps."""
+        """`tac1 >- tac2 >> tac3` precedence-groups as
+        `((tac1 >- tac2) >> tac3)`. The inner `>-` Group stays opaque; the
+        outer `>>` chain is two expand steps."""
         result = await call_step_plan(hol_session, "conj_tac >- simp[] >> fs[]")
-        # conj_tac, open_then1, simp[], close_paren, fs[]
-        assert len(result) == 5, f"Expected 5 steps, got {len(result)}: {[s.text for s in result]}"
-        assert result[0].kind == "expand" and "conj_tac" in result[0].text
-        assert result[1].kind == "open" and result[1].text == "open_then1"
-        assert result[2].kind == "expand" and "simp" in result[2].text
-        assert result[3].kind == "close" and result[3].text == "close_paren"
-        assert result[4].kind == "expand" and result[4].text == "fs[]"
+        assert len(result) == 2, f"Expected 2 steps, got {len(result)}: {[s.text for s in result]}"
+        assert result[0].kind == "expand" and result[0].text == "conj_tac >- simp[]"
+        assert result[1].kind == "expand" and result[1].text == "fs[]"
 
     async def test_by_in_then_chain(self, hol_session):
         """`P` by tac inside >> chain merges into a SINGLE atomic step.
@@ -277,24 +283,29 @@ class TestThenLTReexpand:
         assert result[2].kind == "expand" and result[2].text == "fs[]"
 
     async def test_by_tactic_base_no_sg_prefix(self, hol_session):
-        """`by` with tactic base (not term quotation) keeps base text unchanged.
-
-        Tactic-base `by` is not a Subgoal-from-term-quote pattern, so it does
-        not get the sg-prefix and does NOT trigger merge_by_steps. It keeps
-        the old decomposition (which is rare and benign in practice)."""
+        """Top-level `tac1 by tac2` (no surrounding chain): the parser
+        produces a top-level ThenLT WITHOUT a Group wrapper. Linearize
+        decomposes it directly into [expand, open_then1, expand, close_paren].
+        Mid-arm navigation IS preserved at top level (no per-goal context
+        above to worry about)."""
         result = await call_step_plan(hol_session, "strip_tac by simp[]")
-        # strip_tac (not "sg strip_tac"), open_then1, simp[], close_paren
         assert len(result) == 4, f"Expected 4 steps, got {len(result)}: {[s.text for s in result]}"
-        assert result[0].text == "strip_tac", f"Tactic base should not get sg: {result[0].text}"
+        assert result[0].text == "strip_tac"
+        assert result[1].kind == "open" and result[1].text == "open_then1"
+        assert result[2].text == "simp[]"
+        assert result[3].kind == "close" and result[3].text == "close_paren"
 
     async def test_sg_in_then_chain_merges(self, hol_session):
-        """Explicit `sg `Q` >- tac` is semantically identical to ``Q` by tac`
-        and is merged the same way."""
+        """`strip_tac >> sg \`Q\` >- simp[] >> fs[]`: precedence-groups as
+        `((((strip_tac >> sg \`Q\`) >- simp[]) >> fs[])`. The whole
+        `((strip_tac >> sg \`Q\`) >- simp[])` is the Group-wrapped left
+        operand of the outer `>>`. Atomic step + fs[] = 2 steps."""
         result = await call_step_plan(hol_session, r"strip_tac >> sg `Q` >- simp[] >> fs[]")
-        # strip_tac, `Q` by simp[], fs[]
-        assert len(result) == 3, f"Expected 3 steps, got {len(result)}: {[s.text for s in result]}"
-        assert result[1].kind == "expand"
-        assert "by" in result[1].text and "`Q`" in result[1].text
+        assert len(result) == 2, f"Expected 2 steps, got {len(result)}: {[s.text for s in result]}"
+        assert result[0].kind == "expand"
+        for tok in ("strip_tac", "`Q`", "simp[]"):
+            assert tok in result[0].text, f"Missing {tok!r}: {result[0].text!r}"
+        assert result[1].kind == "expand" and result[1].text == "fs[]"
 
     async def test_by_term_base_merges(self, hol_session):
         """Standalone `P` by tac (no enclosing chain) merges into one step."""
@@ -317,25 +328,25 @@ class TestThenLTReexpand:
             f"Compound body must be parenthesized after `by`: {text!r}"
 
     async def test_thenlt_bare_decomposes(self, hol_session):
-        """Standalone >- (top level, not in >> chain) decomposes correctly."""
+        """Standalone `tac1 >- tac2` (no surrounding chain) — the parser
+        emits the ThenLT directly without a Group wrapper, so the
+        decomposition still happens. Mid-arm navigation IS preserved here."""
         result = await call_step_plan(hol_session, "conj_tac >- simp[]")
         assert len(result) == 4, f"Expected 4 steps, got {len(result)}: {[s.text for s in result]}"
         assert result[1].kind == "open"
 
     async def test_thenlt_multi_step_arm_in_chain(self, hol_session):
-        """>- with multi-step arm inside >> chain decomposes fully."""
+        """`tac1 >- (multi-step arm) >> tac3`: parser groups the LHS as
+        Group(_, ThenLT(tac1, [LThen1 (multi-step)])). My fix keeps it
+        opaque — atomic expand step containing the whole `tac1 >- (...)`."""
         result = await call_step_plan(
             hol_session,
             "conj_tac >- (simp[] >> ACCEPT_TAC) >> fs[]"
         )
-        # conj_tac, open_then1, simp[], ACCEPT_TAC, close_paren, fs[]
-        assert len(result) == 6, f"Expected 6 steps, got {len(result)}: {[s.text for s in result]}"
-        assert result[0].kind == "expand" and "conj_tac" in result[0].text
-        assert result[1].kind == "open"
-        assert result[2].kind == "expand" and "simp" in result[2].text
-        assert result[3].kind == "expand" and "ACCEPT" in result[3].text
-        assert result[4].kind == "close"
-        assert result[5].kind == "expand" and result[5].text == "fs[]"
+        assert len(result) == 2, f"Expected 2 steps, got {len(result)}: {[s.text for s in result]}"
+        assert result[0].kind == "expand"
+        assert result[0].text == "conj_tac >- (simp[] >> ACCEPT_TAC)"
+        assert result[1].kind == "expand" and result[1].text == "fs[]"
 
     async def test_then_chain_without_thenlt_unchanged(self, hol_session):
         """Pure >> chain without >-/by is not affected by reexpand."""
@@ -344,37 +355,49 @@ class TestThenLTReexpand:
         assert all(s.kind == "expand" for s in result)
 
     async def test_nested_thenlt_with_then_chain(self, hol_session):
-        """>- inside >- with >> chain decomposes recursively."""
+        """`tac1 >- (chain with nested >- inside)`. The OUTER `>-` Group
+        stays opaque (LThen1). The arm body has its own Group wrapping the
+        inner `>-`, also kept opaque. Top-level pattern: `conj_tac >- (...)`
+        decomposes the outer arm body via open/close, and the inner `>-`
+        appears as one merged expand step inside the arm."""
         result = await call_step_plan(
             hol_session,
             "conj_tac >- (strip_tac >> simp[] >> strip_tac >- conj_tac)"
         )
-        # conj_tac, open, strip_tac, simp[], strip_tac, open, conj_tac, close, close
-        assert len(result) == 9, f"Expected 9 steps, got {len(result)}: {[s.text for s in result]}"
-        assert result[0].kind == "expand" and "conj_tac" in result[0].text
-        assert result[1].kind == "open"
-        assert result[2].text == "strip_tac"
-        assert result[3].text == "simp[]"
-        assert result[4].text == "strip_tac"
-        assert result[5].kind == "open"  # inner >- open
-        assert result[6].text == "conj_tac"
-        assert result[7].kind == "close"  # inner >- close
-        assert result[8].kind == "close"  # outer >- close
+        kinds = [s.kind for s in result]
+        texts = [s.text for s in result]
+        # Outer `>-` arm decomposes: expand conj_tac, open_then1, then arm
+        # body atoms, close_paren. Arm body contains the inner merged `>-`.
+        assert "open" in kinds and "close" in kinds, (
+            f"Outer arm should still decompose: {kinds}"
+        )
+        # Inner `>-` is merged into a single atom containing both atoms.
+        assert any("strip_tac >- conj_tac" in t for t in texts), (
+            f"Inner `>-` should be merged: {texts}"
+        )
 
     async def test_thenlt_at_start_of_chain(self, hol_session):
-        """>- as the first element in a >> chain decomposes."""
+        """`tac1 >- tac2 >> tac3` — same precedence-grouped form as
+        test_thenlt_in_then_chain. Outer Group stays opaque; chain is 2 steps."""
         result = await call_step_plan(hol_session, "conj_tac >- simp[] >> fs[]")
-        # conj_tac, open_then1, simp[], close_paren, fs[]
-        assert len(result) == 5
-        assert result[1].kind == "open"
+        assert len(result) == 2
+        assert result[0].text == "conj_tac >- simp[]"
 
     async def test_multiple_thenlt_in_chain(self, hol_session):
-        """Multiple >- in the same >> chain each decompose."""
+        """`tac1 >- tac2 >> tac3 >- tac4`: parses as
+        `(((tac1 >- tac2) >> tac3) >- tac4)`. The outer-most ThenLT is at
+        TOP LEVEL (no Group wrapper around it), so it decomposes into
+        [base..., open_then1, expand fs[], close_paren]. The base
+        `((tac1 >- tac2) >> tac3)` is a Then containing a Group-wrapped
+        inner `>-` (kept opaque) and `tac3`. Total: 5 steps."""
         result = await call_step_plan(hol_session, "conj_tac >- simp[] >> conj_tac >- fs[]")
-        # conj_tac, open, simp[], close, conj_tac, open, fs[], close
-        assert len(result) == 8, f"Expected 8 steps, got {len(result)}: {[s.text for s in result]}"
-        assert result[1].kind == "open"
-        assert result[5].kind == "open"
+        # Expected: [merged inner, conj_tac, open_then1, fs[], close_paren]
+        assert len(result) == 5, f"Expected 5 steps, got {len(result)}: {[s.text for s in result]}"
+        assert result[0].kind == "expand" and result[0].text == "conj_tac >- simp[]"
+        assert result[1].kind == "expand" and result[1].text == "conj_tac"
+        assert result[2].kind == "open" and result[2].text == "open_then1"
+        assert result[3].kind == "expand" and result[3].text == "fs[]"
+        assert result[4].kind == "close" and result[4].text == "close_paren"
 
     async def test_end_offsets_correct_after_reexpand(self, hol_session):
         """End offsets for reexpanded fragments use original proof body positions."""
@@ -450,9 +473,9 @@ class TestByDistribution:
         # Goal: T /\ T  (after conj_tac, 2 identical T goals)
         cmd = (
             'verify_theorem_json "T /\\\\ T" "by_multigoal_thm" '
-            '["ef(goalFrag.expand(conj_tac))",'
-            ' "ef(goalFrag.expand(`1+1 = 2` by EVAL_TAC))",'
-            ' "ef(goalFrag.expand(ACCEPT_TAC TRUTH))"] false 10.0;'
+            '["ef(goalFrag.expand(conj_tac)(Context.snapshot()))",'
+            ' "ef(goalFrag.expand(`1+1 = 2` by EVAL_TAC)(Context.snapshot()))",'
+            ' "ef(goalFrag.expand(ACCEPT_TAC TRUTH)(Context.snapshot()))"] false 10.0;'
         )
         result = await hol_session.send(cmd, timeout=30)
         ok_line = next(
@@ -482,12 +505,12 @@ class TestByDistribution:
         await hol_session.send('drop_all();', timeout=5)
         cmd = (
             'verify_theorem_json "T /\\\\ T" "by_multigoal_thm_old" '
-            '["ef(goalFrag.expand(conj_tac))",'
-            ' "ef(goalFrag.expand(sg `1+1 = 2`))",'
+            '["ef(goalFrag.expand(conj_tac)(Context.snapshot()))",'
+            ' "ef(goalFrag.expand(sg `1+1 = 2`)(Context.snapshot()))",'
             ' "ef(goalFrag.open_then1)",'
-            ' "ef(goalFrag.expand(EVAL_TAC))",'
+            ' "ef(goalFrag.expand(EVAL_TAC)(Context.snapshot()))",'
             ' "ef(goalFrag.close_paren)",'
-            ' "ef(goalFrag.expand(ACCEPT_TAC TRUTH))"] false 10.0;'
+            ' "ef(goalFrag.expand(ACCEPT_TAC TRUTH)(Context.snapshot()))"] false 10.0;'
         )
         result = await hol_session.send(cmd, timeout=30)
         ok_line = next(
@@ -508,6 +531,145 @@ class TestByDistribution:
             f"Decomposed sequence should have failed/left goals open, "
             f"but trace says proof closed: {trace!r}"
         )
+
+
+# =============================================================================
+# Step Plan: >~ [pat] >- (compound body with NESTED >-)
+#
+# REGRESSION: Previously merge_select_steps' walkArm bailed on ANY nested
+# open inside the body of >~ [pat] >- (...), and the "no bracket consumed"
+# branch then silently DROPPED the SELECT step. Result: `>~ [pat]` never
+# executed, the following `>-` focused the wrong goal, and the proof
+# silently mis-executed (or failed many steps later for unrelated-looking
+# reasons). Hit on the cake-while branch when inlining a Resume[Result]
+# body that contained `\\ reverse TOP_CASE_TAC >- (rw [] \\ rw [])`.
+#
+# Fix: parseBody walks nested brackets recursively, parenthesising nested
+# `>-` groups so SML precedence (>- inside >> chain) is preserved.
+# =============================================================================
+
+
+class TestSelectGoalNestedBody:
+    """`>~ [pat] >- (body with nested >-)` must merge into a single
+    expand_list step, not silently drop the SELECT pattern."""
+
+    async def test_nested_then1_inside_select_body_merges(self, hol_session):
+        """Body of `>~ [pat] >- (... >- ...)` is reconstructed with nested
+        >- properly parenthesised so the SELECT_GOAL_LT prefix survives."""
+        result = await call_step_plan(
+            hol_session,
+            "Cases_on `x` >~ [`Foo`] >- (a >> b >- c >> d)"
+        )
+        assert len(result) == 2, (
+            f"Expected 2 steps (Cases_on, expand_list); got "
+            f"{[(s.kind, s.text) for s in result]}"
+        )
+        assert result[0].kind == "expand"
+        assert result[1].kind == "expand_list", (
+            f"Compound body with nested >- must yield expand_list, "
+            f"not bare expand or dropped select: {result[1].kind}"
+        )
+        text = result[1].text
+        assert "Q.SELECT_GOAL_LT" in text, (
+            f"SELECT_GOAL_LT prefix dropped: {text!r}"
+        )
+        for tok in ("`Foo`", "a", "b", "c", "d"):
+            assert tok in text, (
+                f"Token {tok!r} missing from reconstruction: {text!r}"
+            )
+
+    async def test_double_nested_then1_inside_select_body(self, hol_session):
+        """Two nested >- arms in body still merge correctly."""
+        result = await call_step_plan(
+            hol_session,
+            "Cases_on `x` >~ [`Foo`] >- (a >- b >- c)"
+        )
+        assert len(result) == 2
+        assert result[1].kind == "expand_list"
+        text = result[1].text
+        assert "Q.SELECT_GOAL_LT" in text
+        for tok in ("`Foo`", "a", "b", "c"):
+            assert tok in text, f"Token {tok!r} missing from {text!r}"
+
+    async def test_nested_paren_inside_select_body(self, hol_session):
+        """Plain (...) nesting inside select body merges correctly."""
+        result = await call_step_plan(
+            hol_session,
+            "Cases_on `x` >~ [`Foo`] >- (a >> (b >> c) >> d)"
+        )
+        assert len(result) == 2
+        assert result[1].kind == "expand_list"
+        for tok in ("`Foo`", "a", "b", "c", "d"):
+            assert tok in result[1].text
+
+    async def test_select_no_nested_unchanged(self, hol_session):
+        """Existing flat-body case still merges as before (regression guard)."""
+        result = await call_step_plan(
+            hol_session,
+            "Cases_on `x` >~ [`Foo`] >- simp[]"
+        )
+        assert len(result) == 2
+        assert result[1].kind == "expand_list"
+        assert "Q.SELECT_GOAL_LT" in result[1].text
+        assert "simp[]" in result[1].text
+
+
+# =============================================================================
+# Step Plan: `reverse TAC` is preserved (not stripped to bare TAC)
+#
+# REGRESSION: TacticParse parses `reverse TAC` as
+#   Group(span, ThenLT(TAC, [LReverse]))
+# reexpand_group_atoms previously re-expanded ANY ThenLT-containing Group,
+# producing flat frags [FAtom TAC, FAtom LReverse]. LReverse has no span,
+# so frag_text returned "" and assignEnds dropped it — losing the `reverse`
+# wrapper entirely. The decomposed step ran TAC alone, which has the wrong
+# goal-stack ordering vs `reverse TAC`.
+#
+# Fix: lsHasStructuralOnly excludes ThenLTs whose list-tactic part has
+# LReverse (or other span-less LT-elements) from re-expansion. The Group
+# stays as a single FAtom whose text is the full `reverse TAC` source.
+# =============================================================================
+
+
+class TestReverseTactical:
+    """`reverse TAC` must survive linearization as a single atomic step."""
+
+    async def test_reverse_preserved_in_step_text(self, hol_session):
+        """Step plan for `reverse TOP_CASE_TAC` keeps the `reverse` prefix."""
+        result = await call_step_plan(hol_session, "reverse TOP_CASE_TAC")
+        assert len(result) == 1, (
+            f"Expected one atomic step for `reverse TOP_CASE_TAC`; got "
+            f"{[(s.kind, s.text) for s in result]}"
+        )
+        assert result[0].kind == "expand"
+        assert result[0].text == "reverse TOP_CASE_TAC", (
+            f"`reverse` prefix dropped: {result[0].text!r}"
+        )
+
+    async def test_reverse_in_then_chain_keeps_prefix(self, hol_session):
+        """`reverse TOP_CASE_TAC` inside a >> chain still keeps `reverse`."""
+        result = await call_step_plan(
+            hol_session, "strip_tac >> reverse TOP_CASE_TAC >> simp[]"
+        )
+        assert len(result) == 3
+        assert result[1].text == "reverse TOP_CASE_TAC", (
+            f"`reverse` prefix dropped in chain: {result[1].text!r}"
+        )
+
+    async def test_reverse_with_then1_arm(self, hol_session):
+        """`reverse TAC >- arm` keeps `reverse` and decomposes the >-."""
+        result = await call_step_plan(
+            hol_session, "reverse TOP_CASE_TAC >- simp[]"
+        )
+        # Expect: expand "reverse TOP_CASE_TAC", open_then1, expand simp[], close_paren
+        assert len(result) == 4, (
+            f"Expected 4 steps; got {[(s.kind, s.text) for s in result]}"
+        )
+        assert result[0].kind == "expand"
+        assert result[0].text == "reverse TOP_CASE_TAC"
+        assert result[1].kind == "open"
+        assert result[2].text == "simp[]"
+        assert result[3].kind == "close"
 
 
 # =============================================================================
@@ -716,7 +878,7 @@ class TestResumeGoalExtraction:
         # `ASM_REWRITE_TAC[]` closes `p` given `p` is in the asms (added by strip_tac).
         cmd = (
             'verify_resume_json "split_conj" "p_case" "split_conj_p_case" '
-            '["ef(goalFrag.expand(ASM_REWRITE_TAC[]))"] false 10.0;'
+            '["ef(goalFrag.expand(ASM_REWRITE_TAC[])(Context.snapshot()))"] false 10.0;'
         )
         result = await hol_session.send(cmd, timeout=20)
         ok_line = next(
@@ -734,3 +896,49 @@ class TestResumeGoalExtraction:
         assert trace[-1].get('goals_after') == 0, (
             f"Resume tactics did not close goal: {trace!r}"
         )
+    async def test_select_goal_compound_body_then(self, hol_session):
+        """>~[pat] >- (a >> b): compound body must be merged, not silently dropped.
+
+        Regression: previously the SELECT_GOAL_LT prefix was dropped when the
+        `>-` body had multiple tactics joined by `>>` (the bracket pattern
+        match in tryConsumeBracket was open+single_expand+close). With the
+        prefix dropped, the `>~` selector never executed and `>-` ran on the
+        un-reordered goal stack, picking the wrong goal."""
+        result = await call_step_plan(hol_session, "Cases_on `x` >~ [`Foo`] >- (simp[] >> fs[])")
+        # Must produce: expand(Cases_on), expand_list(Q.SELECT_GOAL_LT [`Foo`] >- (simp[] >> fs[]))
+        assert len(result) == 2, f"Expected 2 steps, got {len(result)}: {[(s.kind, s.text) for s in result]}"
+        assert result[0].kind == "expand"
+        assert result[1].kind == "expand_list", \
+            f"Compound body should yield expand_list step, got kind={result[1].kind} text={result[1].text!r}"
+        assert "Q.SELECT_GOAL_LT" in result[1].text
+        assert "`Foo`" in result[1].text
+        assert "simp[]" in result[1].text
+        assert "fs[]" in result[1].text
+
+    async def test_select_goal_compound_body_three_then(self, hol_session):
+        """>~[pat] >- (a >> b >> c): three-tactic compound body."""
+        result = await call_step_plan(hol_session, "Cases_on `x` >~ [`Foo`] >- (a >> b >> c)")
+        assert len(result) == 2
+        assert result[1].kind == "expand_list"
+        assert "Q.SELECT_GOAL_LT" in result[1].text
+        # All three sub-tactics must be present
+        for tac in ("a", "b", "c"):
+            assert tac in result[1].text
+
+    async def test_select_goal_compound_body_associativity(self, hol_session):
+        """Compound body must parenthesize so `>-` doesn't bind only to first sub-tactic.
+
+        `Q.SELECT_GOAL_LT [pat] >- a >> b` parses as
+          `(Q.SELECT_GOAL_LT [pat] >- a) >> b`
+        which would run `b` on goals OUTSIDE the >- arm. The body must be
+        wrapped in parens so the entire compound is the arm body."""
+        result = await call_step_plan(hol_session, "Cases_on `x` >~ [`Foo`] >- (simp[] >> fs[])")
+        # The combined text must keep simp[] >> fs[] grouped (parens, or some
+        # equivalent that prevents `>-` from binding only to simp[]).
+        text = result[1].text
+        # Find the position of `>-` and check what follows is parenthesized
+        dash_idx = text.find(">-")
+        assert dash_idx >= 0
+        body = text[dash_idx + 2:].lstrip()
+        assert body.startswith("("), \
+            f"Compound body must be parenthesized; got {body!r}"

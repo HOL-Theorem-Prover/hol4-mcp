@@ -1,0 +1,500 @@
+"""Interrupting and replacing a session while a call is running on it.
+
+1. A Resume body that diverges while a later label is navigated to:
+   hol_interrupt returns at once and the navigation returns as interrupted.
+2. A hol_send whose loop outlives its timeout: the next call does not write
+   into the busy process, and hol_restart replaces the session.
+3. A reply that never arrives while HOL sits idle: hol_interrupt says HOL is
+   idle, the waiting call returns, and the session answers again.
+"""
+import asyncio
+import time
+
+from hol4_mcp.hol_mcp_server import (
+    _init_file_cursor,
+    _sessions,
+    hol_interrupt,
+    hol_restart,
+    hol_send,
+    hol_start,
+    hol_state_at,
+    hol_stop,
+)
+
+SPIN = "(fn g => (let fun spin (n:int) = spin (n + 1) in spin 0 end; ALL_TAC g))"
+
+RESUME_SCRIPT = f"""\
+open HolKernel Parse boolLib bossLib;
+
+val _ = new_theory "cpl";
+
+Theorem main:
+  T /\\ T
+Proof
+  conj_tac >- suspend "a" >> suspend "b"
+QED
+
+Resume main[a]:
+  {SPIN}
+QED
+
+Resume main[b]:
+  simp[]
+QED
+
+val _ = export_theory();
+"""
+
+
+async def _started(task, seconds):
+    await asyncio.sleep(seconds)
+    assert not task.done(), task.result()
+
+
+async def test_interrupt_stops_a_diverging_resume_load(tmp_path):
+    script = tmp_path / "cplScript.sml"
+    script.write_text(RESUME_SCRIPT)
+    session = "cp_resume_spin"
+    try:
+        await _init_file_cursor(file=str(script), session=session)
+        navigation = asyncio.create_task(hol_state_at(line=16, col=3, session=session))
+        await _started(navigation, 3)
+        t0 = time.monotonic()
+        reply = await asyncio.wait_for(hol_interrupt(session=session), 10)
+        assert time.monotonic() - t0 < 5, reply
+        assert "interrupted" in reply.lower() and "hol_state_at" in reply, reply
+        result = await asyncio.wait_for(navigation, 10)
+        assert result.startswith("INTERRUPTED") and "re-run" in result, result
+        assert "val it = 1" in await hol_send("1;", session=session)
+    finally:
+        await hol_stop(session=session)
+
+
+async def test_timed_out_send_does_not_feed_a_busy_process(tmp_path):
+    session = "cp_busy_send"
+    await hol_start(workdir=str(tmp_path), name=session)
+    try:
+        # SIGINT ignored: the loop stands for code that never reaches a point
+        # where Poly/ML acts on an interrupt.
+        first = await hol_send(
+            "val _ = Signal.signal (Posix.Signal.int, Signal.SIG_IGN); "
+            "val _ = let fun f (x:int) = f (x + 1) in f 0 end;",
+            timeout=1, session=session)
+        assert first.startswith("TIMEOUT") and "still busy" in first, first
+        assert "hol_stop" in first, first
+        t0 = time.monotonic()
+        nxt = await hol_send("1;", timeout=5, session=session)
+        assert time.monotonic() - t0 < 3, nxt
+        assert "still busy" in nxt and "Nothing was sent" in nxt and "hol_stop" in nxt, nxt
+        restarted = await asyncio.wait_for(hol_restart(session=session), 60)
+        assert "started" in restarted, restarted
+        assert "val it = 2" in await hol_send("2;", session=session)
+    finally:
+        await hol_stop(session=session)
+
+
+async def test_interrupt_recovers_a_lost_reply(tmp_path):
+    session = "cp_lost_reply"
+    await hol_start(workdir=str(tmp_path), name=session)
+    try:
+        hol = _sessions[session].session
+        read = hol._read_response
+        dropped = []
+
+        async def drop_first_frame(timeout):
+            if not dropped:
+                dropped.append(await read(timeout))
+            return await read(timeout)
+        hol._read_response = drop_first_frame
+        waiting = asyncio.create_task(hol_send("1;", timeout=60, session=session))
+        await _started(waiting, 1.5)
+        hol._read_response = read
+        reply = await asyncio.wait_for(hol_interrupt(session=session), 10)
+        assert "no CPU" in reply and "lost" in reply, reply
+        result = await asyncio.wait_for(waiting, 10)
+        assert result.startswith("INTERRUPTED"), result
+        assert "val it = 2" in await hol_send("2;", session=session)
+    finally:
+        await hol_stop(session=session)
+
+
+class _RecordingSession:
+    """Answers the replay batch with `batch_reply`, everything else with ''."""
+
+    def __init__(self, batch_reply):
+        self.batch_reply = batch_reply
+        self.sent = []
+
+    async def send(self, command, timeout=None):
+        self.sent.append(command)
+        return self.batch_reply if len(self.sent) == 1 else ""
+
+
+async def test_fallback_does_not_rerun_an_interrupted_replay(tmp_path):
+    from hol4_mcp.hol_cursor import FileProofCursor
+    script = tmp_path / "cplScript.sml"
+    script.write_text(RESUME_SCRIPT)
+    hol = _RecordingSession("> e (simp[]);\nException- Interrupt raised\n")
+    cursor = FileProofCursor(script, hol)
+    replayed, error = await cursor._replay_steps_with_fallback(
+        "main", ["e (conj_tac);\n", "e (simp[]);\n"], batch_timeout=10)
+    assert hol.sent == ["e (conj_tac);\ne (simp[]);\n"], hol.sent
+    assert replayed == 0 and "interrupted" in error.lower(), error
+
+
+async def test_interrupted_call_answers_through_the_mcp_protocol(tmp_path):
+    from fastmcp import Client
+    from hol4_mcp.hol_mcp_server import mcp
+    session = "cp_protocol"
+    try:
+        async with Client(mcp) as client:
+            started = await client.call_tool(
+                "hol_start", {"workdir": str(tmp_path), "name": session})
+            assert "started" in started.content[0].text
+            spin = asyncio.create_task(client.call_tool("hol_send", {
+                "command": "val _ = let fun f (x:int) = f (x + 1) in f 0 end;",
+                "timeout": 120, "session": session}))
+            await _started(spin, 1.5)
+            reply = await asyncio.wait_for(
+                client.call_tool("hol_interrupt", {"session": session}), 15)
+            assert "Interrupted the hol_send call" in reply.content[0].text, reply
+            result = await asyncio.wait_for(spin, 15)
+            assert result.content[0].text.startswith("INTERRUPTED"), result
+            again = await client.call_tool("hol_send", {"command": "3;", "session": session})
+            assert "val it = 3" in again.content[0].text, again
+    finally:
+        await hol_stop(session=session)
+
+
+async def test_two_interrupts_still_get_the_call_its_reply(tmp_path):
+    session = "cp_double"
+    await hol_start(workdir=str(tmp_path), name=session)
+    try:
+        spin = asyncio.create_task(hol_send(
+            "val _ = let fun f (x:int) = f (x + 1) in f 0 end;", timeout=120,
+            session=session))
+        await _started(spin, 1.5)
+        first, second = await asyncio.wait_for(asyncio.gather(
+            hol_interrupt(session=session), hol_interrupt(session=session)), 15)
+        assert "Interrupted the hol_send call" in first, first
+        result = await asyncio.wait_for(spin, 15)
+        assert result.startswith("INTERRUPTED"), result
+    finally:
+        await hol_stop(session=session)
+
+
+async def test_interrupt_during_a_half_written_command(tmp_path):
+    session = "cp_half_write"
+    await hol_start(workdir=str(tmp_path), name=session)
+    try:
+        hol = _sessions[session].session
+        write = hol._write_command
+
+        async def slow_write(code):
+            if "777" not in code:
+                return await write(code)
+            data = code.encode() + b"\0"
+            hol.process.stdin.write(data[:len(data) // 2])
+            await hol.process.stdin.drain()
+            await asyncio.sleep(2)
+            hol.process.stdin.write(data[len(data) // 2:])
+            await hol.process.stdin.drain()
+        hol._write_command = slow_write
+        call = asyncio.create_task(hol_send("val half = 777 + 1;", timeout=30, session=session))
+        await _started(call, 0.5)
+        reply = await asyncio.wait_for(hol_interrupt(session=session), 30)
+        assert "Interrupted the hol_send call" in reply, reply
+        result = await asyncio.wait_for(call, 30)
+        assert result.startswith("INTERRUPTED"), result
+        hol._write_command = write
+        for n in (2, 3):
+            assert f"val it = {n}" in await hol_send(f"{n};", session=session)
+    finally:
+        await hol_stop(session=session)
+
+
+IGNORE_SIGINT_LOOP = ("val _ = Signal.signal (Posix.Signal.int, Signal.SIG_IGN); "
+                      "val _ = let fun f (x:int) = f (x + 1) in f 0 end;")
+INTERRUPTIBLE_LOOP = "val _ = let fun f (x:int) = f (x + 1) in f 0 end;"
+
+
+async def test_interrupt_never_kills_a_command_that_ignores_sigint(tmp_path):
+    session = "cp_never_kill"
+    await hol_start(workdir=str(tmp_path), name=session)
+    try:
+        pid = _sessions[session].session.process.pid
+        call = asyncio.create_task(hol_send(IGNORE_SIGINT_LOOP, timeout=300, session=session))
+        await _started(call, 1.5)
+        reply = await asyncio.wait_for(hol_interrupt(session=session), 40)
+        assert "ignores SIGINT" in reply and "hol_stop" in reply, reply
+        result = await asyncio.wait_for(call, 10)
+        assert result.startswith("INTERRUPTED") and "ignores SIGINT" in result, result
+        hol = _sessions[session].session
+        assert hol.is_running and hol.process.pid == pid and hol.busy
+        refused = await hol_send("1;", session=session)
+        assert "Nothing was sent" in refused, refused
+        stopped = await asyncio.wait_for(hol_stop(session=session), 20)
+        assert "stopped" in stopped, stopped
+    finally:
+        await hol_stop(session=session)
+
+
+async def test_restart_preempts_the_running_call(tmp_path):
+    session = "cp_restart"
+    await hol_start(workdir=str(tmp_path), name=session)
+    try:
+        call = asyncio.create_task(hol_send(INTERRUPTIBLE_LOOP, timeout=300, session=session))
+        await _started(call, 1.5)
+        restarted = await asyncio.wait_for(hol_restart(session=session), 40)
+        assert "started" in restarted and "returns STOPPED" in restarted, restarted
+        result = await asyncio.wait_for(call, 10)
+        assert result.startswith("STOPPED: hol_restart"), result
+        assert "val it = 4" in await hol_send("4;", session=session)
+    finally:
+        await hol_stop(session=session)
+
+
+async def test_stop_preempts_the_running_call(tmp_path):
+    session = "cp_stop"
+    await hol_start(workdir=str(tmp_path), name=session)
+    try:
+        call = asyncio.create_task(hol_send(IGNORE_SIGINT_LOOP, timeout=300, session=session))
+        await _started(call, 1.5)
+        stopped = await asyncio.wait_for(hol_stop(session=session), 30)
+        assert "stopped" in stopped and "returns STOPPED" in stopped, stopped
+        result = await asyncio.wait_for(call, 10)
+        assert result.startswith("STOPPED: hol_stop"), result
+        assert session not in _sessions
+    finally:
+        await hol_stop(session=session)
+
+
+async def test_waiting_call_notices_a_lost_reply(tmp_path, monkeypatch):
+    from hol4_mcp.hol_session import HOLSession
+    monkeypatch.setattr(HOLSession, "LOST_REPLY_INTERVAL", 0.5)
+    session = "cp_watchdog"
+    await hol_start(workdir=str(tmp_path), name=session)
+    try:
+        hol = _sessions[session].session
+        read = hol._read_response
+        dropped = []
+
+        async def drop_first_frame(timeout):
+            if not dropped:
+                dropped.append(await read(timeout))
+            return await read(timeout)
+        hol._read_response = drop_first_frame
+        t0 = time.monotonic()
+        result = await asyncio.wait_for(hol_send("1;", timeout=60, session=session), 20)
+        assert time.monotonic() - t0 < 10, result
+        assert "without sending its reply" in result, result
+        hol._read_response = read
+        assert "val it = 5" in await hol_send("5;", session=session)
+    finally:
+        await hol_stop(session=session)
+
+
+async def test_server_sigint_cancels_the_running_call(tmp_path):
+    from hol4_mcp.hol_mcp_server import _sigint_handler, _signal_interrupts
+    import signal
+    session = "cp_server_sigint"
+    await hol_start(workdir=str(tmp_path), name=session)
+    try:
+        call = asyncio.create_task(hol_send(INTERRUPTIBLE_LOOP, timeout=300, session=session))
+        await _started(call, 1.5)
+        _sigint_handler(signal.SIGINT, None)
+        result = await asyncio.wait_for(call, 20)
+        assert result.startswith("INTERRUPTED"), result
+        await asyncio.wait_for(asyncio.gather(*_signal_interrupts), 20)
+        assert "val it = 6" in await hol_send("6;", session=session)
+    finally:
+        await hol_stop(session=session)
+
+
+def _slow_start(monkeypatch, started):
+    """HOLSession.start that has started HOL but has not returned."""
+    from hol4_mcp.hol_session import HOLSession
+    real = HOLSession.start
+
+    async def start(self):
+        await real(self)
+        started.append(self)
+        await asyncio.sleep(60)
+    monkeypatch.setattr(HOLSession, "start", start)
+
+
+async def _until(predicate, seconds):
+    deadline = time.monotonic() + seconds
+    while not predicate():
+        assert time.monotonic() < deadline
+        await asyncio.sleep(0.05)
+
+
+async def test_interrupt_reaches_a_call_still_starting_the_session(tmp_path, monkeypatch):
+    session, started = "cp_start_interrupt", []
+    _slow_start(monkeypatch, started)
+    call = asyncio.create_task(hol_start(workdir=str(tmp_path), name=session))
+    try:
+        await _until(lambda: started, 60)
+        reply = await asyncio.wait_for(hol_interrupt(session=session), 30)
+        assert "Interrupted the hol_start call" in reply, reply
+        result = await asyncio.wait_for(call, 10)
+        assert result.startswith("INTERRUPTED"), result
+        assert not started[0].is_running
+    finally:
+        await hol_stop(session=session)
+
+
+async def test_stop_reaches_a_call_still_starting_the_session(tmp_path, monkeypatch):
+    session, started = "cp_start_stop", []
+    _slow_start(monkeypatch, started)
+    call = asyncio.create_task(hol_start(workdir=str(tmp_path), name=session))
+    try:
+        await _until(lambda: started, 60)
+        reply = await asyncio.wait_for(hol_stop(session=session), 30)
+        assert "Stopped the hol_start call" in reply, reply
+        result = await asyncio.wait_for(call, 10)
+        assert result.startswith("STOPPED"), result
+        assert not started[0].is_running
+    finally:
+        await hol_stop(session=session)
+
+
+async def test_restart_keeps_a_forced_second_session(tmp_path):
+    first, second = "cp_forced_a", "cp_forced_b"
+    await hol_start(workdir=str(tmp_path), name=first)
+    try:
+        assert "started" in await hol_start(workdir=str(tmp_path), name=second, force=True)
+        restarted = await asyncio.wait_for(hol_restart(session=first), 60)
+        assert "started" in restarted and "refusing" not in restarted, restarted
+        assert _sessions[first].session.is_running
+        assert _sessions[second].session.is_running
+    finally:
+        await hol_stop(session=first)
+        await hol_stop(session=second)
+
+
+async def test_session_listing_does_not_reparse_the_file(tmp_path):
+    from hol4_mcp.hol_mcp_server import hol_sessions
+    script = tmp_path / "lstScript.sml"
+    script.write_text('open HolKernel Parse boolLib bossLib;\n'
+                      'val _ = new_theory "lst";\n'
+                      'Theorem t: T\nProof\n  simp[]\nQED\n'
+                      'val _ = export_theory();\n')
+    session = "cp_listing"
+    try:
+        await _init_file_cursor(file=str(script), session=session)
+        cursor, reparsed = _sessions[session].cursor, []
+        cursor._reparse_if_changed = lambda: reparsed.append(1)
+        listing = await hol_sessions()
+        assert session in listing, listing
+        assert reparsed == []
+    finally:
+        await hol_stop(session=session)
+
+
+def test_orphan_gc_keeps_a_live_cursors_checkpoints(tmp_path, monkeypatch):
+    from types import SimpleNamespace
+    from hol4_mcp.hol_mcp_server import _gc_workdir_orphans
+    live = tmp_path / "a" / ".hol" / "cursor_checkpoints"
+    orphan = tmp_path / "b" / ".hol" / "cursor_checkpoints"
+    for d in (live, orphan):
+        d.mkdir(parents=True)
+        (d / "t_context.save").write_text("")
+    monkeypatch.setitem(_sessions, "cp_gc_live", SimpleNamespace(
+        cursor=SimpleNamespace(_checkpoint_dir=live)))
+    _gc_workdir_orphans(tmp_path)
+    assert (live / "t_context.save").exists()
+    assert not (orphan / "t_context.save").exists()
+
+
+def test_clip_reports_the_count_it_elided():
+    import re
+    from hol4_mcp.hol_mcp_server import _clip
+    output = "".join(chr(97 + i % 26) for i in range(10000))
+    clipped = _clip(output, 1000)
+    marker = re.search(r"\n\n\[\.\.\. (\d+) bytes elided \.\.\.\]\n\n", clipped)
+    kept = len(clipped) - len(marker.group(0))
+    assert kept + int(marker.group(1)) == len(output) and len(clipped) <= 1000
+
+
+async def test_interrupted_init_leaves_checkpoints_that_work(tmp_path, monkeypatch):
+    """An interrupt after init saved the deps checkpoint: the session's
+    next cursor still has one (the live process cannot save over it)."""
+    from hol4_mcp.hol_cursor import FileProofCursor
+    script = tmp_path / "iniScript.sml"
+    script.write_text('open HolKernel Parse boolLib bossLib;\n'
+                      'val _ = new_theory "ini";\n'
+                      'Theorem t: T\nProof\n  simp[]\nQED\n'
+                      'val _ = export_theory();\n')
+    session, saved = "cp_init_interrupt", []
+    real = FileProofCursor._save_base_checkpoint
+
+    async def slow_base(self):
+        saved.append(self._deps_checkpoint_saved)
+        await asyncio.sleep(60)
+        return await real(self)
+    monkeypatch.setattr(FileProofCursor, "_save_base_checkpoint", slow_base)
+    try:
+        call = asyncio.create_task(hol_state_at(file=str(script), line=5, col=3,
+                                                session=session))
+        await _until(lambda: saved, 120)
+        await asyncio.wait_for(hol_interrupt(session=session), 30)
+        assert (await asyncio.wait_for(call, 30)).startswith("INTERRUPTED")
+        monkeypatch.setattr(FileProofCursor, "_save_base_checkpoint", real)
+        state = await hol_state_at(file=str(script), line=5, col=3, session=session)
+        assert "=== Goal" in state, state
+        assert _sessions[session].cursor._deps_checkpoint_saved
+    finally:
+        await hol_stop(session=session)
+
+
+async def test_recovery_with_no_hol_says_so(monkeypatch):
+    from types import SimpleNamespace
+    from hol4_mcp.hol_mcp_server import (
+        _cancelled_call_text, _recover_cancelled_operation)
+    assert await _recover_cancelled_operation("cp_no_entry", "interrupt") == "gone"
+    dead = SimpleNamespace(session=SimpleNamespace(is_running=False), cursor=None)
+    monkeypatch.setitem(_sessions, "cp_dead", dead)
+    assert await _recover_cancelled_operation("cp_dead", "interrupt") == "gone"
+    text = _cancelled_call_text("hol_start", "gone", "interrupt")
+    assert "no HOL was running" in text and "did not answer" not in text
+
+
+async def test_control_tool_does_not_claim_a_call_a_client_cancelled():
+    from hol4_mcp.hol_mcp_server import _SessionOperation, _preempt, _session_operations
+    operation = _SessionOperation()
+    operation.owner = asyncio.create_task(asyncio.sleep(0.2))
+    operation.tool, operation.recovering = "hol_send", True
+    _session_operations["cp_client_cancel"] = operation
+    try:
+        assert await _preempt("cp_client_cancel", "stop", wait=5) is None
+        assert operation.intent is None and not operation.owner.cancelled()
+    finally:
+        del _session_operations["cp_client_cancel"]
+
+
+async def test_empty_reply_read_with_the_probe_is_not_lost(monkeypatch):
+    """An idle command that replies with nothing, its frame read together
+    with the lost-reply probe's: the command answered."""
+    import re
+    from hol4_mcp.hol_session import HOLSession
+    hol = HOLSession("/nonexistent")
+    hol.LOST_REPLY_INTERVAL = 0.05
+    written = []
+
+    async def write(command):
+        written.append(command)
+
+    async def read(timeout):
+        while not written:
+            await asyncio.sleep(0.01)
+        sentinel = re.search(r"HOL_MCP_RESYNC_\d+", written[0]).group(0)
+        hol._last_raw = f"\0{sentinel}\n\0".encode()
+        return f"{sentinel}\n"
+
+    async def idle():
+        return False
+    hol._write_command, hol._read_response, hol.is_computing = write, read, idle
+    assert await hol._await_reply(timeout=10) == ""
+    assert not hol._unclaimed_sentinel

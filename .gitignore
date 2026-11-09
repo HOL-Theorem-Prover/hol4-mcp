@@ -5,9 +5,26 @@ __pycache__/
 dist/
 build/
 .hol/
+.hol4-mcp/
 .agent-files/
 .agent-files.git/
 node_modules/
 uv.lock
 .sandbox
 scratch/
+
+# Personal/home-dir + editor + local Claude/MCP config that can land in the repo
+# dir — never commit (the real ones hold credentials). To track one deliberately:
+# remove its line and `git add -f <path>`.
+.bash_profile
+.bashrc
+.profile
+.zprofile
+.zshrc
+.gitconfig
+.ripgreprc
+.claude/
+.idea
+.vscode
+.mcp.json
+.gitmodules

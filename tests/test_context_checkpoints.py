@@ -67,15 +67,27 @@ async def test_context_checkpoint_has_context_path(cursor: FileProofCursor):
 
 @pytest.mark.asyncio
 async def test_context_checkpoint_files_on_disk(cursor: FileProofCursor):
-    """Context checkpoint files should exist on disk."""
+    """Every predecessor gets a rewind point; with a file after every point,
+    every one has a context file on disk too."""
+    cursor.SAVESTATE_EVERY = 1
     await cursor.enter_theorem("helper_lemma")
 
     for name in ["add_zero", "needs_proof", "partial_proof", "zero_add"]:
         ckpt = cursor._checkpoints.get(name)
         assert ckpt is not None, f"Missing checkpoint entry for {name}"
+        assert ckpt.point_id is not None, f"Missing rewind point for {name}"
         assert ckpt.context_path is not None, f"Missing context_path for {name}"
         assert ckpt.context_path.exists(), f"Missing context file for {name}"
         assert ckpt.context_path.name.endswith("_context.save")
+
+
+@pytest.mark.asyncio
+async def test_context_files_are_sparse_by_default(cursor: FileProofCursor):
+    """By default only the first checkpoint (of these four) gets a file."""
+    await cursor.enter_theorem("helper_lemma")
+    names = ["add_zero", "needs_proof", "partial_proof", "zero_add"]
+    assert all(cursor._checkpoints[n].point_id is not None for n in names)
+    assert [n for n in names if cursor._checkpoints[n].context_path] == ["add_zero"]
 
 
 # --- _loaded_to_line tracking ---
@@ -143,9 +155,10 @@ async def test_loaded_to_line_after_load_end_of_proof_checkpoint(cursor: FilePro
 
     thm = cursor._get_theorem("add_zero")
     assert thm is not None
-    # Key assertion: should be add_zero's proof_end_line, NOT last theorem's
-    assert cursor._loaded_to_line == thm.proof_end_line, (
-        f"Expected _loaded_to_line={thm.proof_end_line}, "
+    # Key assertion: the end_of_proof heap holds the file up to add_zero's
+    # START (add_zero itself is not bound), NOT up to the last theorem
+    assert cursor._loaded_to_line == thm.start_line, (
+        f"Expected _loaded_to_line={thm.start_line}, "
         f"got {cursor._loaded_to_line}"
     )
 
@@ -256,8 +269,9 @@ async def test_context_and_end_of_proof_coexist(cursor: FileProofCursor):
 
 
 @pytest.mark.asyncio
-async def test_invalidate_deletes_both_paths(cursor: FileProofCursor):
-    """_invalidate_checkpoint should delete both context and end_of_proof files."""
+async def test_invalidate_forgets_both_paths_and_gc_deletes_them(cursor: FileProofCursor):
+    """_invalidate_checkpoint forgets both checkpoints at once; their files,
+    possibly SaveState parents of later saves, go at cursor GC."""
     # Enter later theorem to create context checkpoint for add_zero
     await cursor.enter_theorem("zero_add")
 
@@ -277,11 +291,12 @@ async def test_invalidate_deletes_both_paths(cursor: FileProofCursor):
 
     # Invalidate
     cursor._invalidate_checkpoint("add_zero")
-
-    # Both files should be deleted
-    assert not ctx_path.exists(), "Context file should be deleted"
-    assert not eop_path.exists(), "End_of_proof file should be deleted"
     assert "add_zero" not in cursor._checkpoints
+    assert ctx_path.exists() and eop_path.exists()
+
+    from hol4_mcp.hol_mcp_server import _gc_cursor_checkpoints
+    _gc_cursor_checkpoints(cursor)
+    assert not ctx_path.exists() and not eop_path.exists()
 
 
 @pytest.mark.asyncio
@@ -385,10 +400,74 @@ async def test_load_context_checkpoint_handles_missing_file(cursor: FileProofCur
     ckpt = cursor._checkpoints.get("add_zero")
     assert ckpt is not None and ckpt.context_path is not None
 
-    # Delete the file
+    # Delete the file, with no in-memory point to fall back on
+    ckpt.point_id = None
     ckpt.context_path.unlink()
 
     # Should fail and clean up
     result = await cursor._load_context_checkpoint("add_zero")
     assert result is False
     assert ckpt.context_path is None  # Should be cleared
+
+
+# --- unreadable SaveState hierarchy depth ---
+
+
+class _UnreadableDepthSession:
+    """Answers every command with an empty reply and records what was sent."""
+
+    def __init__(self):
+        self.sent = []
+
+    async def send(self, command, timeout=None):
+        self.sent.append(command)
+        return ""
+
+
+async def test_unreadable_depth_saves_no_checkpoint(tmp_path: Path):
+    session = _UnreadableDepthSession()
+    c = FileProofCursor(FIXTURE, session, checkpoint_dir=tmp_path / "ckpt")
+    assert await c._save_deps_checkpoint() is False
+    assert await c._save_base_checkpoint() is False
+    c._base_checkpoint_saved = True
+    assert await c._save_end_of_proof_checkpoint("add_zero", 1) is False
+    await c._save_context_checkpoint("zero_add")
+
+    assert not any("saveChild" in cmd for cmd in session.sent), session.sent
+    assert all(ck.context_path is None and ck.end_of_proof_path is None
+               for ck in c._checkpoints.values()), c._checkpoints
+    notices = [n for n in c._session_notices if n.startswith("[Checkpoint not saved")]
+    assert len(notices) == 2, c._session_notices
+    assert all("hierarchy depth unreadable" in n for n in notices), notices
+
+
+@pytest.mark.asyncio
+async def test_invalidating_an_ancestor_keeps_later_checkpoints_loadable(cursor: FileProofCursor):
+    """A context save is a SaveState child of the saves before it; deleting
+    an ancestor's file makes every later one fail with ENOENT."""
+    cursor.SAVESTATE_EVERY = 1
+    await cursor.enter_theorem("helper_lemma")
+    cursor._checkpoints["zero_add"].point_id = None   # load the file
+    later = cursor._checkpoints["zero_add"].context_path
+    parent = await cursor.session.send(
+        f'PolyML.SaveState.showParent "{later}";', timeout=10)
+    assert "add_zero" in parent or "needs_proof" in parent or "partial_proof" in parent, parent
+    cursor._invalidate_checkpoint("add_zero")
+    assert await cursor._load_context_checkpoint("zero_add"), "child of an invalidated save failed to load"
+
+
+@pytest.mark.asyncio
+async def test_failed_checkpoint_load_records_its_savestate_chain(cursor: FileProofCursor):
+    import json
+    cursor.SAVESTATE_EVERY = 1
+    await cursor.enter_theorem("helper_lemma")
+    cursor._checkpoints["zero_add"].point_id = None   # load the file
+    later = cursor._checkpoints["zero_add"].context_path
+    ancestor = Path(cursor._save_parent[str(later)])
+    assert ancestor.name.endswith("_context.save"), ancestor
+    ancestor.unlink()
+    assert not await cursor._load_context_checkpoint("zero_add")
+    evidence = cursor.session.failure_evidence.latest
+    assert evidence["kind"] == "checkpoint load", evidence
+    response = json.loads(Path(evidence["path"]).read_text())["response"]
+    assert f"{later} (exists)" in response and f"{ancestor} (MISSING)" in response, response

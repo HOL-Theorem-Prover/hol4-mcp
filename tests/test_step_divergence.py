@@ -55,7 +55,7 @@ class TestStepPlan:
         """>- structure: expand, open_then1, expand, close."""
         result = await call_step_plan(hol_session, "conj_tac >- simp[]")
         assert len(result) == 4
-        assert "ef(goalFrag.expand(conj_tac));" == result[0].cmd
+        assert "ef(goalFrag.expand(conj_tac)(Context.snapshot()));" == result[0].cmd
         assert "ef(goalFrag.open_then1);" == result[1].cmd
         assert result[2].cmd.startswith("ef(goalFrag.expand(")
         assert "ef(goalFrag.close_paren);" == result[3].cmd

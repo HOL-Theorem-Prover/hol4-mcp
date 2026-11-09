@@ -678,6 +678,36 @@ end
     assert blocks[0].local_line == 3
 
 
+@pytest.mark.parametrize("declaration", [
+    "structure S = struct val x = 1 end",
+    "signature S = sig val x : int end",
+    "abstype t = T with val x = T end",
+])
+def test_parse_local_blocks_tracks_other_sml_end_delimiters(declaration):
+    content = f"local\n  {declaration}\nin\n  val y = 1\nend\n"
+    blocks = parse_local_blocks(content)
+    assert [(b.local_line, b.in_line, b.end_line) for b in blocks] == [(1, 3, 5)]
+
+
+def test_parse_local_blocks_outermost_first():
+    content = "local\nval x = 1\nin\nlocal val y = x in\nval z = y\nend\nend\n"
+    blocks = parse_local_blocks(content)
+    assert [(b.local_line, b.in_line, b.end_line) for b in blocks] == [(1, 3, 7), (4, 4, 6)]
+
+
+def test_parser_keeps_code_after_comment_marker_in_string():
+    content = 'val marker = "(*";\nlocal\nval x = 1\nin\nTheorem example:\n T\nProof\n simp[]\nQED\nend\n'
+    blocks = parse_local_blocks(content)
+    assert [(b.local_line, b.in_line, b.end_line) for b in blocks] == [(2, 4, 10)]
+    assert [t.name for t in parse_theorems(content)] == ["example"]
+
+
+def test_parse_local_blocks_primed_identifiers_are_not_keywords():
+    content = "local\nval let' = 1\nin\nval end' = let'\nend\n"
+    blocks = parse_local_blocks(content)
+    assert [(b.local_line, b.in_line, b.end_line) for b in blocks] == [(1, 3, 5)]
+
+
 def test_parse_local_blocks_multiple():
     """Multiple non-nested local blocks."""
     content = '''local open A in
@@ -761,6 +791,110 @@ end
     assert lb.end_line == 7
 
 
+def test_parse_local_blocks_ignores_local_attribute():
+    """A [local] attribute on Theorem/Overload/Triviality is not an opener.
+
+    Each spurious opener would sit on the stack above the real one, so the
+    real block's 'in'/'end' would pair with the wrong entry.
+    """
+    content = '''Overload True_ast[local] = "T"
+Theorem helper[local]:
+  T
+Proof
+  simp[]
+QED
+Triviality tiny[local,simp]:
+  T
+Proof
+  simp[]
+QED
+local
+  val th = helper
+in
+Theorem main:
+  T
+Proof
+  simp[th]
+QED
+end;
+'''
+    blocks = parse_local_blocks(content)
+    assert [(b.local_line, b.in_line, b.end_line) for b in blocks] == [(12, 14, 20)]
+
+
+def test_parse_local_blocks_ignores_let_in_backquote_quotation():
+    """A HOL `let ... in ...` term has no `end`; it must not be counted
+    as an SML let, or the block's `end` closes the term instead."""
+    content = '''local
+  val code = ``Let (SOME k) x1 (Var (Short k))``
+in
+Theorem Eval_Num_ABS:
+  Eval env x1 (INT i) ==> Eval env ^code (NUM (Num (ABS i)))
+Proof
+  `&(Num (ABS i)) = let k = i in if k < 0 then 0 - k else k` by
+    (FULL_SIMP_TAC std_ss [LET_DEF] THEN intLib.COOPER_TAC)
+  \\\\ simp []
+QED
+end;
+'''
+    blocks = parse_local_blocks(content)
+    assert [(b.local_line, b.in_line, b.end_line) for b in blocks] == [(1, 3, 11)]
+
+
+def test_parse_local_blocks_ignores_let_in_unicode_quotation():
+    """Same as above with ‘...’ and “...” quotations, possibly multi-line."""
+    content = '''local
+  val tm = “let x = 1 in
+              x + 1”
+in
+Theorem foo:
+  ‘let y = 2 in y’ = ‘2’
+Proof
+  simp []
+QED
+end;
+'''
+    blocks = parse_local_blocks(content)
+    assert [(b.local_line, b.in_line, b.end_line) for b in blocks] == [(1, 4, 10)]
+
+
+def test_parse_local_blocks_ignores_let_in_theorem_statement():
+    """An unquoted `let ... in` in a Theorem statement or a Definition body
+    is HOL syntax; a Theorem-equals form and a Termination block are SML."""
+    content = '''local
+  val th = TRUTH
+in
+Theorem Eval_word_lsr:
+  Eval env x1 (WORD w) ==>
+  Eval env (let w = W8 in
+            let k = 8 in App (Shift w Lsr) [x1]) (WORD (word_lsr w1 n))
+Proof
+  simp [th]
+QED
+Definition f_def:
+  f x = let y = x in y
+Termination
+  WF_REL_TAC `measure I` \\\\ simp []
+End
+Theorem sml_form = TRUTH |> DISCH_ALL
+end;
+'''
+    blocks = parse_local_blocks(content)
+    assert [(b.local_line, b.in_line, b.end_line) for b in blocks] == [(1, 3, 17)]
+
+
+def test_parse_local_blocks_keeps_sml_let_after_quotation():
+    """Stripping quotations must leave genuine SML let/in/end balanced."""
+    content = '''local
+  val tm = ‘let x = 1 in x’
+in
+  fun f x = let val y = ``let z = x in z`` in y end
+end
+'''
+    blocks = parse_local_blocks(content)
+    assert [(b.local_line, b.in_line, b.end_line) for b in blocks] == [(1, 3, 5)]
+
+
 class TestStepLineNumbers:
     """Tests for step_line_numbers."""
 
@@ -810,6 +944,37 @@ class TestFormatStepContext:
         lines = self._make_lines(plan)
         result = format_step_context(plan, fail_idx=4, step_lines=lines)
         assert result == ["", "=== Failing tactic ===", "cheat", "Opaque tactic — cannot inspect inside of cheat. Use Suspend/Resume or extract as a lemma."]
+
+    def test_long_opaque_body_is_elided_and_not_echoed_twice(self):
+        """A preserved multi-hundred-line arm must not be echoed in full, twice.
+
+        The failure is *inside* the opaque step either way, so the body carries
+        no localisation signal; echoing it once after the header and again
+        inside the "Opaque tactic" notice cost tens of thousands of tokens per
+        failed check on a real 350-line arm.
+        """
+        body = "\n".join(f"  \\\\ tactic_number_{i} []" for i in range(300))
+        plan = [StepPlan(end=10, kind="expand", text=body)]
+        result = format_step_context(plan, fail_idx=0, step_lines=[10])
+        joined = "\n".join(result)
+
+        assert "lines elided" in joined, "long body was not elided"
+        assert joined.count("tactic_number_0 []") == 1, (
+            "body echoed more than once (header + opaque notice)"
+        )
+        assert "Opaque tactic — cannot inspect inside it." in joined
+        assert len(joined) < len(body) / 5, (
+            f"elision left {len(joined)} chars from a {len(body)}-char body"
+        )
+
+    def test_short_opaque_tactic_still_named_in_full(self):
+        """The elision must not degrade the common short-tactic message."""
+        plan = [StepPlan(end=10, kind="expand", text="cheat")]
+        result = format_step_context(plan, fail_idx=0, step_lines=[10])
+        assert result[-1] == (
+            "Opaque tactic — cannot inspect inside of cheat. "
+            "Use Suspend/Resume or extract as a lemma."
+        )
 
     def test_then_chain_no_nesting(self):
         """>> chain tactics should be at the same depth (sequential, not nested)."""
@@ -978,10 +1143,10 @@ class TestNeedsInfixParens:
 
 class TestFragToCmdInfix:
     def test_bare_infix_gets_parens(self):
-        assert _frag_to_cmd("expand", ">- strip_tac") == "ef(goalFrag.expand((>- strip_tac)));"
+        assert _frag_to_cmd("expand", ">- strip_tac") == "ef(goalFrag.expand((>- strip_tac))(Context.snapshot()));"
 
     def test_normal_tactic_no_extra_parens(self):
-        assert _frag_to_cmd("expand", "strip_tac") == "ef(goalFrag.expand(strip_tac));"
+        assert _frag_to_cmd("expand", "strip_tac") == "ef(goalFrag.expand(strip_tac)(Context.snapshot()));"
 
     def test_open_step_unchanged(self):
         assert _frag_to_cmd("open", "open_then1") == "ef(goalFrag.open_then1);"
@@ -1263,4 +1428,3 @@ class TestFormatStepContextReal:
         text = "\n".join(result)
         # The inner >- is not decomposed, shows as (simp[] >- fs[])
         assert "(simp[] >- fs[])" in text
-

@@ -17,8 +17,8 @@ from hol4_mcp.hol_mcp_server import (
     hol_logs as _hol_logs,
     holmake as _holmake,
     _init_file_cursor,  # Internal helper (not MCP tool)
+    _get_cursor,
     hol_state_at as _hol_state_at,
-    hol_file_status as _hol_file_status,
     hol_check_proof as _hol_check_proof,
     _kill_process_group,
     _sessions,
@@ -38,7 +38,6 @@ holmake = _holmake
 hol_file_init = _init_file_cursor
 hol_state_at = _hol_state_at
 hol_check_proof = _hol_check_proof
-hol_file_status = _hol_file_status
 
 FIXTURES_DIR = Path(__file__).parent / "fixtures"
 
@@ -208,7 +207,8 @@ async def test_log_nonexistent(workdir):
     """Test hol_log for non-existent theory."""
     result = await hol_log(workdir=workdir, theory="nonexistent")
     assert "Log not found: nonexistent" in result
-    assert "Available:" in result
+    # Listing depends on whether prior builds left logs in the fixtures dir
+    assert "Available:" in result or "No logs in" in result
 
 
 async def test_holmake_env_in_output(isolated_workdir):
@@ -255,31 +255,10 @@ async def test_file_init_lists_theorems(tmp_path):
         await hol_stop(session="file_init_test")
 
 
-async def test_file_status_shows_cheats(tmp_path):
-    """Test hol_file_status lists cheats and active theorem."""
-    test_file = tmp_path / "testScript.sml"
-    shutil.copy(FIXTURES_DIR / "testScript.sml", test_file)
-
-    try:
-        await hol_file_init(file=str(test_file), session="status_test")
-        result = await hol_file_status(session="status_test")
-
-        # Should show file info
-        assert "File:" in result
-        assert "Progress:" in result
-        # Should list cheats
-        assert "needs_proof" in result
-        assert "partial_proof" in result
-    finally:
-        await hol_stop(session="status_test")
-
-
-async def test_file_init_restarts_on_workdir_change(tmp_path):
-    """Test hol_file_init restarts session when workdir changes.
-
-    Regression test for BUG_workdir_mismatch: when hol_file_init was called
-    with a different workdir, the session kept using the old workdir.
-    """
+async def test_file_init_moves_session_on_workdir_change(tmp_path):
+    """hol_file_init moves the session to a file's workdir and says so: one
+    session at a time (RULE J), so the session follows the file, and the
+    notice names both workdirs because the old one's context is gone."""
     # Create two directories with test files
     dir_a = tmp_path / "dirA"
     dir_b = tmp_path / "dirB"
@@ -300,15 +279,19 @@ async def test_file_init_restarts_on_workdir_change(tmp_path):
         sessions = await hol_sessions()
         assert "dirA" in sessions
 
-        # Now init for file in dir_b - should restart session
-        result = await hol_file_init(file=str(file_b), session="workdir_test", workdir=str(dir_b))
+        # Init for a file in dir_b: the session moves there, once, with a notice
+        # queued for the next tool output.
+        result = await hol_file_init(
+            file=str(file_b), session="workdir_test", workdir=str(dir_b)
+        )
         assert "Theorems:" in result
-
-        # Check workdir changed
         sessions = await hol_sessions()
-        assert "dirB" in sessions
-        # Old workdir should not be present (session was restarted)
-        assert "dirA" not in sessions or "workdir_test" not in sessions.split("dirA")[0]
+        assert "dirB" in sessions and "dirA" not in sessions
+        assert sessions.count("running") == 1
+        cursor = await _get_cursor("workdir_test")
+        notices = cursor.take_notices()
+        assert len(notices) == 1 and notices[0].startswith("[Session restarted: workdir")
+        assert str(dir_a) in notices[0] and str(dir_b) in notices[0]
     finally:
         await hol_stop(session="workdir_test")
 
@@ -425,6 +408,50 @@ async def test_state_at_after_qed_line(tmp_path):
         assert "proof complete" not in result.lower() or "ERROR" in result
     finally:
         await hol_stop(session="after_qed_test")
+
+
+async def test_state_at_inside_local_block_with_quoted_let(tmp_path):
+    """A theorem inside `local ... in ... end` whose proof quotes a HOL
+    `let ... in` (no `end`), after `[local]` attributes: the block is sent
+    to HOL as one unit, so its QED and the theorem after it both replay."""
+    test_file = tmp_path / "localQuoteLetScript.sml"
+    shutil.copy(FIXTURES_DIR / "localQuoteLetScript.sml", test_file)
+
+    try:
+        await hol_file_init(file=str(test_file), session="local_quote_let")
+
+        # inside_local_plain: QED at line 36, inside the block, after the
+        # theorem whose proof quotes the `let ... in`
+        result = await hol_state_at(session="local_quote_let", line=36, col=1)
+        assert "expected keyword 'end'" not in result
+        assert "ERROR" not in result
+        assert "proof complete" in result.lower()
+
+        # after_local: QED at line 44, after the block's `end;`
+        result = await hol_state_at(session="local_quote_let", line=44, col=1)
+        assert "ERROR" not in result
+        assert "proof complete" in result.lower()
+    finally:
+        await hol_stop(session="local_quote_let")
+
+
+async def test_state_at_nested_local_with_structure_and_comment_string(tmp_path):
+    content = (FIXTURES_DIR / "localQuoteLetScript.sml").read_text()
+    content = content.replace("val th = helper", 'val th = helper\nval marker = "(*";\nstructure S = struct val x = 1 end;')
+    content = content.replace("in\n\nTheorem inside_local:", "in\n\nlocal val x = S.x in\n\nTheorem inside_local:")
+    content = content.replace("end;\n\nTheorem after_local:", "end;\nend;\n\nTheorem after_local:")
+    script = tmp_path / "localQuoteLetScript.sml"
+    script.write_text(content)
+    lines = content.splitlines()
+    first_qed = lines.index("QED", lines.index("Theorem inside_local_plain:")) + 1
+    last_qed = lines.index("QED", lines.index("Theorem after_local:")) + 1
+    try:
+        for line in (first_qed, last_qed):
+            result = await hol_state_at(file=str(script), session="nested_local", line=line)
+            assert "ERROR" not in result, result
+            assert "proof complete" in result.lower(), result
+    finally:
+        await hol_stop(session="nested_local")
 
 
 async def test_state_at_auto_init(tmp_path):
@@ -1314,7 +1341,10 @@ async def test_state_at_broken_two_step_qed_reports_stuck_location(tmp_path):
         assert "PROOF BROKEN" in r
         assert "ERROR" in r
         assert "=== Goals ===" not in r  # Goals section suppressed in strict mode
-        assert "hol_state_at" in r  # Suggests inspecting failure point
+        # Points at the failure: either a precise location to inspect
+        # (hol_state_at suggestion) or, for an opaque multi-line step,
+        # bisection advice over the reported line range.
+        assert "hol_state_at" in r or "To localize" in r
     finally:
         await hol_stop(session=session)
 
@@ -1852,9 +1882,11 @@ async def test_state_at_absolute_lines_with_blank_line(tmp_path):
         # Request state at QED line (line 18). Proof is broken, so PROOF BROKEN.
         r = await hol_state_at(session=session, line=18, col=1)
         assert "PROOF BROKEN" in r
-        # The failure location must be line 15 (rpt strip_tac), not line 14 (blank)
-        assert "line 15" in r, f"Expected failure at line 15, got: {r}"
-        assert "hol_state_at(line=15" in r, f"Suggested line should be 15: {r}"
+        # The failure location must start at line 15 (rpt strip_tac), not
+        # line 14 (blank). Opaque multi-line steps report a range whose
+        # start must still be the absolute line 15.
+        assert "line 15" in r or "lines 15-" in r, \
+            f"Expected failure at line 15, got: {r}"
     finally:
         await hol_stop(session=session)
 
